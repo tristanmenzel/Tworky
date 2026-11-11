@@ -1,0 +1,219 @@
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-2: #eef0f3;
+  --border: #dde1e6;
+  --text: #1c2026;
+  --muted: #69717d;
+  --accent: #2f6fde;
+  --accent-text: #ffffff;
+  --ok: #1f8a4c;
+  --warn: #b7791f;
+  --bad: #c53030;
+  --ok-fill: #1c7c44;
+  --on-ok: #ffffff;
+  --on-warn: #111418;
+  --on-accent: #ffffff;
+  --on-bad: #ffffff;
+  --account: #b0367f;
+  --on-account: #ffffff;
+  --epic: #7c4dcc;
+  --story: #2f6fde;
+  --task: #1f8a4c;
+  --term-bg: #15181d;
+  --mono: 'Cascadia Code', 'Cascadia Mono', Consolas, monospace;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418;
+    --panel: #181c21;
+    --panel-2: #20252c;
+    --border: #2b313a;
+    --text: #e3e6ea;
+    --muted: #8b939e;
+    --accent: #5b8ff0;
+    --ok: #4cc283;
+    --warn: #e0a84a;
+    --bad: #ef6b6b;
+    --ok-fill: #4cc283;
+    --on-ok: #111418;
+    --on-warn: #111418;
+    --on-accent: #111418;
+    --on-bad: #111418;
+    --account: #e27ab8;
+    --on-account: #111418;
+    --epic: #a885f0;
+    --story: #6d9cf2;
+    --task: #4cc283;
+    --term-bg: #0d0f12;
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+button.danger:hover:not(:disabled) {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+a {
+  color: var(--accent);
+}
+
+code,
+pre {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+button.link {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  text-align: left;
+}
+
+.tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 5px;
+  white-space: nowrap;
+}
+
+.status {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: var(--panel-2);
+  white-space: nowrap;
+}
+.status.ready,
+.status.merged,
+.status.live {
+  color: var(--ok);
+}
+.status.creating,
+.status.cleaning,
+.status.open {
+  color: var(--warn);
+}
+.status.failed,
+.status.closed {
+  color: var(--bad);
+}
+
+.dot {
+  flex: none;
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.dot.ready {
+  background: var(--ok);
+}
+.dot.creating,
+.dot.cleaning {
+  background: var(--warn);
+}
+.dot.failed {
+  background: var(--bad);
+}
+.dot.live {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 35%, transparent);
+}
+.dot.live.idle {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 35%, transparent);
+}
+.dot.live.uat {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.dot.live.account {
+  background: var(--account);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--account) 35%, transparent);
+}
+.dot.live.waiting {
+  background: var(--bad);
+  animation: waiting 1.2s ease-in-out infinite;
+}
+@keyframes waiting {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--bad) 60%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--bad) 10%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dot.live.waiting {
+    animation: none;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 45%, transparent);
+  }
+}
+
+.type-epic {
+  color: var(--epic);
+}
+.type-story {
+  color: var(--story);
+}
+.type-task {
+  color: var(--task);
+}

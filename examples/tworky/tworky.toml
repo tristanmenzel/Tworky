@@ -1,0 +1,25 @@
+name = "tworky"
+match = { repos = ["tristanmenzel/Tworky"] }
+notes = """
+Start the app with `tw service start app`. It runs on this worker's Vite port (`TW_PORT_VITE`) with its own home and its own workers folder, so it never touches the installed app's workers.
+"""
+
+[[repos]]
+name = "Tworky"
+source = 'C:\Source\Tworky'
+
+[ports]
+vite = 1420
+
+[[hooks.setup]]
+cwd = "Tworky"
+run.windows = "npm ci; if ($LASTEXITCODE) { exit $LASTEXITCODE }; node scripts/build-cli.mjs"
+run.unix = "npm ci && node scripts/build-cli.mjs"
+
+[[services]]
+name = "app"
+cwd = "Tworky"
+port = "vite"
+run.windows = "npm run dev:app"
+run.unix = "npm run dev:tauri"
+ready_timeout_secs = 900

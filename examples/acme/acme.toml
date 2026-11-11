@@ -1,0 +1,55 @@
+name = "acme"
+match = { owner = "acme" }
+subtask_types = ["Subtask", "Task"]
+context_types = ["Story", "Epic"]
+branch = "feat/{{ parent.slug if parent else issue.slug }}-{{ issue.number }}"
+status_board = 3
+notes = """
+Start the API and the web app with `tw service start <name>` (`api`, `web`), which runs them on this worker's ports. The web app needs the API, so starting `web` starts both.
+"""
+
+[[repos]]
+name = "acme-api"
+source = 'C:\Source\acme\acme-api'
+
+[[repos]]
+name = "acme-web"
+source = 'C:\Source\acme\acme-web'
+
+[ports]
+api = 4000
+web = 5173
+postgres = 5432
+redis = 6379
+
+[stack]
+compose_dir = "acme-api"
+env_file = "acme-api/.env"
+
+[[hooks.setup]]
+cwd = "acme-api"
+run.windows = "npm ci; if ($LASTEXITCODE) { exit $LASTEXITCODE }; npm run db:migrate; if ($LASTEXITCODE) { exit $LASTEXITCODE }; npm run db:seed"
+run.unix = "npm ci && npm run db:migrate && npm run db:seed"
+
+[[hooks.setup]]
+cwd = "acme-web"
+run = "npm ci"
+
+[[services]]
+name = "api"
+cwd = "acme-api"
+run = "npm run dev"
+port = "api"
+https = true
+
+[[services]]
+name = "web"
+cwd = "acme-web"
+run = "npx vite --port {{ ports.web }} --strictPort"
+port = "web"
+needs = ["api"]
+
+[[accounts]]
+name = "Tester 1"
+username = "tester1@example.com"
+start_service = "web"
