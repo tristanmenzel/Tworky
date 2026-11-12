@@ -8,14 +8,14 @@ export function singleLine(text: string): string {
 }
 
 /** `exited` is true once the app has seen the session end, which `session_alive` lags behind. */
-export function askBlocker(w: Worker, exited: boolean): string | false {
-  if (!w.session_alive || exited) return `Claude isn't running in ${w.id}`
-  if (w.activity === 'waiting') return `${w.id} is waiting for you to answer Claude`
-  return false
+export function sessionRunning(w: Worker, exited: boolean): boolean {
+  return w.session_alive && !exited
 }
 
-export function canAsk(w: Worker, exited: boolean): boolean {
-  return !askBlocker(w, exited)
+export function askBlocker(w: Worker, exited: boolean): string | false {
+  if (!sessionRunning(w, exited)) return w.status === 'ready' ? false : `${w.id} is ${w.status}`
+  if (w.activity === 'waiting') return `${w.id} is waiting for you to answer Claude`
+  return false
 }
 
 export type BranchWithoutPr = 'waiting' | 'no_commits' | 'deleted'
@@ -49,6 +49,5 @@ export function addressReviewPrompt(b: BranchWork, pr: PrDetail): string {
 }
 
 export function openPrPrompt(b: BranchWork): string {
-  const push = !b.remote ? ' Push it first, since it is only local.' : b.unpushed ? ' Push its unpushed commits first.' : ''
-  return singleLine(`Open a pull request for branch ${b.branch} in ${b.repo}.${push} Show me the title and description you used.`)
+  return singleLine(`Open a pull request for branch ${b.branch} in ${b.repo}`)
 }
