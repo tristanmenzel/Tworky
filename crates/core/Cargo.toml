@@ -30,4 +30,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Netwo
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFString"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+async-io = "2.6.0"
+futures-lite = "2.6.1"
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }

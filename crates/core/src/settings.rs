@@ -1,6 +1,8 @@
 //! `<config>/settings.toml`: preferences the app writes. Parsed leniently, key by key, so a hand
 //! edit or a file from a newer build never stops an older one from starting.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, value};
@@ -31,6 +33,8 @@ pub struct Settings {
     pub keep_awake: KeepAwake,
 }
 
+static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
 impl Settings {
     pub fn load(paths: &Paths) -> Settings {
         std::fs::read_to_string(paths.settings())
@@ -48,10 +52,15 @@ impl Settings {
     }
 
     /// Hand-written comments and keys this build doesn't know survive. A file that doesn't parse
-    /// is replaced, as `load` already ignored it.
+    /// is replaced, as `load` already ignored it, but one that can't be read is left alone.
     pub fn save(&self, paths: &Paths) -> Result<()> {
         let file = paths.settings();
-        let mut doc = std::fs::read_to_string(&file)
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
+        };
+        let mut doc = std::str::from_utf8(&bytes)
             .ok()
             .and_then(|text| text.parse::<DocumentMut>().ok())
             .unwrap_or_default();
@@ -65,9 +74,17 @@ impl Settings {
         doc["keep_awake"] = keep_awake;
 
         std::fs::create_dir_all(&paths.config_dir)?;
-        let tmp = file.with_extension("toml.tmp");
-        std::fs::write(&tmp, doc.to_string())?;
-        std::fs::rename(&tmp, &file).with_context(|| format!("writing {}", file.display()))
+        let tmp = paths.config_dir.join(format!(
+            "settings.{}.{}.tmp",
+            std::process::id(),
+            NEXT_TMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written =
+            std::fs::write(&tmp, doc.to_string()).and_then(|()| std::fs::rename(&tmp, &file));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written.with_context(|| format!("writing {}", file.display()))
     }
 }
 
@@ -127,7 +144,12 @@ mod tests {
             Settings { keep_awake: mode }.save(&paths).unwrap();
             assert_eq!(Settings::load(&paths).keep_awake, mode);
         }
-        assert!(!paths.settings().with_extension("toml.tmp").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&paths.config_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name() != "settings.toml")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
@@ -167,5 +189,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(Settings::load(&paths).keep_awake, KeepAwake::Off);
+    }
+
+    #[test]
+    fn save_replaces_a_file_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(&dir);
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(paths.settings(), b"keep_awake = \"\xff\"").unwrap();
+
+        Settings {
+            keep_awake: KeepAwake::Always,
+        }
+        .save(&paths)
+        .unwrap();
+
+        assert_eq!(Settings::load(&paths).keep_awake, KeepAwake::Always);
+    }
+
+    #[test]
+    fn save_fails_rather_than_overwrite_a_file_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(&dir);
+        std::fs::create_dir_all(paths.settings()).unwrap();
+
+        let result = Settings {
+            keep_awake: KeepAwake::Always,
+        }
+        .save(&paths);
+
+        assert!(result.is_err());
+        assert!(paths.settings().is_dir());
     }
 }

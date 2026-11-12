@@ -2,21 +2,29 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::fd::OwnedFd;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use futures_lite::{FutureExt, StreamExt};
 use serde::Serialize;
-use zbus::blocking::Connection;
 use zbus::blocking::connection::Builder;
+use zbus::blocking::{Connection, MessageIterator};
+use zbus::message::Type;
 use zbus::zvariant::{DynamicDeserialize, DynamicType, OwnedObjectPath, OwnedValue, Value};
+use zbus::{MatchRule, MessageStream};
 
 use super::{LockKind, PowerSource};
 
 const PORTAL: &str = "org.freedesktop.portal.Desktop";
+const REQUEST: &str = "org.freedesktop.portal.Request";
 const DBUS: &str = "org.freedesktop.DBus";
 const SYSFS_POWER_SUPPLY: &str = "/sys/class/power_supply";
 /// The portal's `Inhibit` flag for suspend.
 const INHIBIT_SUSPEND: u32 = 4;
+const TIMEOUT: Duration = Duration::from_secs(2);
+
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 pub struct SleepLock {
     held: Held,
@@ -38,13 +46,9 @@ struct PortalInhibit {
 impl Drop for PortalInhibit {
     fn drop(&mut self) {
         if let Some(request) = self.request.take() {
-            let _ = self.connection.call_method(
-                Some(PORTAL),
-                &request,
-                Some("org.freedesktop.portal.Request"),
-                "Close",
-                &(),
-            );
+            let _ =
+                self.connection
+                    .call_method(Some(PORTAL), &request, Some(REQUEST), "Close", &());
         }
     }
 }
@@ -68,7 +72,21 @@ impl Portal for DesktopPortal {
         let connection = connect(Builder::session()?)?;
         start_portal(&connection)?;
         let owner = portal_owner(&connection)?;
-        let options = HashMap::from([("reason", Value::from(reason))]);
+        let sender = connection
+            .unique_name()
+            .context("no unique name on the session bus")?;
+        let token = format!(
+            "tworky_{}_{}",
+            std::process::id(),
+            NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
+        );
+        let expected = request_path(sender.as_str(), &token);
+        let mut responses = subscribe(&connection, &owner, &expected)?;
+        let deadline = Instant::now() + TIMEOUT;
+        let options = HashMap::from([
+            ("reason", Value::from(reason)),
+            ("handle_token", Value::from(token.as_str())),
+        ]);
         let request: OwnedObjectPath = call(
             &connection,
             PORTAL,
@@ -78,12 +96,58 @@ impl Portal for DesktopPortal {
             &("", INHIBIT_SUSPEND, options),
         )
         .context("portal Inhibit")?;
-        Ok(PortalInhibit {
+        if request.as_str() != expected {
+            responses = subscribe(&connection, &owner, request.as_str())?;
+        }
+        let inhibit = PortalInhibit {
             connection,
             request: Some(request),
             owner,
-        })
+        };
+        match wait_for_response(responses, deadline) {
+            Some(0) => Ok(inhibit),
+            Some(code) => bail!("the portal refused the inhibit (response {code})"),
+            None => bail!("the portal didn't answer the inhibit request"),
+        }
     }
+}
+
+/// The portal emits `Response` on the request path it derives from our unique name and token,
+/// possibly before `Inhibit` returns, so the match must be in place before the call.
+fn request_path(unique_name: &str, token: &str) -> String {
+    let sender = unique_name.trim_start_matches(':').replace('.', "_");
+    format!("/org/freedesktop/portal/desktop/request/{sender}/{token}")
+}
+
+fn subscribe(connection: &Connection, owner: &str, path: &str) -> Result<MessageStream> {
+    let rule = MatchRule::builder()
+        .msg_type(Type::Signal)
+        .sender(owner)?
+        .interface(REQUEST)?
+        .member("Response")?
+        .path(path)?
+        .build();
+    Ok(MessageIterator::for_match_rule(rule, connection, None)?.into_inner())
+}
+
+fn wait_for_response(mut responses: MessageStream, deadline: Instant) -> Option<u32> {
+    let response = async {
+        while let Some(message) = responses.next().await {
+            let Ok(message) = message else { continue };
+            if let Ok((code, _)) = message
+                .body()
+                .deserialize::<(u32, HashMap<String, OwnedValue>)>()
+            {
+                return Some(code);
+            }
+        }
+        None
+    };
+    let timeout = async {
+        async_io::Timer::at(deadline).await;
+        None
+    };
+    async_io::block_on(response.or(timeout))
 }
 
 struct SystemLogind;
@@ -313,6 +377,14 @@ mod tests {
         assert!(
             message.contains("no portal") && message.contains("no logind"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn request_path_follows_the_portal_convention() {
+        assert_eq!(
+            request_path(":1.42", "tworky_7_0"),
+            "/org/freedesktop/portal/desktop/request/1_42/tworky_7_0"
         );
     }
 
