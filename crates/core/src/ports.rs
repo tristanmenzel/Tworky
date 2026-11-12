@@ -51,6 +51,10 @@ fn exclusive_bind(addr: std::net::SocketAddr) -> io::Result<socket2::Socket> {
     use windows_sys::Win32::Networking::WinSock::{SO_EXCLUSIVEADDRUSE, SOL_SOCKET, setsockopt};
 
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    if addr.is_ipv6() {
+        // Windows defaults IPv6 sockets to V6ONLY, which wouldn't conflict with a dual-stack holder.
+        socket.set_only_v6(false)?;
+    }
     let on: i32 = 1;
     // SAFETY: the socket is open for the whole call, and optval points at an i32 of optlen bytes.
     let result = unsafe {
@@ -154,13 +158,36 @@ mod tests {
         assert!(!is_free(port));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn probe_detects_dual_stack_wildcard_bind() {
+        use socket2::{Domain, Socket, Type};
+        let Ok(socket) = Socket::new(Domain::IPV6, Type::STREAM, None) else {
+            eprintln!("skipped: no IPv6");
+            return;
+        };
+        let bound = socket.set_only_v6(false).and_then(|()| {
+            socket.bind(&std::net::SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
+        });
+        if bound.is_err() {
+            eprintln!("skipped: no dual-stack IPv6");
+            return;
+        }
+        let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+        assert!(!is_free(port));
+    }
+
     #[test]
     fn probe_reads_free_port_as_free() {
-        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        assert!(is_free(port));
+        // Parallel tests bind ephemeral ports too, so one dropped port may be taken again.
+        let any_free = (0..5).any(|_| {
+            let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            is_free(port)
+        });
+        assert!(any_free);
     }
 }
