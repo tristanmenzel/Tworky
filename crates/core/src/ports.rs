@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, TcpListener};
+use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
 
 use anyhow::{Result, bail};
 
@@ -12,10 +13,60 @@ pub fn ports_for_slot(base: &PortMap, slot: u16, stride: u16) -> PortMap {
         .collect()
 }
 
+/// Windows asks the user for firewall access when a new exe listens on a wildcard address, but
+/// not when it only binds one, so the wildcard checks are exclusive binds that never listen.
+#[cfg(windows)]
+pub fn is_free(port: u16) -> bool {
+    // Each step closes its socket before the next runs: the 127.0.0.1 listener would otherwise
+    // make the exclusive 0.0.0.0 bind fail, and every port would read busy.
+    let steps: [&dyn Fn() -> bool; 4] = [
+        &|| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
+        &|| exclusive_bind((Ipv4Addr::UNSPECIFIED, port).into()).is_ok(),
+        &|| ipv6_free(TcpListener::bind((Ipv6Addr::LOCALHOST, port))),
+        &|| ipv6_free(exclusive_bind((Ipv6Addr::UNSPECIFIED, port).into())),
+    ];
+    steps.iter().all(|step| step())
+}
+
+#[cfg(unix)]
 pub fn is_free(port: u16) -> bool {
     [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED]
         .iter()
         .all(|ip| TcpListener::bind((*ip, port)).is_ok())
+        && ipv6_free(TcpListener::bind((Ipv6Addr::LOCALHOST, port)))
+}
+
+/// Machines without IPv6 fail IPv6 binds with other errors, which mustn't make every port busy.
+fn ipv6_free<T>(probe: io::Result<T>) -> bool {
+    !matches!(
+        probe.map_err(|e| e.kind()),
+        Err(io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied)
+    )
+}
+
+#[cfg(windows)]
+fn exclusive_bind(addr: std::net::SocketAddr) -> io::Result<socket2::Socket> {
+    use socket2::{Domain, Socket, Type};
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SO_EXCLUSIVEADDRUSE, SOL_SOCKET, setsockopt};
+
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    let on: i32 = 1;
+    // SAFETY: the socket is open for the whole call, and optval points at an i32 of optlen bytes.
+    let result = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&on as *const i32).cast(),
+            size_of::<i32>() as i32,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    socket.bind(&addr.into())?;
+    Ok(socket)
 }
 
 pub fn allocate(
@@ -80,5 +131,36 @@ mod tests {
     fn probe_detects_bound_port() {
         let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         assert!(!is_free(l.local_addr().unwrap().port()));
+    }
+
+    #[test]
+    fn probe_detects_ipv6_loopback_listener() {
+        let Ok(l) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+            eprintln!("skipped: no IPv6 loopback");
+            return;
+        };
+        assert!(!is_free(l.local_addr().unwrap().port()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_detects_wildcard_bind_without_listen() {
+        use socket2::{Domain, Socket, Type};
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        socket
+            .bind(&std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())
+            .unwrap();
+        let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+        assert!(!is_free(port));
+    }
+
+    #[test]
+    fn probe_reads_free_port_as_free() {
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(is_free(port));
     }
 }
