@@ -127,6 +127,10 @@ impl Paths {
         self.config_dir.join("templates")
     }
 
+    pub fn settings(&self) -> PathBuf {
+        self.config_dir.join("settings.toml")
+    }
+
     pub fn memory_file(&self, project: &str) -> PathBuf {
         self.config_dir.join("memory").join(format!("{project}.md"))
     }
