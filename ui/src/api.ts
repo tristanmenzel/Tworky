@@ -399,6 +399,17 @@ export interface UpdateProgress {
   log_tail: string
 }
 
+export type KeepAwakeMode = 'off' | 'plugged_in' | 'always'
+
+export interface KeepAwakeStatus {
+  mode: KeepAwakeMode
+  holding: boolean
+  busy_sessions: number
+  on_battery: boolean | null
+  has_battery: boolean
+  lock: 'windows' | 'macos' | 'portal' | 'logind' | 'none'
+}
+
 // The host ignores a show older than one it applied from the same load.
 const showLoad = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)
 let showSeq = 0
@@ -409,6 +420,8 @@ export const api = {
   dismissUpdateFailure: () => invoke<void>('dismiss_update_failure'),
   startUpdate: () => invoke<void>('start_update'),
   restartForUpdate: () => invoke<void>('restart_for_update'),
+  keepAwakeStatus: () => invoke<KeepAwakeStatus>('keep_awake_status'),
+  setKeepAwake: (mode: KeepAwakeMode) => invoke<void>('set_keep_awake', { mode }),
   projects: () => invoke<ProjectSummary[]>('list_projects'),
   browserTabs: () => invoke<BrowserTabView[]>('browser_tabs'),
   browserOpen: (worker: string, account: string | null, url: string | null = null) =>

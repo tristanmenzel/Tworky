@@ -42,6 +42,7 @@
   import ServicePickerDialog from './ServicePickerDialog.svelte'
   import CreateProfileDialog from './CreateProfileDialog.svelte'
   import type { ServiceLink } from './ServiceList.svelte'
+  import KeepAwakePill from './KeepAwakePill.svelte'
   import VersionBadge from './VersionBadge.svelte'
   import {
     activityLabel,
@@ -684,6 +685,7 @@
       <button class:active={view === 'projects'} onclick={() => showView('projects')}>Projects</button>
     </nav>
     <span class="right">
+      <KeepAwakePill />
       <VersionBadge liveSessions={liveSessionCount} {refreshKey} />
       <span class="muted viewer">{payload?.viewer ?? ''}</span>
     </span>
