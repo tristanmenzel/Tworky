@@ -49,6 +49,5 @@ export function addressReviewPrompt(b: BranchWork, pr: PrDetail): string {
 }
 
 export function openPrPrompt(b: BranchWork): string {
-  const push = !b.remote ? ' Push it first, since it is only local.' : b.unpushed ? ' Push its unpushed commits first.' : ''
-  return singleLine(`Open a pull request for branch ${b.branch} in ${b.repo}.${push} Show me the title and description you used.`)
+  return singleLine(`Open a pull request for branch ${b.branch} in ${b.repo}`)
 }
