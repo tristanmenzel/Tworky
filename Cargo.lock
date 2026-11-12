@@ -4911,6 +4911,7 @@ dependencies = [
  "directories",
  "keyring",
  "minijinja",
+ "objc2-core-foundation",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4921,6 +4922,7 @@ dependencies = [
  "toml_edit 0.25.17+spec-1.1.0",
  "uuid",
  "windows-sys 0.61.2",
+ "zbus 5.19.0",
 ]
 
 [[package]]
