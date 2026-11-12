@@ -535,6 +535,17 @@ impl Workspace {
     fn drop_worktree(&self, w: &WorkerRecord, repo: &RepoConfig, log: Log) -> Result<()> {
         let path = w.dir.join(&repo.name);
         let record = w.worktrees.iter().find(|t| t.repo == repo.name);
+        if !repo.source.is_dir() {
+            if path.exists() {
+                log(&format!(
+                    "▸ {}: the clone at {} is gone, so removing the worktree folder without git",
+                    repo.name,
+                    repo.source.display()
+                ));
+                remove_dir(&path)?;
+            }
+            return Ok(());
+        }
         if git::is_worktree(&path) || record.is_some() {
             log(&format!("▸ {}: removing worktree", repo.name));
             git::worktree_remove(&repo.source, &path)?;
@@ -966,10 +977,18 @@ impl Workspace {
         if let Some(project) = &project {
             let ctx = template_context(&w, project, &IssueIndex::default());
             for hook in &project.hooks.teardown {
-                if Self::has_worktree(&w, &hook.cwd) {
-                    let r = self.run_hook(&w, hook, &ctx, log);
-                    attempt(errors, "teardown hook", r, log);
+                if !Self::has_worktree(&w, &hook.cwd) {
+                    continue;
                 }
+                if !w.dir.join(&hook.cwd).is_dir() {
+                    log(&format!(
+                        "  skipping the teardown hook in {}: the folder is gone",
+                        hook.cwd
+                    ));
+                    continue;
+                }
+                let r = self.run_hook(&w, hook, &ctx, log);
+                attempt(errors, "teardown hook", r, log);
             }
         }
 
@@ -1959,6 +1978,40 @@ start_url = "http://localhost:5173/home"
         assert_eq!(t.origin, BranchOrigin::Existing);
         ws.remove_worktree(&id, "platform", &mut log).unwrap();
         assert!(git::local_branch_exists(&source, "someone-elses"));
+    }
+
+    #[test]
+    fn cleans_up_after_the_clone_is_deleted() {
+        let (d, mut ws, _source, id) = git_workspace();
+        ws.config.projects[0].stack = None;
+        ws.add_worktree(&id, "platform", None, None, &mut |_| {})
+            .unwrap();
+        let dir = ws.state.get(&id).unwrap().unwrap().dir;
+        ws.config.projects[0].repos[0].source = d.path().join("deleted-clone");
+
+        ws.cleanup(&id, None, &mut |_| {}).unwrap();
+        assert!(!dir.exists());
+        assert!(ws.state.get(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn cleans_up_after_the_worktree_folder_is_deleted() {
+        let (_d, mut ws, source, id) = git_workspace();
+        let project = &mut ws.config.projects[0];
+        project.stack = None;
+        project.hooks.teardown = toml::from_str::<crate::config::Hooks>(
+            "[[teardown]]\ncwd = \"platform\"\nrun = \"exit 1\"",
+        )
+        .unwrap()
+        .teardown;
+        ws.add_worktree(&id, "platform", None, None, &mut |_| {})
+            .unwrap();
+        let dir = ws.state.get(&id).unwrap().unwrap().dir;
+        std::fs::remove_dir_all(dir.join("platform")).unwrap();
+
+        ws.cleanup(&id, None, &mut |_| {}).unwrap();
+        assert!(!dir.exists());
+        assert!(!git::local_branch_exists(&source, "feat/header-layout-327"));
     }
 
     #[test]
