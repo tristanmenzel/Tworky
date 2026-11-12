@@ -47,12 +47,14 @@
     const unlisten = listen<KeepAwakeStatus>('keep-awake-changed', (e) => {
       heard = true
       status = e.payload
+      error = ''
     })
     unlisten
       .then(() => api.keepAwakeStatus())
       .then((s) => {
         if (!heard) status = s
       })
+      .catch(() => {})
     return () => void unlisten.then((f) => f())
   })
 

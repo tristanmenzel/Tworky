@@ -90,27 +90,35 @@ struct StuckRun {
 /// file is written.
 #[derive(Default)]
 struct BusyCounter {
-    mtimes: Option<HashMap<String, SystemTime>>,
+    mtimes: HashMap<String, SystemTime>,
     last_write: HashMap<String, Instant>,
     stuck_runs: HashMap<String, StuckRun>,
 }
 
 impl BusyCounter {
+    /// `mtimes` is `None` when the activity folder couldn't be read. A file's first time is only a
+    /// baseline, and a ticking session keeps its last time while its file is missing, so a poll
+    /// that misses files can't pass for a write when they reappear.
     fn count(
         &mut self,
         ticks: &HashMap<String, Ticks>,
-        mtimes: HashMap<String, SystemTime>,
+        mtimes: Option<HashMap<String, SystemTime>>,
         now: Instant,
     ) -> usize {
-        if let Some(before) = &self.mtimes {
-            for (id, mtime) in &mtimes {
-                if before.get(id) != Some(mtime) {
-                    self.last_write.insert(id.clone(), now);
+        if let Some(mtimes) = mtimes {
+            self.mtimes
+                .retain(|id, _| mtimes.contains_key(id) || ticks.contains_key(id));
+            for (id, mtime) in mtimes {
+                if self
+                    .mtimes
+                    .insert(id.clone(), mtime)
+                    .is_some_and(|m| m != mtime)
+                {
+                    self.last_write.insert(id, now);
                 }
             }
+            self.last_write.retain(|id, _| self.mtimes.contains_key(id));
         }
-        self.last_write.retain(|id, _| mtimes.contains_key(id));
-        self.mtimes = Some(mtimes);
         self.stuck_runs.retain(|id, stuck| {
             ticks
                 .get(id)
@@ -183,7 +191,7 @@ impl<L: Lock> Controller<L> {
         &mut self,
         mode: KeepAwake,
         ticks: &HashMap<String, Ticks>,
-        mtimes: HashMap<String, SystemTime>,
+        mtimes: Option<HashMap<String, SystemTime>>,
         now: Instant,
         power_source: impl FnOnce() -> PowerSource,
         acquire: impl FnOnce() -> Result<L>,
@@ -260,7 +268,7 @@ pub fn run(app: AppHandle) {
         let status = controller.step(
             mode,
             &state.sessions.ticks(),
-            activity::modified_all(&paths),
+            activity::modified_all(&paths).ok(),
             Instant::now(),
             power::power_source,
             || SleepLock::acquire(SLEEP_LOCK_REASON),
@@ -363,12 +371,16 @@ mod tests {
         }
 
         fn count(&mut self) -> usize {
+            let mtimes = HashMap::from([("acme-1".to_string(), self.session.mtime)]);
+            self.poll(Some(mtimes))
+        }
+
+        fn poll(&mut self, mtimes: Option<HashMap<String, SystemTime>>) -> usize {
             let ticks = self
                 .session
                 .ticks
                 .map(|t| HashMap::from([("acme-1".to_string(), t)]))
                 .unwrap_or_default();
-            let mtimes = HashMap::from([("acme-1".to_string(), self.session.mtime)]);
             self.counter.count(&ticks, mtimes, self.now)
         }
     }
@@ -483,8 +495,56 @@ mod tests {
         let mut counter = BusyCounter::default();
         let now = Instant::now();
         let mtimes = HashMap::from([("acme-1".to_string(), SystemTime::now())]);
-        counter.count(&HashMap::new(), mtimes, now);
+        counter.count(&HashMap::new(), Some(mtimes), now);
         assert!(counter.last_write.is_empty());
+    }
+
+    fn stuck_sim() -> Sim {
+        let mut sim = Sim::new();
+        sim.count();
+        assert_eq!(sim.run(15 * 60 + 1, true, None), 0);
+        sim
+    }
+
+    #[test]
+    fn a_poll_that_misses_files_is_not_a_write() {
+        let other = HashMap::from([("acme-2".to_string(), SystemTime::UNIX_EPOCH)]);
+        for missing in [None, Some(HashMap::new()), Some(other)] {
+            let mut sim = stuck_sim();
+            sim.now += SEC;
+            sim.session.ticks = Some(Ticks::after(sim.session.ticks, sim.now));
+            assert_eq!(sim.poll(missing), 0);
+            assert_eq!(sim.run(1, true, None), 0, "still stuck when it reappears");
+            assert!(sim.counter.last_write.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_write_after_a_poll_that_missed_files_ends_a_stuck_episode() {
+        let mut sim = stuck_sim();
+        sim.poll(Some(HashMap::new()));
+        sim.write();
+        assert_eq!(sim.run(1, true, None), 1);
+    }
+
+    #[test]
+    fn a_new_file_is_a_baseline_and_its_next_change_a_write() {
+        let mut counter = BusyCounter::default();
+        let now = Instant::now();
+        counter.count(&HashMap::new(), Some(HashMap::new()), now);
+        let t = SystemTime::UNIX_EPOCH;
+        counter.count(
+            &HashMap::new(),
+            Some(HashMap::from([("acme-1".to_string(), t)])),
+            now + SEC,
+        );
+        assert!(counter.last_write.is_empty());
+        counter.count(
+            &HashMap::new(),
+            Some(HashMap::from([("acme-1".to_string(), t + SEC)])),
+            now + 2 * SEC,
+        );
+        assert_eq!(counter.last_write["acme-1"], now + 2 * SEC);
     }
 
     #[derive(Debug)]
@@ -527,7 +587,7 @@ mod tests {
         let status = c.step(
             mode,
             ticks,
-            HashMap::new(),
+            Some(HashMap::new()),
             now,
             || {
                 read = true;

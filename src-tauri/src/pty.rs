@@ -29,6 +29,7 @@ struct Session {
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     shared: Arc<Mutex<Shared>>,
+    generation: u64,
 }
 
 struct SessionTicks {
@@ -37,8 +38,9 @@ struct SessionTicks {
 }
 
 /// Each live session's spinner ticks, apart from `inner` so the keep awake controller never waits
-/// behind a pty write that blocks. An entry is only touched by the reader of its own generation,
-/// so an old reader finishing after a respawn leaves the new session's entry alone.
+/// behind a pty write that blocks. An entry is started, and replaced, only under the `inner` lock,
+/// so its generation is always that of the session in `inner`. Ticks and ends from any other
+/// generation are ignored, so an old reader finishing after a respawn leaves the new entry alone.
 #[derive(Default, Clone)]
 struct TickBoard(Arc<Mutex<HashMap<String, SessionTicks>>>);
 
@@ -66,10 +68,6 @@ impl TickBoard {
         if board.get(id).is_some_and(|s| s.generation == generation) {
             board.remove(id);
         }
-    }
-
-    fn remove(&self, id: &str) {
-        self.0.lock().unwrap().remove(id);
     }
 
     fn current(&self) -> HashMap<String, Ticks> {
@@ -148,7 +146,23 @@ impl Sessions {
         let board = self.ticks.clone();
         let thread_id = id.to_string();
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
-        board.start(id, generation);
+        let previous = {
+            let mut inner = self.inner.lock().unwrap();
+            board.start(id, generation);
+            inner.insert(
+                id.to_string(),
+                Session {
+                    master: pty.master,
+                    writer,
+                    child,
+                    shared,
+                    generation,
+                },
+            )
+        };
+        if let Some(mut old) = previous {
+            let _ = old.child.kill();
+        }
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             let mut pending: Vec<u8> = Vec::new();
@@ -181,19 +195,6 @@ impl Sessions {
             board.end(&thread_id, generation);
             on_exit();
         });
-
-        let previous = self.inner.lock().unwrap().insert(
-            id.to_string(),
-            Session {
-                master: pty.master,
-                writer,
-                child,
-                shared,
-            },
-        );
-        if let Some(mut old) = previous {
-            let _ = old.child.kill();
-        }
         Ok(())
     }
 
@@ -245,10 +246,11 @@ impl Sessions {
     }
 
     pub fn kill(&self, id: &str) {
-        if let Some(mut s) = self.inner.lock().unwrap().remove(id) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(mut s) = inner.remove(id) {
+            self.ticks.end(id, s.generation);
             let _ = s.child.kill();
         }
-        self.ticks.remove(id);
     }
 
     pub fn live(&self) -> Vec<String> {
@@ -266,10 +268,11 @@ impl Sessions {
     }
 
     pub fn kill_all(&self) {
-        for (_, mut s) in self.inner.lock().unwrap().drain() {
+        let mut inner = self.inner.lock().unwrap();
+        self.ticks.0.lock().unwrap().clear();
+        for (_, mut s) in inner.drain() {
             let _ = s.child.kill();
         }
-        self.ticks.0.lock().unwrap().clear();
     }
 }
 
@@ -382,6 +385,37 @@ fn trim_front(s: &mut String, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tick_board_follows_only_the_current_generation() {
+        let board = TickBoard::default();
+        let now = std::time::Instant::now();
+        board.start("acme-1", 0);
+        assert!(board.current().is_empty(), "no ticks yet");
+        board.tick("acme-1", 0, now);
+        assert_eq!(board.current()["acme-1"].last, now);
+
+        board.start("acme-1", 1);
+        assert!(board.current().is_empty(), "a respawn starts afresh");
+        board.tick("acme-1", 0, now);
+        assert!(
+            board.current().is_empty(),
+            "the old reader's ticks are ignored"
+        );
+        board.end("acme-1", 0);
+        let later = now + std::time::Duration::from_secs(1);
+        board.tick("acme-1", 1, later);
+        assert_eq!(
+            board.current()["acme-1"].last,
+            later,
+            "the old reader's end leaves the new entry"
+        );
+
+        board.end("acme-1", 1);
+        assert!(board.current().is_empty());
+        board.tick("acme-1", 1, later);
+        assert!(board.current().is_empty(), "no entry after its end");
+    }
 
     #[test]
     fn keeps_split_multibyte_sequences() {

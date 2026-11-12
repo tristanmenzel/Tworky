@@ -189,11 +189,14 @@ pub fn read_all(paths: &Paths) -> HashMap<String, Session> {
 }
 
 /// Kept apart from `Session` so a write that changes nothing the UI shows isn't reported as a
-/// change.
-pub fn modified_all(paths: &Paths) -> HashMap<String, SystemTime> {
-    std::fs::read_dir(dir(paths))
-        .into_iter()
-        .flatten()
+/// change. A record whose time can't be read is left out.
+pub fn modified_all(paths: &Paths) -> std::io::Result<HashMap<String, SystemTime>> {
+    let entries = match std::fs::read_dir(dir(paths)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(entries
         .filter_map(|e| {
             let entry = e.ok()?;
             let path = entry.path();
@@ -203,7 +206,7 @@ pub fn modified_all(paths: &Paths) -> HashMap<String, SystemTime> {
             let worker = path.file_stem()?.to_str()?.to_string();
             Some((worker, entry.metadata().ok()?.modified().ok()?))
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -399,10 +402,10 @@ mod tests {
     fn modification_times_cover_records_only() {
         let home = tempfile::tempdir().unwrap();
         let paths = paths(home.path());
-        assert!(modified_all(&paths).is_empty());
+        assert!(modified_all(&paths).unwrap().is_empty());
         record(&paths, "acme-1", Activity::Working).unwrap();
         std::fs::write(dir(&paths).join("acme-2.1.0.tmp"), "{}").unwrap();
-        let modified = modified_all(&paths);
+        let modified = modified_all(&paths).unwrap();
         assert_eq!(modified.keys().collect::<Vec<_>>(), ["acme-1"]);
     }
 
