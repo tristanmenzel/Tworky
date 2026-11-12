@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod browser;
+mod keep_awake;
 mod pty;
+mod title;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -34,6 +36,8 @@ struct AppState {
     assets: Mutex<HashMap<String, std::sync::Arc<github::Asset>>>,
     background_tasks: Mutex<tworky_core::claude_config::BackgroundTasks>,
     activity: Mutex<HashMap<String, Session>>,
+    keep_awake: Mutex<keep_awake::Control>,
+    keep_awake_changed: std::sync::Condvar,
 }
 
 const FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
@@ -1258,7 +1262,9 @@ fn main() {
                 tauri::async_runtime::spawn(browser::restore(handle.clone()));
                 tauri::async_runtime::spawn(browser::keep_cookies_periodically(handle.clone()));
             }
+            let keep_awake_handle = handle.clone();
             std::thread::spawn(move || watch_activity(handle));
+            std::thread::spawn(move || keep_awake::run(keep_awake_handle));
             Ok(())
         })
         .register_asynchronous_uri_scheme_protocol("ghimg", |ctx, request, responder| {
@@ -1318,6 +1324,8 @@ fn main() {
             dismiss_update_failure,
             start_update,
             restart_for_update,
+            keep_awake::keep_awake_status,
+            keep_awake::set_keep_awake,
             browser::browser_tabs,
             browser::browser_open,
             browser::browser_navigate,

@@ -7,6 +7,9 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use tauri::ipc::Channel;
 use tworky_core::worker::Launch;
 
+use crate::keep_awake::Ticks;
+use crate::title::TitleTracker;
+
 const SCROLLBACK_LIMIT: usize = 512 * 1024;
 
 #[derive(Default)]
@@ -18,6 +21,7 @@ struct Shared {
     attached: bool,
     alive: bool,
     last_output: Option<std::time::Instant>,
+    ticks: Option<Ticks>,
 }
 
 struct Session {
@@ -91,6 +95,7 @@ impl Sessions {
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             let mut pending: Vec<u8> = Vec::new();
+            let mut titles = TitleTracker::default();
             loop {
                 let n = match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -101,8 +106,13 @@ impl Sessions {
                 if text.is_empty() {
                     continue;
                 }
+                let ticked = titles.feed(text.as_bytes());
+                let now = std::time::Instant::now();
                 let mut s = thread_shared.lock().unwrap();
-                s.last_output = Some(std::time::Instant::now());
+                s.last_output = Some(now);
+                if ticked {
+                    s.ticks = Some(Ticks::after(s.ticks, now));
+                }
                 s.scrollback.push_str(&text);
                 trim_front(&mut s.scrollback, SCROLLBACK_LIMIT);
                 if let Some(ch) = &s.channel
@@ -190,6 +200,19 @@ impl Sessions {
             .iter()
             .filter(|(_, s)| s.shared.lock().unwrap().alive)
             .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// The current run of title spinner ticks of each live session that has ticked.
+    pub fn ticks(&self) -> HashMap<String, Ticks> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, session)| {
+                let s = session.shared.lock().unwrap();
+                Some((id.clone(), s.ticks.filter(|_| s.alive)?))
+            })
             .collect()
     }
 
