@@ -555,6 +555,12 @@
     terminals = terminals.filter((t) => t !== id)
   }
 
+  async function terminate(w: Worker) {
+    await api.stop(w.id)
+    await loadWorkers()
+    closeTerminal(w.id)
+  }
+
   function workerById(id: string) {
     return workers.find((w) => w.id === id)
   }
@@ -995,6 +1001,7 @@
                 accounts={accountsOf(w)}
                 services={servicesOf(w).length}
                 onResume={() => mountTerminal({ ...w, session_alive: false })}
+                onTerminate={() => terminate(w)}
                 onOpenBrowser={(account) => openBrowser(w, account)}
                 onOpenAnonymous={() => openAnonymous(w)}
                 onCreateProfile={() => (createProfileFor = { worker: w, request: null })}

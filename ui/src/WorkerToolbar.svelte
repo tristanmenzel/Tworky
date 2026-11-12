@@ -11,13 +11,14 @@
     /** How many of the project's services have a port on this worker. */
     services: number
     onResume: () => void
+    onTerminate: () => Promise<void>
     onOpenBrowser: (account: string) => void
     onOpenAnonymous: () => void
     onCreateProfile: () => void
     onError: (message: string) => void
   }
 
-  let { worker, accounts, services, onResume, onOpenBrowser, onOpenAnonymous, onCreateProfile, onError }: Props =
+  let { worker, accounts, services, onResume, onTerminate, onOpenBrowser, onOpenAnonymous, onCreateProfile, onError }: Props =
     $props()
 
   const noService = $derived(services ? false : 'The project has no service with a port')
@@ -73,7 +74,7 @@
         class="danger"
         disabled={worker.busy}
         title="Stop Claude, everything it started and the worker's containers (kept, not removed)"
-        onclick={() => act(() => api.stop(worker.id))}>Terminate</button
+        onclick={() => act(onTerminate)}>Terminate</button
       >
     {:else}
       <span class="muted">Claude not running</span>
