@@ -24,7 +24,6 @@ const POLL: Duration = Duration::from_secs(1);
 const POWER_POLL: Duration = Duration::from_secs(15);
 const LOCK_RETRY: Duration = Duration::from_secs(60);
 
-/// A session's current run of spinner ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ticks {
     pub run_start: Instant,
@@ -68,7 +67,6 @@ impl Default for KeepAwakeStatus {
     }
 }
 
-/// The part of `AppState` the commands and the controller share.
 #[derive(Default)]
 pub struct Control {
     pub mode: KeepAwake,
@@ -159,7 +157,7 @@ impl Lock for SleepLock {
     }
 }
 
-/// The controller's state between ticks. OS calls come in through `step`'s arguments.
+/// OS calls come in through `step`'s arguments so tests can fake them.
 struct Controller<L> {
     has_battery: bool,
     busy: BusyCounter,
@@ -248,7 +246,6 @@ impl<L: Lock> Controller<L> {
     }
 }
 
-/// Runs for the life of the app, ticking every second or as soon as the mode changes.
 pub fn run(app: AppHandle) {
     let Ok(paths) = Paths::resolve() else { return };
     let state = app.state::<AppState>();
@@ -318,7 +315,6 @@ mod tests {
         mtime: SystemTime,
     }
 
-    /// Drives a `BusyCounter` for one session a second at a time.
     struct Sim {
         counter: BusyCounter,
         now: Instant,
@@ -337,15 +333,11 @@ mod tests {
             }
         }
 
-        /// Advances `secs` seconds, ticking each second when `ticking`, writing the activity file
-        /// every `write_every` seconds, and returns the last busy count.
         fn run(&mut self, secs: u64, ticking: bool, write_every: Option<u64>) -> usize {
             let trace = self.trace(secs, ticking.then_some(1), write_every);
             trace.last().copied().unwrap_or(0)
         }
 
-        /// Advances `secs` seconds, ticking every `tick_every` seconds and writing the activity
-        /// file every `write_every` seconds, and returns the busy count after each second.
         fn trace(
             &mut self,
             secs: u64,

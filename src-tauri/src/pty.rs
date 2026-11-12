@@ -261,7 +261,6 @@ impl Sessions {
             .collect()
     }
 
-    /// The current run of title spinner ticks of each live session that has ticked.
     pub fn ticks(&self) -> HashMap<String, Ticks> {
         self.ticks.current()
     }

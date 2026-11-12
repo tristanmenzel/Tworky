@@ -188,8 +188,8 @@ pub fn read_all(paths: &Paths) -> HashMap<String, Session> {
         .collect()
 }
 
-/// When each record was last written, kept apart from `Session` so a write that changes nothing
-/// the UI shows isn't reported as a change.
+/// Kept apart from `Session` so a write that changes nothing the UI shows isn't reported as a
+/// change.
 pub fn modified_all(paths: &Paths) -> HashMap<String, SystemTime> {
     std::fs::read_dir(dir(paths))
         .into_iter()

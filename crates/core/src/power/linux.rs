@@ -20,7 +20,6 @@ const PORTAL: &str = "org.freedesktop.portal.Desktop";
 const REQUEST: &str = "org.freedesktop.portal.Request";
 const DBUS: &str = "org.freedesktop.DBus";
 const SYSFS_POWER_SUPPLY: &str = "/sys/class/power_supply";
-/// The portal's `Inhibit` flag for suspend.
 const INHIBIT_SUSPEND: u32 = 4;
 const TIMEOUT: Duration = Duration::from_secs(2);
 

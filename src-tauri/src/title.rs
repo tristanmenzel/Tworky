@@ -19,8 +19,8 @@ enum State {
     OscEscape,
 }
 
-/// Parses the byte stream across reads. Spinner glyphs are single code points, so the leading
-/// `char` stands in for the leading grapheme: a variation selector after it doesn't change it.
+/// Spinner glyphs are single code points, so the leading `char` stands in for the leading
+/// grapheme: a variation selector after it doesn't change it.
 #[derive(Default)]
 pub struct TitleTracker {
     state: State,
