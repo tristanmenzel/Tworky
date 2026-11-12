@@ -17,8 +17,8 @@ pub fn ports_for_slot(base: &PortMap, slot: u16, stride: u16) -> PortMap {
 /// not when it only binds one, so the wildcard checks are exclusive binds that never listen.
 #[cfg(windows)]
 pub fn is_free(port: u16) -> bool {
-    // Each step closes its socket before the next runs: the 127.0.0.1 listener would otherwise
-    // make the exclusive 0.0.0.0 bind fail, and every port would read busy.
+    // Each step drops its socket before the next; a held 127.0.0.1 listener makes the exclusive
+    // 0.0.0.0 bind fail, so every port would read busy.
     let steps: [&dyn Fn() -> bool; 4] = [
         &|| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
         &|| exclusive_bind((Ipv4Addr::UNSPECIFIED, port).into()).is_ok(),
@@ -36,7 +36,7 @@ pub fn is_free(port: u16) -> bool {
         && ipv6_free(TcpListener::bind((Ipv6Addr::LOCALHOST, port)))
 }
 
-/// Machines without IPv6 fail IPv6 binds with other errors, which mustn't make every port busy.
+/// Other IPv6 bind errors count as free so machines without IPv6 don't read every port as busy.
 fn ipv6_free<T>(probe: io::Result<T>) -> bool {
     !matches!(
         probe.map_err(|e| e.kind()),
