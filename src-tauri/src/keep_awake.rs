@@ -14,8 +14,11 @@ use tworky_core::settings::{KeepAwake, Settings};
 
 use crate::{AppState, CmdResult, err};
 
-/// A session is busy this long after its last spinner tick, and a longer gap starts a new run.
+/// A session is busy this long after its last spinner tick.
 pub const BUSY_WINDOW: Duration = Duration::from_secs(5);
+/// A longer gap between ticks starts a new run. It is wider than `BUSY_WINDOW` so that a title
+/// changing every few seconds is one run for the stuck rule rather than many short ones.
+const STUCK_RUN_GAP: Duration = Duration::from_secs(60);
 const STUCK_AFTER: Duration = Duration::from_secs(15 * 60);
 const POLL: Duration = Duration::from_secs(1);
 const POWER_POLL: Duration = Duration::from_secs(15);
@@ -31,7 +34,7 @@ pub struct Ticks {
 impl Ticks {
     pub fn after(previous: Option<Ticks>, now: Instant) -> Ticks {
         match previous {
-            Some(t) if now.saturating_duration_since(t.last) <= BUSY_WINDOW => {
+            Some(t) if now.saturating_duration_since(t.last) <= STUCK_RUN_GAP => {
                 Ticks { last: now, ..t }
             }
             _ => Ticks {
@@ -80,12 +83,18 @@ fn is_stuck(ticks: Ticks, last_write: Option<Instant>, now: Instant) -> bool {
     now.saturating_duration_since(since) >= STUCK_AFTER
 }
 
-/// Counts busy sessions, leaving out each stuck one until its run of ticks ends.
+struct StuckRun {
+    run_start: Instant,
+    at: Instant,
+}
+
+/// Counts busy sessions, leaving out each stuck one until its run of ticks ends or its activity
+/// file is written.
 #[derive(Default)]
 struct BusyCounter {
     mtimes: Option<HashMap<String, SystemTime>>,
     last_write: HashMap<String, Instant>,
-    stuck_runs: HashMap<String, Instant>,
+    stuck_runs: HashMap<String, StuckRun>,
 }
 
 impl BusyCounter {
@@ -104,8 +113,12 @@ impl BusyCounter {
         }
         self.last_write.retain(|id, _| mtimes.contains_key(id));
         self.mtimes = Some(mtimes);
-        self.stuck_runs
-            .retain(|id, run| ticks.get(id).is_some_and(|t| t.run_start == *run));
+        self.stuck_runs.retain(|id, stuck| {
+            ticks
+                .get(id)
+                .is_some_and(|t| t.run_start == stuck.run_start)
+                && self.last_write.get(id).is_none_or(|&w| w <= stuck.at)
+        });
 
         let mut busy = 0;
         for (id, &t) in ticks {
@@ -116,7 +129,13 @@ impl BusyCounter {
             }
             if is_stuck(t, self.last_write.get(id).copied(), now) {
                 eprintln!("keep awake: {id} has ticked for 15 min without activity; ignoring it");
-                self.stuck_runs.insert(id.clone(), t.run_start);
+                self.stuck_runs.insert(
+                    id.clone(),
+                    StuckRun {
+                        run_start: t.run_start,
+                        at: now,
+                    },
+                );
                 continue;
             }
             busy += 1;
@@ -249,6 +268,7 @@ pub fn run(app: AppHandle) {
             power::power_source,
             || SleepLock::acquire(SLEEP_LOCK_REASON),
         );
+        state.keep_awake.lock().unwrap().status = status.clone();
         if emitted.as_ref() != Some(&status) {
             let was_holding = emitted
                 .as_ref()
@@ -262,10 +282,9 @@ pub fn run(app: AppHandle) {
                 eprintln!("keep awake: {verb} ({} busy)", status.busy_sessions);
             }
             let _ = app.emit("keep-awake-changed", &status);
-            emitted = Some(status.clone());
+            emitted = Some(status);
         }
-        let mut control = state.keep_awake.lock().unwrap();
-        control.status = status;
+        let control = state.keep_awake.lock().unwrap();
         let _ = state
             .keep_awake_changed
             .wait_timeout_while(control, POLL, |c| c.mode == mode);
@@ -321,18 +340,30 @@ mod tests {
         /// Advances `secs` seconds, ticking each second when `ticking`, writing the activity file
         /// every `write_every` seconds, and returns the last busy count.
         fn run(&mut self, secs: u64, ticking: bool, write_every: Option<u64>) -> usize {
-            let mut busy = 0;
-            for i in 1..=secs {
-                self.now += SEC;
-                if ticking {
-                    self.session.ticks = Some(Ticks::after(self.session.ticks, self.now));
-                }
-                if write_every.is_some_and(|n| i % n == 0) {
-                    self.write();
-                }
-                busy = self.count();
-            }
-            busy
+            let trace = self.trace(secs, ticking.then_some(1), write_every);
+            trace.last().copied().unwrap_or(0)
+        }
+
+        /// Advances `secs` seconds, ticking every `tick_every` seconds and writing the activity
+        /// file every `write_every` seconds, and returns the busy count after each second.
+        fn trace(
+            &mut self,
+            secs: u64,
+            tick_every: Option<u64>,
+            write_every: Option<u64>,
+        ) -> Vec<usize> {
+            (1..=secs)
+                .map(|i| {
+                    self.now += SEC;
+                    if tick_every.is_some_and(|n| i % n == 0) {
+                        self.session.ticks = Some(Ticks::after(self.session.ticks, self.now));
+                    }
+                    if write_every.is_some_and(|n| i % n == 0) {
+                        self.write();
+                    }
+                    self.count()
+                })
+                .collect()
         }
 
         fn write(&mut self) {
@@ -351,13 +382,13 @@ mod tests {
     }
 
     #[test]
-    fn ticks_continue_a_run_within_the_busy_window_and_start_one_after() {
+    fn ticks_continue_a_run_across_gaps_up_to_a_minute() {
         let start = Instant::now();
         let t = Ticks::after(None, start);
-        let t = Ticks::after(Some(t), start + 5 * SEC);
+        let t = Ticks::after(Some(t), start + MIN);
         assert_eq!(t.run_start, start);
-        let t = Ticks::after(Some(t), start + 11 * SEC);
-        assert_eq!(t.run_start, start + 11 * SEC);
+        let t = Ticks::after(Some(t), start + 2 * MIN + SEC);
+        assert_eq!(t.run_start, start + 2 * MIN + SEC);
     }
 
     #[test]
@@ -370,27 +401,62 @@ mod tests {
     }
 
     #[test]
-    fn a_run_without_writes_is_stuck_until_its_ticks_stop() {
+    fn a_run_without_writes_is_stuck_until_its_ticks_stop_for_a_minute() {
         let mut sim = Sim::new();
         sim.count();
         assert_eq!(sim.run(15 * 60, true, None), 1);
         assert_eq!(sim.run(1, true, None), 0);
-        sim.write();
-        assert_eq!(sim.run(10 * 60, true, None), 0, "a write doesn't end it");
+        assert_eq!(sim.run(10 * 60, true, None), 0);
 
-        sim.run(6, false, None);
+        sim.run(60, false, None);
         assert_eq!(sim.run(1, true, None), 1, "a new run is judged afresh");
         assert_eq!(sim.run(15 * 60 - 1, true, None), 1);
         assert_eq!(sim.run(1, true, None), 0, "a second episode");
     }
 
     #[test]
-    fn a_short_pause_does_not_end_a_stuck_run() {
+    fn a_pause_under_a_minute_does_not_end_a_stuck_run() {
         let mut sim = Sim::new();
         sim.count();
         assert_eq!(sim.run(15 * 60 + 1, true, None), 0);
-        sim.run(4, false, None);
+        sim.run(59, false, None);
         assert_eq!(sim.run(1, true, None), 0);
+    }
+
+    #[test]
+    fn a_write_ends_a_stuck_episode() {
+        let mut sim = Sim::new();
+        sim.count();
+        assert_eq!(sim.run(15 * 60 + 1, true, None), 0);
+        sim.write();
+        assert_eq!(sim.run(1, true, None), 1);
+        assert_eq!(sim.run(15 * 60 - 1, true, None), 1);
+        assert_eq!(
+            sim.run(1, true, None),
+            0,
+            "stuck again without another write"
+        );
+    }
+
+    #[test]
+    fn a_title_changing_every_few_seconds_goes_stuck_and_stays_out() {
+        let mut sim = Sim::new();
+        sim.count();
+        let trace = sim.trace(30 * 60, Some(6), None);
+        assert_eq!(trace[..5], [0; 5]);
+        assert_eq!(trace[5..10], [1; 5]);
+        assert_eq!(trace[899], 1);
+        assert!(trace[905..].iter().all(|&b| b == 0), "no churn once stuck");
+
+        sim.run(60, false, None);
+        assert_eq!(
+            sim.run(1, true, None),
+            1,
+            "the run ended a minute after the last tick"
+        );
+        let trace = sim.trace(16 * 60, Some(6), None);
+        assert_eq!(trace[..899].iter().filter(|&&b| b == 0).count(), 150);
+        assert!(trace[899..].iter().all(|&b| b == 0), "a second episode");
     }
 
     #[test]

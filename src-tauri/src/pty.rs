@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -21,7 +22,6 @@ struct Shared {
     attached: bool,
     alive: bool,
     last_output: Option<std::time::Instant>,
-    ticks: Option<Ticks>,
 }
 
 struct Session {
@@ -31,9 +31,62 @@ struct Session {
     shared: Arc<Mutex<Shared>>,
 }
 
+struct SessionTicks {
+    generation: u64,
+    ticks: Option<Ticks>,
+}
+
+/// Each live session's spinner ticks, apart from `inner` so the keep awake controller never waits
+/// behind a pty write that blocks. An entry is only touched by the reader of its own generation,
+/// so an old reader finishing after a respawn leaves the new session's entry alone.
+#[derive(Default, Clone)]
+struct TickBoard(Arc<Mutex<HashMap<String, SessionTicks>>>);
+
+impl TickBoard {
+    fn start(&self, id: &str, generation: u64) {
+        self.0.lock().unwrap().insert(
+            id.to_string(),
+            SessionTicks {
+                generation,
+                ticks: None,
+            },
+        );
+    }
+
+    fn tick(&self, id: &str, generation: u64, now: std::time::Instant) {
+        if let Some(s) = self.0.lock().unwrap().get_mut(id)
+            && s.generation == generation
+        {
+            s.ticks = Some(Ticks::after(s.ticks, now));
+        }
+    }
+
+    fn end(&self, id: &str, generation: u64) {
+        let mut board = self.0.lock().unwrap();
+        if board.get(id).is_some_and(|s| s.generation == generation) {
+            board.remove(id);
+        }
+    }
+
+    fn remove(&self, id: &str) {
+        self.0.lock().unwrap().remove(id);
+    }
+
+    fn current(&self) -> HashMap<String, Ticks> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, s)| Some((id.clone(), s.ticks?)))
+            .collect()
+    }
+}
+
 #[derive(Default)]
 pub struct Sessions {
     inner: Mutex<HashMap<String, Session>>,
+    ticks: TickBoard,
+    generations: AtomicU64,
 }
 
 impl Sessions {
@@ -92,6 +145,10 @@ impl Sessions {
         }));
 
         let thread_shared = shared.clone();
+        let board = self.ticks.clone();
+        let thread_id = id.to_string();
+        let generation = self.generations.fetch_add(1, Ordering::Relaxed);
+        board.start(id, generation);
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             let mut pending: Vec<u8> = Vec::new();
@@ -106,13 +163,12 @@ impl Sessions {
                 if text.is_empty() {
                     continue;
                 }
-                let ticked = titles.feed(text.as_bytes());
                 let now = std::time::Instant::now();
+                if titles.feed(text.as_bytes()) {
+                    board.tick(&thread_id, generation, now);
+                }
                 let mut s = thread_shared.lock().unwrap();
                 s.last_output = Some(now);
-                if ticked {
-                    s.ticks = Some(Ticks::after(s.ticks, now));
-                }
                 s.scrollback.push_str(&text);
                 trim_front(&mut s.scrollback, SCROLLBACK_LIMIT);
                 if let Some(ch) = &s.channel
@@ -122,6 +178,7 @@ impl Sessions {
                 }
             }
             thread_shared.lock().unwrap().alive = false;
+            board.end(&thread_id, generation);
             on_exit();
         });
 
@@ -191,6 +248,7 @@ impl Sessions {
         if let Some(mut s) = self.inner.lock().unwrap().remove(id) {
             let _ = s.child.kill();
         }
+        self.ticks.remove(id);
     }
 
     pub fn live(&self) -> Vec<String> {
@@ -205,21 +263,14 @@ impl Sessions {
 
     /// The current run of title spinner ticks of each live session that has ticked.
     pub fn ticks(&self) -> HashMap<String, Ticks> {
-        self.inner
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|(id, session)| {
-                let s = session.shared.lock().unwrap();
-                Some((id.clone(), s.ticks.filter(|_| s.alive)?))
-            })
-            .collect()
+        self.ticks.current()
     }
 
     pub fn kill_all(&self) {
         for (_, mut s) in self.inner.lock().unwrap().drain() {
             let _ = s.child.kill();
         }
+        self.ticks.0.lock().unwrap().clear();
     }
 }
 
