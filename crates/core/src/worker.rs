@@ -1031,6 +1031,37 @@ impl Workspace {
             bail!("cleanup incomplete: {}", errors.join("; "))
         }
     }
+
+    pub fn item_for_worker(&self, w: &WorkerRecord) -> Result<Option<String>> {
+        if let Some(item) = &w.item {
+            return Ok(Some(item.name.clone()));
+        }
+        match w.issue_id() {
+            Some(issue_id) => Ok(self.state.item_for_issue(issue_id)?.map(|i| i.name)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn cleanup_and_remove_item(
+        &self,
+        id: &str,
+        session_pid: Option<u32>,
+        log: Log,
+    ) -> Result<()> {
+        let w = self.worker(id)?;
+        let item = self.item_for_worker(&w)?;
+        self.cleanup(id, session_pid, log)?;
+        match item {
+            Some(name) => {
+                if self.state.get_item(&name)?.is_some() {
+                    self.state.delete_item(&name)?;
+                }
+                log(&format!("✓ removed {name} from the list"));
+            }
+            None => log("  the worker has no item on the list"),
+        }
+        Ok(())
+    }
 }
 
 fn remove_dir(path: &Path) -> Result<()> {
@@ -1838,6 +1869,89 @@ start_url = "http://localhost:5173/home"
         }
         assert!(ws.state.get_item("quiet-lynx").unwrap().is_none());
         assert!(ws.state.get_item("tidy-seal").unwrap().is_some());
+    }
+
+    fn issue_ref_t() -> IssueRef {
+        let idx = index();
+        let t = idx.get("T").unwrap();
+        IssueRef {
+            id: t.id.clone(),
+            number: t.number,
+            repo: t.repo.clone(),
+            title: t.title.clone(),
+            url: t.url.clone(),
+        }
+    }
+
+    #[test]
+    fn cleanup_and_remove_item_removes_a_custom_item() {
+        let (_d, ws) = workspace();
+        insert_item(&ws, "tidy-seal", ItemSource::Custom, false);
+        let w = ws.plan_item("tidy-seal", &IssueIndex::default()).unwrap();
+        let mut lines = Vec::new();
+        ws.cleanup_and_remove_item(&w.id, None, &mut |l| lines.push(l.to_string()))
+            .unwrap();
+        assert!(ws.state.get(&w.id).unwrap().is_none());
+        assert!(ws.state.get_item("tidy-seal").unwrap().is_none());
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "✓ removed tidy-seal from the list")
+        );
+    }
+
+    #[test]
+    fn cleanup_and_remove_item_removes_an_issue_item() {
+        let (_d, ws) = workspace();
+        insert_item(&ws, "keen-lynx", ItemSource::Issue(issue_ref_t()), false);
+        let w = ws.plan_item("keen-lynx", &index()).unwrap();
+        ws.cleanup_and_remove_item(&w.id, None, &mut |_| {})
+            .unwrap();
+        assert!(ws.state.get(&w.id).unwrap().is_none());
+        assert!(ws.state.get_item("keen-lynx").unwrap().is_none());
+    }
+
+    #[test]
+    fn cleanup_and_remove_item_tolerates_a_scratch_item() {
+        let (_d, ws) = workspace();
+        insert_item(&ws, "quiet-lynx", ItemSource::Custom, true);
+        let w = ws.plan_item("quiet-lynx", &IssueIndex::default()).unwrap();
+        ws.cleanup_and_remove_item(&w.id, None, &mut |_| {})
+            .unwrap();
+        assert!(ws.state.get_item("quiet-lynx").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_cleanup_keeps_the_item() {
+        let (_d, mut ws, _source, id) = git_workspace();
+        let project = &mut ws.config.projects[0];
+        project.stack = None;
+        project.hooks.teardown = toml::from_str::<crate::config::Hooks>(
+            "[[teardown]]\ncwd = \"platform\"\nrun = \"exit 1\"",
+        )
+        .unwrap()
+        .teardown;
+        ws.add_worktree(&id, "platform", None, None, &mut |_| {})
+            .unwrap();
+        insert_item(&ws, "keen-lynx", ItemSource::Issue(issue_ref_t()), false);
+
+        assert!(ws.cleanup_and_remove_item(&id, None, &mut |_| {}).is_err());
+        assert!(ws.state.get_item("keen-lynx").unwrap().is_some());
+        assert_eq!(
+            ws.state.get(&id).unwrap().unwrap().status,
+            WorkerStatus::Failed
+        );
+    }
+
+    #[test]
+    fn cleanup_and_remove_item_cleans_up_a_worker_with_no_item() {
+        let (_d, ws) = workspace();
+        let w = ws.plan(&index(), "T").unwrap();
+        let mut lines = Vec::new();
+        ws.cleanup_and_remove_item(&w.id, None, &mut |l| lines.push(l.to_string()))
+            .unwrap();
+        assert!(ws.state.get(&w.id).unwrap().is_none());
+        assert!(lines.iter().any(|l| l.contains("no item on the list")));
     }
 
     #[test]

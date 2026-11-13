@@ -828,14 +828,22 @@ fn run_session_job(
 }
 
 #[tauri::command]
-async fn cleanup_worker(app: AppHandle, id: String) -> CmdResult<()> {
+async fn cleanup_worker(app: AppHandle, id: String, remove_item: bool) -> CmdResult<()> {
     browser::forget_worker(&app, &id).await;
     if let Some(mcp) = app.try_state::<browser::Mcp>() {
         mcp.revoke(&id);
     }
     let job_id = id.clone();
-    blocking(move || run_session_job(app, id, move |ws, pid, log| ws.cleanup(&job_id, pid, log)))
-        .await
+    blocking(move || {
+        run_session_job(app, id, move |ws, pid, log| {
+            if remove_item {
+                ws.cleanup_and_remove_item(&job_id, pid, log)
+            } else {
+                ws.cleanup(&job_id, pid, log)
+            }
+        })
+    })
+    .await
 }
 
 #[tauri::command]
