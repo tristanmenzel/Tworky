@@ -10,6 +10,8 @@
     accounts: string[]
     /** How many of the project's services have a port on this worker. */
     services: number
+    /** A reason the worker's item can't be removed with it, or `false` when it can. */
+    removeItem: string | false
     onResume: () => void
     onTerminate: () => Promise<void>
     onOpenBrowser: (account: string) => void
@@ -18,7 +20,7 @@
     onError: (message: string) => void
   }
 
-  let { worker, accounts, services, onResume, onTerminate, onOpenBrowser, onOpenAnonymous, onCreateProfile, onError }: Props =
+  let { worker, accounts, services, removeItem, onResume, onTerminate, onOpenBrowser, onOpenAnonymous, onCreateProfile, onError }: Props =
     $props()
 
   const noService = $derived(services ? false : 'The project has no service with a port')
@@ -41,11 +43,16 @@
     }
   }
 
-  async function cleanup() {
+  const cleanupItems = $derived<MenuItem[]>([
+    { label: 'Clean up', onSelect: () => cleanup(false) },
+    { label: 'Clean up and remove item', danger: true, disabled: removeItem, onSelect: () => cleanup(true) },
+  ])
+
+  async function cleanup(removeItem: boolean) {
     checking = true
     const prs = await api.prs(worker.id).catch(() => null)
     checking = false
-    if (confirmCleanup(worker, prs)) act(() => api.cleanup(worker.id))
+    if (confirmCleanup(worker, prs, removeItem)) act(() => api.cleanup(worker.id, removeItem))
   }
 </script>
 
@@ -84,9 +91,13 @@
       <ActionMenu label="Open browser" trigger="Open browser ▾" items={browserItems} />
     {/if}
     <button onclick={() => act(() => api.openDir(worker.id))}>Open folder</button>
-    <button class="danger" disabled={checking || worker.busy || worker.status === 'cleaning'} onclick={cleanup}>
-      {checking ? 'Checking PRs…' : 'Clean up'}
-    </button>
+    <ActionMenu
+      label="Clean up"
+      trigger={checking ? 'Checking PRs…' : 'Clean up ▾'}
+      danger
+      disabled={checking || worker.busy || worker.status === 'cleaning'}
+      items={cleanupItems}
+    />
   </span>
 </div>
 

@@ -14,7 +14,9 @@
     items,
     label = 'Actions',
     trigger = '⋯',
-  }: { items: MenuItem[]; label?: string; trigger?: string } = $props()
+    danger = false,
+    disabled = false,
+  }: { items: MenuItem[]; label?: string; trigger?: string; danger?: boolean; disabled?: boolean } = $props()
 
   let open = $state(false)
   let root: HTMLDivElement
@@ -35,8 +37,15 @@
 />
 
 <div class="menu" bind:this={root}>
-  <button class="trigger" class:icon={trigger === '⋯'} aria-label={label} aria-haspopup="menu" aria-expanded={open} onclick={() => (open = !open)}
-    >{trigger}</button
+  <button
+    class="trigger"
+    class:icon={trigger === '⋯'}
+    class:danger
+    {disabled}
+    aria-label={label}
+    aria-haspopup="menu"
+    aria-expanded={open}
+    onclick={() => (open = !open)}>{trigger}</button
   >
   {#if open}
     <div class="popup" role="menu">

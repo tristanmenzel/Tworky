@@ -50,6 +50,7 @@
     activityRank,
     formatBytes,
     jobLabel,
+    removeItemReason,
     serviceUrl,
     subjectLabel,
     subjectUrl,
@@ -227,10 +228,17 @@
       workers = await api.workers()
       const ids = new Set(workers.map((w) => w.id))
       terminals = terminals.filter((t) => ids.has(t))
-      if (before.some((w) => w.issue && !ids.has(w.id))) loadIssues(false)
+      const gone = before.filter((w) => !ids.has(w.id))
+      if (gone.length) reloadWorkList(gone.some((w) => w.issue))
     } catch (e) {
       showError(String(e))
     }
+  }
+
+  async function reloadWorkList(withIssues: boolean) {
+    await Promise.all([withIssues && loadIssues(false), loadItems()])
+    if (selectedId && !cards.some((c) => c.id === selectedId) && !otherItems.some((i) => ITEM_PREFIX + i.name === selectedId))
+      selectedId = null
   }
 
   async function loadJobs() {
@@ -844,6 +852,7 @@
                 projects={payload?.projects ?? {}}
                 statusBoards={payload?.status_boards ?? {}}
                 viewer={payload?.viewer ?? ''}
+                {items}
                 {workers}
                 {exited}
                 {jobs}
@@ -892,6 +901,7 @@
                   local={local[w.id] ?? null}
                   localFailed={localFailed[w.id] ?? false}
                   log={logs[w.id] ?? []}
+                  removeItem={removeItemReason(w, items)}
                   onOpenWorker={openTerminal}
                   onError={showError}
                 />
@@ -1002,6 +1012,7 @@
                 worker={w}
                 accounts={accountsOf(w)}
                 services={servicesOf(w).length}
+                removeItem={removeItemReason(w, items)}
                 onResume={() => mountTerminal({ ...w, session_alive: false })}
                 onTerminate={() => terminate(w)}
                 onOpenBrowser={(account) => openBrowser(w, account)}

@@ -484,7 +484,7 @@ export const api = {
     invoke<IssuesPayload>('set_issue_state', { issueId, state }),
   setBoardStatus: (issueId: string, projectId: string, optionId: string) =>
     invoke<IssuesPayload>('set_board_status', { issueId, projectId, optionId }),
-  cleanup: (id: string) => invoke<void>('cleanup_worker', { id }),
+  cleanup: (id: string, removeItem = false) => invoke<void>('cleanup_worker', { id, removeItem }),
   prs: (id: string) => invoke<PrSummary>('pr_summary', { id }),
   openSession: (id: string, cols: number, rows: number, onOutput: Channel<string>) =>
     invoke<void>('open_session', { id, cols, rows, onOutput }),

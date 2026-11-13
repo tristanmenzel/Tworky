@@ -3,6 +3,7 @@
   import { openUrl } from '@tauri-apps/plugin-opener'
   import type { Item, Job, LocalStatus, Worker } from './api'
   import { ExistingWorkLoader } from './existingWork.svelte'
+  import { removeItemReason } from './issue'
   import LocalWork from './LocalWork.svelte'
   import Markdown from './Markdown.svelte'
   import PullRequests from './PullRequests.svelte'
@@ -109,7 +110,16 @@
     </section>
 
     {#if worker}
-      <LocalWork {worker} {jobs} {local} {localFailed} log={logs} {onOpenWorker} {onError} />
+      <LocalWork
+        {worker}
+        {jobs}
+        {local}
+        {localFailed}
+        log={logs}
+        removeItem={removeItemReason(worker, [item])}
+        {onOpenWorker}
+        {onError}
+      />
     {/if}
 
     {#if item.source.kind === 'custom'}
