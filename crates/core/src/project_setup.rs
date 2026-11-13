@@ -303,7 +303,7 @@ impl Workspace {
                 problem(
                     Level::Warning,
                     format!(
-                        "port {key} = {port} is blocked by browsers (ERR_UNSAFE_PORT), so the main checkout can't be opened in a browser tab"
+                        "port {key} = {port} is blocked by browsers (ERR_UNSAFE_PORT), so if it serves pages, the main checkout can't be opened on it in a browser tab"
                     ),
                 );
             }
@@ -625,7 +625,7 @@ start_service = "web"
         assert_eq!(
             blocked,
             [
-                "port vite = 6000 is blocked by browsers (ERR_UNSAFE_PORT), so the main checkout can't be opened in a browser tab"
+                "port vite = 6000 is blocked by browsers (ERR_UNSAFE_PORT), so if it serves pages, the main checkout can't be opened on it in a browser tab"
             ]
         );
     }
