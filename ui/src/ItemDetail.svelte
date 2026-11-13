@@ -2,12 +2,12 @@
   import { untrack } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import type { Item, Job, LocalStatus, Worker } from './api'
-  import { ask } from './confirm.svelte'
   import { ExistingWorkLoader } from './existingWork.svelte'
   import { ownsItem } from './issue'
   import LocalWork from './LocalWork.svelte'
   import Markdown from './Markdown.svelte'
   import PullRequests from './PullRequests.svelte'
+  import WrapUp from './WrapUp.svelte'
 
   interface Props {
     item: Item
@@ -65,16 +65,6 @@
       linking = false
     }
   }
-
-  async function remove() {
-    const ok = await ask({
-      title: `Remove ${item.name}?`,
-      message: `“${item.title}” comes off the list.`,
-      confirmLabel: 'Remove item',
-      danger: true,
-    })
-    if (ok) onRemove(item.name)
-  }
 </script>
 
 <div class="detail">
@@ -124,6 +114,7 @@
         {localFailed}
         log={logs}
         ownsItem={ownsItem(worker, [item])}
+        cleanup={false}
         {onOpenWorker}
         {onError}
       />
@@ -156,20 +147,15 @@
       </section>
     {/if}
 
-    <section class="panel box">
-      <h2>Remove</h2>
-      <div class="row">
-        <span class="muted">
-          {worker ? `Clean up worker ${worker.id} first; then the item can be removed.` : 'Take this item off the list.'}
-        </span>
-        <button
-          class="danger"
-          disabled={!!worker}
-          title={worker ? 'Clean up the worker first' : undefined}
-          onclick={remove}>Remove from list</button
-        >
-      </div>
-    </section>
+    <WrapUp
+      {worker}
+      ownsItem={!!worker && ownsItem(worker, [item])}
+      scratch={item.scratch}
+      label={item.name}
+      title={item.title}
+      onRemove={() => onRemove(item.name)}
+      {onError}
+    />
   </div>
 
   <div class="column">
@@ -264,9 +250,6 @@
     display: flex;
     gap: 8px;
     align-items: center;
-  }
-  .row .muted {
-    margin-right: auto;
   }
   input {
     flex: 1;

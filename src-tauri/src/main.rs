@@ -1113,14 +1113,23 @@ async fn new_conversation(app: AppHandle, id: String) -> CmdResult<()> {
 }
 
 #[tauri::command]
-async fn open_worker_dir(id: String) -> CmdResult<()> {
+async fn open_worker_dir(id: String, repo: Option<String>) -> CmdResult<()> {
     blocking(move || {
         let w = workspace()?
             .state
             .get(&id)
             .map_err(err)?
             .ok_or("worker not found")?;
-        tauri_plugin_opener::open_path(&w.dir, None::<&str>).map_err(err)
+        let dir = match repo {
+            Some(repo) => {
+                if !w.worktrees.iter().any(|t| t.repo == repo) {
+                    return Err(format!("{repo} is not a worktree of {id}"));
+                }
+                w.dir.join(repo)
+            }
+            None => w.dir,
+        };
+        tauri_plugin_opener::open_path(&dir, None::<&str>).map_err(err)
     })
     .await
 }

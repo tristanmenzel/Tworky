@@ -94,12 +94,16 @@ function cleanupWarning(w: Worker, prs: PrSummary | null): string | null {
   return state.kind === 'open' || state.kind === 'unmerged' ? 'Not all PRs are merged' : null
 }
 
-export async function confirmCleanup(w: Worker, prs: PrSummary | null, removeItem = false): Promise<boolean> {
+export async function confirmCleanup(
+  w: Worker,
+  prs: PrSummary | null,
+  { removeItem = false, scratch = false }: { removeItem?: boolean; scratch?: boolean } = {},
+): Promise<boolean> {
   const warning = cleanupWarning(w, prs)
   const label = removeItem ? 'Clean up and remove' : 'Clean up'
   return ask({
     title: `Clean up ${w.id}?`,
-    message: `Stops the session and removes its stack (including volumes), worktrees and the branches Tworky created${removeItem ? ', then takes the item off the list' : ''}.`,
+    message: `Stops the session and removes its stack (including volumes), worktrees and the branches Tworky created${removeItem || scratch ? ', then takes the item off the list' : ''}.`,
     warning: warning ? { title: warning, message: 'Uncommitted and unpushed work will be lost.' } : undefined,
     confirmLabel: warning ? `${label} anyway` : label,
     danger: true,
