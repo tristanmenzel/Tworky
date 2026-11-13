@@ -42,6 +42,7 @@ export interface IssuesPayload {
   subtasks: string[]
   status_boards: Record<string, number>
   config_error: string | null
+  refresh_secs: number
 }
 
 export type IssueState = 'open' | 'completed' | 'not_planned'

@@ -22,6 +22,7 @@
     onRemove: (name: string) => void
     onOpenWorker: (worker: Worker) => void
     onError: (message: string) => void
+    issuesRefreshed: number
   }
 
   let {
@@ -38,6 +39,7 @@
     onRemove,
     onOpenWorker,
     onError,
+    issuesRefreshed,
   }: Props = $props()
 
   let issueUrl = $state('')
@@ -51,6 +53,7 @@
 
   $effect(() => {
     const name = itemName
+    void issuesRefreshed
     untrack(() => existing.load({ kind: 'item', name }, false))
   })
 
