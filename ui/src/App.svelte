@@ -37,6 +37,8 @@
   import BrowserTab from './BrowserTab.svelte'
   import HandoverPanel from './HandoverPanel.svelte'
   import AccountRequestPanel from './AccountRequestPanel.svelte'
+  import { ask } from './confirm.svelte'
+  import ConfirmDialog from './ConfirmDialog.svelte'
   import { overlay } from './overlay.svelte'
   import JobsMenu from './JobsMenu.svelte'
   import ServicePickerDialog from './ServicePickerDialog.svelte'
@@ -343,7 +345,12 @@
   const setupSessionId = (name: string) => projects.find((p) => p.name === name)?.setup_session ?? `setup@${name}`
 
   async function newSetupConversation(name: string) {
-    if (!confirm(`Start a new setup conversation for ${name}? The current one ends.`)) return
+    const ok = await ask({
+      title: `Start a new setup conversation for ${name}?`,
+      message: 'The current one ends.',
+      confirmLabel: 'New conversation',
+    })
+    if (!ok) return
     try {
       await api.newConversation(setupSessionId(name))
       exited[setupSessionId(name)] = true
@@ -1075,6 +1082,8 @@
   {#if newProjectOpen}
     <NewProjectDialog onCreated={projectCreated} onClose={() => (newProjectOpen = false)} />
   {/if}
+
+  <ConfirmDialog />
 </div>
 
 <style>

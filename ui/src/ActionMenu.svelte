@@ -39,7 +39,6 @@
 <div class="menu" bind:this={root}>
   <button
     class="trigger"
-    class:icon={trigger === '⋯'}
     class:danger
     {disabled}
     aria-label={label}
@@ -71,11 +70,6 @@
   .menu {
     position: relative;
     display: inline-block;
-  }
-  .trigger.icon {
-    padding: 0 8px;
-    line-height: 20px;
-    font-size: 14px;
   }
   .popup {
     position: absolute;

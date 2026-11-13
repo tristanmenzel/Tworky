@@ -7,6 +7,7 @@
   import LocalWork from './LocalWork.svelte'
   import Markdown from './Markdown.svelte'
   import PullRequests from './PullRequests.svelte'
+  import WrapUp from './WrapUp.svelte'
 
   interface Props {
     item: Item
@@ -64,10 +65,6 @@
       linking = false
     }
   }
-
-  function remove() {
-    if (confirm(`Remove item ${item.name} (“${item.title}”)?`)) onRemove(item.name)
-  }
 </script>
 
 <div class="detail">
@@ -117,6 +114,7 @@
         {localFailed}
         log={logs}
         ownsItem={ownsItem(worker, [item])}
+        cleanup={false}
         {onOpenWorker}
         {onError}
       />
@@ -149,20 +147,15 @@
       </section>
     {/if}
 
-    <section class="panel box">
-      <h2>Remove</h2>
-      <div class="row">
-        <span class="muted">
-          {worker ? `Clean up worker ${worker.id} first; then the item can be removed.` : 'Take this item off the list.'}
-        </span>
-        <button
-          class="danger"
-          disabled={!!worker}
-          title={worker ? 'Clean up the worker first' : undefined}
-          onclick={remove}>Remove from list</button
-        >
-      </div>
-    </section>
+    <WrapUp
+      {worker}
+      ownsItem={!!worker && ownsItem(worker, [item])}
+      scratch={item.scratch}
+      label={item.name}
+      title={item.title}
+      onRemove={() => onRemove(item.name)}
+      {onError}
+    />
   </div>
 
   <div class="column">
@@ -257,9 +250,6 @@
     display: flex;
     gap: 8px;
     align-items: center;
-  }
-  .row .muted {
-    margin-right: auto;
   }
   input {
     flex: 1;

@@ -51,7 +51,7 @@
     checking = true
     const prs = await api.prs(worker.id).catch(() => null)
     checking = false
-    if (confirmCleanup(worker, prs, removeItem)) act(() => api.cleanup(worker.id, removeItem))
+    if (await confirmCleanup(worker, prs, { removeItem })) act(() => api.cleanup(worker.id, removeItem))
   }
 </script>
 

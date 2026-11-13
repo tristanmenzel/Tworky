@@ -2,6 +2,7 @@
   import { onMount, tick } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { api, type BranchWork, type PrDetail, type Verdict, type Worker, type WorkSubject } from './api'
+  import { ask as confirmAsk } from './confirm.svelte'
   import { formatAge } from './issue'
   import { addressReviewPrompt, askBlocker, fixCiPrompt, openPrPrompt, sessionRunning, withoutPr } from './prs'
   import { pasteIntoSession } from './terminals'
@@ -98,9 +99,15 @@
       !wasMerged && b.ahead ? `${b.ahead} commit(s) aren’t on the base branch and no merged PR contains them.` : null,
       b.unpushed ? `${b.unpushed} local commit(s) were never pushed.` : null,
       b.local && !b.remote ? 'The branch was never pushed, so this is the only copy.' : null,
-    ].filter(Boolean)
-    const message = [`Delete ${b.branch} in ${b.repo}?`, `This removes ${where.join(' and ')}.`, ...risks].join('\n\n')
-    if (!confirm(message)) return
+    ].filter((r) => r !== null)
+    const ok = await confirmAsk({
+      title: `Delete ${b.branch}?`,
+      message: `Removes ${where.join(' and ')} in ${b.repo}.`,
+      warning: risks.length ? { title: 'Work could be lost', message: risks } : undefined,
+      confirmLabel: 'Delete branch',
+      danger: true,
+    })
+    if (!ok) return
     try {
       await api.deleteBranch(subject, b.repo, b.branch)
       onRefresh(false)
