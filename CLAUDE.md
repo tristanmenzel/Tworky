@@ -71,7 +71,7 @@ A commit a user would notice carries a `Change: <one terse line>` trailer, worde
 
 ## Invariants
 
-- **Ports.** A worker on slot N gets `base + N × port_stride`. Slot 0 is the main checkout. The allocator also rejects any slot whose ports clash with another service's shifted port, or include a browser-blocked port (the Fetch spec's bad ports, which Chromium and WebView2 refuse with `ERR_UNSAFE_PORT`).
+- **Ports.** A worker on slot N gets `base + N × port_stride`. Slot 0 is the main checkout. The allocator also rejects any slot whose ports clash with another service's shifted port, or include a browser-blocked port (`ports::BLOCKED_PORTS`, the Fetch spec's bad ports, which Chromium and WebView2 refuse with `ERR_UNSAFE_PORT`).
 - **Template output** should land on gitignored files. If a rendered file is tracked, provisioning marks it `skip-worktree` so per-worker values can't be committed.
 - **Branches.** Cleanup deletes only branches Tworky created: those it branched from base (`new`) or made to track a remote branch (`tracking`). It keeps `existing` ones.
 - **Setup and cleanup** are idempotent and resumable. A cleanup that fails partway keeps the worker record as `failed` so it can be retried. `git worktree remove` can stop partway when a file is held open, after it has deleted `.git`, so `git::worktree_remove` deletes whatever is left directly.
