@@ -95,8 +95,7 @@ download=$(mktemp -d "${TMPDIR:-/tmp}/tworky.XXXXXX") || fail 'could not make a 
 releases=$(curl -fsSL "https://api.github.com/repos/$repo/releases?per_page=20" </dev/null) \
   || fail "could not list the releases of $repo"
 # The API doesn't list releases in publish order, so take the newest by published_at that has this
-# platform's build. The Windows build is published first, so the newest release may lack it for a
-# while. A release's published_at precedes its assets in the JSON; drafts are hidden.
+# platform's build. A release's published_at precedes its assets in the JSON; drafts are hidden.
 url=
 published=
 newest=

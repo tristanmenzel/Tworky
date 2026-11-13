@@ -9,6 +9,12 @@ name: Release
 on:
   push:
     branches: [main]
+    # The app's Update button fetches the install scripts from main, so changing them needs no build.
+    paths-ignore:
+      - scripts/install.sh
+      - scripts/install.ps1
+      - README.md
+      - CLAUDE.md
   workflow_dispatch:
 
 concurrency:
