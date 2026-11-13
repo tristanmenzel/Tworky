@@ -78,7 +78,7 @@ export function confirmCleanup(w: Worker, prs: PrSummary | null, removeItem = fa
 }
 
 export function removeItemReason(w: Worker, items: Item[]): string | false {
-  const owns = !!w.item || items.some((i) => i.source.kind === 'issue' && i.source.id === w.issue?.id)
+  const owns = items.some((i) => i.name === w.item?.name || (i.source.kind === 'issue' && i.source.id === w.issue?.id))
   return owns ? false : "This worker's issue isn't on the list"
 }
 

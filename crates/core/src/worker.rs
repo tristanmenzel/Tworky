@@ -1055,8 +1055,10 @@ impl Workspace {
             Some(name) => {
                 if self.state.get_item(&name)?.is_some() {
                     self.state.delete_item(&name)?;
+                    log(&format!("✓ removed {name} from the list"));
+                } else {
+                    log(&format!("  {name} is already off the list"));
                 }
-                log(&format!("✓ removed {name} from the list"));
             }
             None => log("  the worker has no item on the list"),
         }
