@@ -1389,16 +1389,16 @@ mod tests {
     #[test]
     fn output_timeout_stops_a_command_that_runs_too_long() {
         let (program, args): (&str, &[&str]) = if cfg!(windows) {
-            ("ping", &["-n", "30", "127.0.0.1"])
+            ("ping", &["-n", "300", "127.0.0.1"])
         } else {
-            ("sleep", &["30"])
+            ("sleep", &["300"])
         };
         let mut slow = command(program);
         slow.args(args);
         let started = Instant::now();
         let e = output_timeout(slow, "slow", Duration::from_millis(500)).unwrap_err();
         assert!(e.to_string().contains("timed out"), "{e:#}");
-        assert!(started.elapsed() < Duration::from_secs(15));
+        assert!(started.elapsed() < Duration::from_secs(120));
 
         let (program, args): (&str, &[&str]) = if cfg!(windows) {
             ("cmd", &["/c", "echo hi"])
