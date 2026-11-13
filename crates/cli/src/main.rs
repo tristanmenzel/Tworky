@@ -106,6 +106,7 @@ enum ItemCommand {
     },
     /// Put a pull request on the work list; its worker works on the PR's branch
     AddPr {
+        /// A pull request URL or owner/repo#number
         url: String,
         /// Project to add the PR's repo to, when no project covers it yet
         #[arg(long, short)]

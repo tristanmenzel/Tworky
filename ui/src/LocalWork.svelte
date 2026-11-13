@@ -12,11 +12,23 @@
     local: LocalStatus | null
     localFailed: boolean
     log: string[]
+    ownsItem: boolean
+    cleanup?: boolean
     onOpenWorker: (worker: Worker) => void
     onError: (message: string) => void
   }
 
-  let { worker, jobs, local, localFailed, log, onOpenWorker, onError }: Props = $props()
+  let {
+    worker,
+    jobs,
+    local,
+    localFailed,
+    log,
+    ownsItem,
+    cleanup: showCleanup = true,
+    onOpenWorker,
+    onError,
+  }: Props = $props()
 
   let checking = $state(false)
   let stopping = $state<Record<string, boolean>>({})
@@ -79,16 +91,6 @@
       : worker.worktrees.map((t) => ({ repo: t.repo, branch: t.branch, status: null })),
   )
 
-  const menu = $derived<MenuItem[]>([
-    { label: 'Open folder', onSelect: () => act(() => api.openDir(worker.id)) },
-    {
-      label: 'New conversation…',
-      disabled: worker.claude_started ? false : 'No conversation has started yet',
-      onSelect: () =>
-        confirm('Start a new Claude conversation for this worker?') && act(() => api.newConversation(worker.id)),
-    },
-  ])
-
   async function act(fn: () => Promise<void>) {
     try {
       await fn()
@@ -103,17 +105,34 @@
     stopping[key] = false
   }
 
-  async function cleanup() {
+  const cleanupItems = $derived<MenuItem[]>([
+    { label: 'Clean up', onSelect: () => cleanup(false) },
+    ...(ownsItem ? [{ label: 'Clean up and remove item', danger: true, onSelect: () => cleanup(true) }] : []),
+  ])
+
+  async function cleanup(removeItem: boolean) {
     checking = true
     const summary = await api.prs(worker.id).catch(() => null)
     checking = false
-    if (confirmCleanup(worker, summary)) act(() => api.cleanup(worker.id))
+    if (await confirmCleanup(worker, summary, { removeItem })) act(() => api.cleanup(worker.id, removeItem))
   }
 
   function serviceAddress(s: ServiceStatus): string | null {
     return s.url?.replace(/^https?:\/\//, '').replace(/\/$/, '') ?? null
   }
 </script>
+
+{#snippet folderIcon()}
+  <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+    <path
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linejoin="round"
+      d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2.5h8.5A1.5 1.5 0 0 1 21 9v9.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z"
+    />
+  </svg>
+{/snippet}
 
 <section class="local">
   <div class="head">
@@ -128,15 +147,29 @@
     </button>
     {#if worker.session_alive || anythingRunning || !local}
       <button
+        class="danger"
         disabled={worker.busy}
         title="Stop Claude, everything it started and the worker's containers (kept, not removed)"
-        onclick={() => act(() => api.stop(worker.id))}>Stop everything</button
+        onclick={() => act(() => api.stop(worker.id))}>Terminate</button
       >
     {/if}
-    <button class="danger" disabled={checking || worker.busy || worker.status === 'cleaning'} onclick={cleanup}>
-      {checking ? 'Checking PRs…' : 'Clean up'}
+    {#if showCleanup}
+      <ActionMenu
+        label="Clean up {worker.id}"
+        trigger={checking ? 'Checking PRs…' : 'Clean up ▾'}
+        danger
+        disabled={checking || worker.busy || worker.status === 'cleaning'}
+        items={cleanupItems}
+      />
+    {/if}
+    <button
+      class="head-icon"
+      title="Open worker folder"
+      aria-label="Open worker folder"
+      onclick={() => act(() => api.openDir(worker.id))}
+    >
+      {@render folderIcon()}
     </button>
-    <ActionMenu items={menu} label="More actions for {worker.id}" />
   </div>
 
   {#if worker.error}<div class="error">{worker.error}</div>{/if}
@@ -152,19 +185,6 @@
       <div class="label">Worktrees</div>
       {#each worktrees as t (t.repo)}
         <div class="tree">
-          <button
-            class="icon"
-            title="Open in VSCode"
-            aria-label="Open {t.repo} in VSCode"
-            onclick={() => act(() => api.openInVscode(worker.id, t.repo))}
-          >
-            <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
-              <path
-                fill="#007ACC"
-                d="M23.15 2.587L18.21.21a1.494 1.494 0 0 0-1.705.29l-9.46 8.63-4.12-3.128a.999.999 0 0 0-1.276.057L.327 7.261A1 1 0 0 0 .326 8.74L3.899 12 .326 15.26a1 1 0 0 0 .001 1.479L1.65 17.94a.999.999 0 0 0 1.276.057l4.12-3.128 9.46 8.63a1.492 1.492 0 0 0 1.704.29l4.942-2.377A1.5 1.5 0 0 0 24 20.06V3.939a1.5 1.5 0 0 0-.85-1.352zm-5.146 14.861L10.826 12l7.178-5.448v10.896z"
-              />
-            </svg>
-          </button>
           <code class="repo">{t.repo}</code>
           <code class="muted branch">{t.branch}</code>
           {#if t.status?.error}
@@ -175,6 +195,29 @@
           {:else if t.status}
             <span class="pill ok">clean · pushed</span>
           {/if}
+          <span class="tools">
+            <button
+              class="icon"
+              title="Open folder"
+              aria-label="Open {t.repo} folder"
+              onclick={() => act(() => api.openDir(worker.id, t.repo))}
+            >
+              {@render folderIcon()}
+            </button>
+            <button
+              class="icon"
+              title="Open in VSCode"
+              aria-label="Open {t.repo} in VSCode"
+              onclick={() => act(() => api.openInVscode(worker.id, t.repo))}
+            >
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                <path
+                  fill="#007ACC"
+                  d="M23.15 2.587L18.21.21a1.494 1.494 0 0 0-1.705.29l-9.46 8.63-4.12-3.128a.999.999 0 0 0-1.276.057L.327 7.261A1 1 0 0 0 .326 8.74L3.899 12 .326 15.26a1 1 0 0 0 .001 1.479L1.65 17.94a.999.999 0 0 0 1.276.057l4.12-3.128 9.46 8.63a1.492 1.492 0 0 0 1.704.29l4.942-2.377A1.5 1.5 0 0 0 24 20.06V3.939a1.5 1.5 0 0 0-.85-1.352zm-5.146 14.861L10.826 12l7.178-5.448v10.896z"
+                />
+              </svg>
+            </button>
+          </span>
         </div>
       {:else}
         <div><span class="muted">None yet. Suggested branch </span><code>{worker.branch}</code></div>
@@ -398,6 +441,17 @@
     display: inline-flex;
     align-items: center;
     padding: 2px 4px;
+  }
+  .head-icon {
+    display: inline-flex;
+    align-items: center;
+    align-self: stretch;
+    padding: 0 8px;
+  }
+  .tools {
+    margin-left: auto;
+    display: inline-flex;
+    gap: 4px;
   }
   button.small {
     padding: 1px 8px;

@@ -22,7 +22,10 @@
   let fit: FitAddon | undefined
   let unregister: (() => void) | undefined
 
-  const paste = (text: string) => term?.paste(text)
+  const paster = {
+    paste: (text: string) => term?.paste(text),
+    ready: () => !!term?.modes.bracketedPasteMode,
+  }
 
   function css(name: string): string {
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim()
@@ -88,7 +91,7 @@
     try {
       fit?.fit()
       await api.openSession(workerId, term.cols, term.rows, channel)
-      if (term) unregister = registerTerminal(workerId, paste)
+      if (term) unregister = registerTerminal(workerId, paster)
     } catch (e) {
       onError(String(e))
     }

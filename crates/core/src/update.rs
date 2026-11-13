@@ -99,8 +99,8 @@ fn is_installable_here(asset: &str) -> bool {
     }
 }
 
-/// The newest published release with a build for this OS. The Windows build is published first,
-/// while macOS and Linux still build, so the newest release can lack this OS's asset for a while.
+/// The newest published release with a build for this OS. The releases API doesn't list them in
+/// publish order.
 fn newest_installable(releases: &Value, installable: impl Fn(&str) -> bool) -> Option<Release> {
     releases
         .as_array()?

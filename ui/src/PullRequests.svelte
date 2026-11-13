@@ -2,8 +2,9 @@
   import { onMount, tick } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { api, type BranchWork, type PrDetail, type Verdict, type Worker, type WorkSubject } from './api'
+  import { ask as confirmAsk } from './confirm.svelte'
   import { formatAge } from './issue'
-  import { addressReviewPrompt, askBlocker, fixCiPrompt, openPrPrompt, withoutPr } from './prs'
+  import { addressReviewPrompt, askBlocker, fixCiPrompt, openPrPrompt, sessionRunning, withoutPr } from './prs'
   import { pasteIntoSession } from './terminals'
   import ActionMenu, { type MenuItem } from './ActionMenu.svelte'
 
@@ -66,10 +67,11 @@
   }
 
   async function ask(w: Worker, prompt: string) {
+    const starting = !sessionRunning(w, !!exited[w.id])
     onOpenWorker(w)
     await tick()
-    if (!(await pasteIntoSession(w.id, prompt))) {
-      onError(`${w.id}'s terminal didn't attach, so the prompt wasn't pasted. Try again once it shows Claude.`)
+    if (!(await pasteIntoSession(w.id, prompt, starting ? 60_000 : 2000))) {
+      onError(`Claude in ${w.id} didn't take input, so the prompt wasn't pasted. Try again once it shows Claude.`)
     }
   }
 
@@ -97,9 +99,15 @@
       !wasMerged && b.ahead ? `${b.ahead} commit(s) aren’t on the base branch and no merged PR contains them.` : null,
       b.unpushed ? `${b.unpushed} local commit(s) were never pushed.` : null,
       b.local && !b.remote ? 'The branch was never pushed, so this is the only copy.' : null,
-    ].filter(Boolean)
-    const message = [`Delete ${b.branch} in ${b.repo}?`, `This removes ${where.join(' and ')}.`, ...risks].join('\n\n')
-    if (!confirm(message)) return
+    ].filter((r) => r !== null)
+    const ok = await confirmAsk({
+      title: `Delete ${b.branch}?`,
+      message: `Removes ${where.join(' and ')} in ${b.repo}.`,
+      warning: risks.length ? { title: 'Work could be lost', message: risks } : undefined,
+      confirmLabel: 'Delete branch',
+      danger: true,
+    })
+    if (!ok) return
     try {
       await api.deleteBranch(subject, b.repo, b.branch)
       onRefresh(false)
@@ -117,9 +125,10 @@
   {@const w = askTarget(b)}
   {#if w}
     {@const blocker = askBlocker(w, !!exited[w.id])}
-    <button class="small" disabled={!!blocker} title={blocker || `Paste the prompt into ${w.id}'s session`} onclick={() => ask(w, prompt)}
-      >{label}</button
-    >
+    {@const title = sessionRunning(w, !!exited[w.id])
+      ? `Paste the prompt into ${w.id}'s session`
+      : `Resume Claude in ${w.id} and paste the prompt`}
+    <button class="small" disabled={!!blocker} title={blocker || title} onclick={() => ask(w, prompt)}>{label}</button>
   {/if}
 {/snippet}
 

@@ -37,11 +37,14 @@
   import BrowserTab from './BrowserTab.svelte'
   import HandoverPanel from './HandoverPanel.svelte'
   import AccountRequestPanel from './AccountRequestPanel.svelte'
+  import { ask } from './confirm.svelte'
+  import ConfirmDialog from './ConfirmDialog.svelte'
   import { overlay } from './overlay.svelte'
   import JobsMenu from './JobsMenu.svelte'
   import ServicePickerDialog from './ServicePickerDialog.svelte'
   import CreateProfileDialog from './CreateProfileDialog.svelte'
   import type { ServiceLink } from './ServiceList.svelte'
+  import KeepAwakePill from './KeepAwakePill.svelte'
   import VersionBadge from './VersionBadge.svelte'
   import {
     activityLabel,
@@ -49,12 +52,13 @@
     activityRank,
     formatBytes,
     jobLabel,
+    ownsItem,
     serviceUrl,
     subjectLabel,
     subjectUrl,
   } from './issue'
 
-  const POLL_MS = 5 * 60 * 1000
+  const DUE_CHECK_MS = 30_000
   const JOBS_POLL_MS = 10_000
   const ITEM_PREFIX = 'item:'
 
@@ -82,6 +86,8 @@
   let generations = $state<Record<string, number>>({})
   let exited = $state<Record<string, boolean>>({})
   let refreshKey = $state(0)
+  let issuesRefreshedAt = Date.now()
+  let issuesRefreshed = $state(0)
   const liveSessionCount = $derived(workers.filter((w) => w.session_alive && !exited[w.id]).length)
   let logs = $state<Record<string, string[]>>({})
   let jobs = $state<Record<string, Job[]>>({})
@@ -209,8 +215,10 @@
 
   async function loadIssues(refresh: boolean) {
     loading = true
+    if (refresh) issuesRefreshedAt = Date.now()
     try {
       payload = await api.issues(refresh)
+      if (refresh) issuesRefreshed++
       if (payload.config_error) showError(`Config: ${payload.config_error}`)
       if (selectedId === null && payload.cards.length) selectedId = payload.cards[0].id
     } catch (e) {
@@ -220,16 +228,28 @@
     }
   }
 
+  function refreshIssuesIfDue() {
+    if (document.hidden || loading || !payload) return
+    if (Date.now() - issuesRefreshedAt >= payload.refresh_secs * 1000) loadIssues(true)
+  }
+
   async function loadWorkers() {
     try {
       const before = workers
       workers = await api.workers()
       const ids = new Set(workers.map((w) => w.id))
       terminals = terminals.filter((t) => ids.has(t))
-      if (before.some((w) => w.issue && !ids.has(w.id))) loadIssues(false)
+      const gone = before.filter((w) => !ids.has(w.id))
+      if (gone.length) reloadWorkList(gone.some((w) => w.issue))
     } catch (e) {
       showError(String(e))
     }
+  }
+
+  async function reloadWorkList(withIssues: boolean) {
+    await Promise.all([withIssues && loadIssues(false), loadItems()])
+    if (selectedId && !cards.some((c) => c.id === selectedId) && !otherItems.some((i) => ITEM_PREFIX + i.name === selectedId))
+      selectedId = null
   }
 
   async function loadJobs() {
@@ -334,7 +354,12 @@
   const setupSessionId = (name: string) => projects.find((p) => p.name === name)?.setup_session ?? `setup@${name}`
 
   async function newSetupConversation(name: string) {
-    if (!confirm(`Start a new setup conversation for ${name}? The current one ends.`)) return
+    const ok = await ask({
+      title: `Start a new setup conversation for ${name}?`,
+      message: 'The current one ends.',
+      confirmLabel: 'New conversation',
+    })
+    if (!ok) return
     try {
       await api.newConversation(setupSessionId(name))
       exited[setupSessionId(name)] = true
@@ -555,6 +580,12 @@
     terminals = terminals.filter((t) => t !== id)
   }
 
+  async function terminate(w: Worker) {
+    await api.stop(w.id)
+    await loadWorkers()
+    closeTerminal(w.id)
+  }
+
   function workerById(id: string) {
     return workers.find((w) => w.id === id)
   }
@@ -566,7 +597,8 @@
     loadProjects()
     loadJobs()
     api.browserTabs().then((tabs) => (browserTabs = tabs), showError)
-    const timer = setInterval(() => loadIssues(true), POLL_MS)
+    const timer = setInterval(refreshIssuesIfDue, DUE_CHECK_MS)
+    document.addEventListener('visibilitychange', refreshIssuesIfDue)
     const jobsTimer = setInterval(() => {
       if (document.hidden) return
       loadJobs()
@@ -604,6 +636,7 @@
     return () => {
       clearInterval(timer)
       clearInterval(jobsTimer)
+      document.removeEventListener('visibilitychange', refreshIssuesIfDue)
       unlisten.forEach((p) => p.then((f) => f()))
     }
   })
@@ -678,6 +711,7 @@
       <button class:active={view === 'projects'} onclick={() => showView('projects')}>Projects</button>
     </nav>
     <span class="right">
+      <KeepAwakePill />
       <VersionBadge liveSessions={liveSessionCount} {refreshKey} />
       <span class="muted viewer">{payload?.viewer ?? ''}</span>
     </span>
@@ -825,6 +859,7 @@
                 onRemove={removeItem}
                 onOpenWorker={openTerminal}
                 onError={showError}
+                {issuesRefreshed}
               />
             {/key}
           {:else if selectedCard && issues.has(selectedCard.id)}
@@ -836,6 +871,7 @@
                 projects={payload?.projects ?? {}}
                 statusBoards={payload?.status_boards ?? {}}
                 viewer={payload?.viewer ?? ''}
+                {items}
                 {workers}
                 {exited}
                 {jobs}
@@ -849,6 +885,7 @@
                 onOpenWorker={openTerminal}
                 onRemove={removeItem}
                 onError={showError}
+                {issuesRefreshed}
               />
             {/key}
           {:else}
@@ -884,6 +921,7 @@
                   local={local[w.id] ?? null}
                   localFailed={localFailed[w.id] ?? false}
                   log={logs[w.id] ?? []}
+                  ownsItem={ownsItem(w, items)}
                   onOpenWorker={openTerminal}
                   onError={showError}
                 />
@@ -994,7 +1032,9 @@
                 worker={w}
                 accounts={accountsOf(w)}
                 services={servicesOf(w).length}
+                ownsItem={ownsItem(w, items)}
                 onResume={() => mountTerminal({ ...w, session_alive: false })}
+                onTerminate={() => terminate(w)}
                 onOpenBrowser={(account) => openBrowser(w, account)}
                 onOpenAnonymous={() => openAnonymous(w)}
                 onCreateProfile={() => (createProfileFor = { worker: w, request: null })}
@@ -1055,6 +1095,8 @@
   {#if newProjectOpen}
     <NewProjectDialog onCreated={projectCreated} onClose={() => (newProjectOpen = false)} />
   {/if}
+
+  <ConfirmDialog />
 </div>
 
 <style>

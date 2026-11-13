@@ -42,6 +42,7 @@ export interface IssuesPayload {
   subtasks: string[]
   status_boards: Record<string, number>
   config_error: string | null
+  refresh_secs: number
 }
 
 export type IssueState = 'open' | 'completed' | 'not_planned'
@@ -400,6 +401,17 @@ export interface UpdateProgress {
   log_tail: string
 }
 
+export type KeepAwakeMode = 'off' | 'plugged_in' | 'always'
+
+export interface KeepAwakeStatus {
+  mode: KeepAwakeMode
+  holding: boolean
+  busy_sessions: number
+  on_battery: boolean | null
+  has_battery: boolean
+  lock: 'windows' | 'macos' | 'portal' | 'logind' | 'none'
+}
+
 // The host ignores a show older than one it applied from the same load.
 const showLoad = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)
 let showSeq = 0
@@ -410,6 +422,8 @@ export const api = {
   dismissUpdateFailure: () => invoke<void>('dismiss_update_failure'),
   startUpdate: () => invoke<void>('start_update'),
   restartForUpdate: () => invoke<void>('restart_for_update'),
+  keepAwakeStatus: () => invoke<KeepAwakeStatus>('keep_awake_status'),
+  setKeepAwake: (mode: KeepAwakeMode) => invoke<void>('set_keep_awake', { mode }),
   projects: () => invoke<ProjectSummary[]>('list_projects'),
   browserTabs: () => invoke<BrowserTabView[]>('browser_tabs'),
   browserOpen: (worker: string, account: string | null, url: string | null = null) =>
@@ -472,7 +486,7 @@ export const api = {
     invoke<IssuesPayload>('set_issue_state', { issueId, state }),
   setBoardStatus: (issueId: string, projectId: string, optionId: string) =>
     invoke<IssuesPayload>('set_board_status', { issueId, projectId, optionId }),
-  cleanup: (id: string) => invoke<void>('cleanup_worker', { id }),
+  cleanup: (id: string, removeItem = false) => invoke<void>('cleanup_worker', { id, removeItem }),
   prs: (id: string) => invoke<PrSummary>('pr_summary', { id }),
   openSession: (id: string, cols: number, rows: number, onOutput: Channel<string>) =>
     invoke<void>('open_session', { id, cols, rows, onOutput }),
@@ -480,7 +494,7 @@ export const api = {
   resize: (id: string, cols: number, rows: number) => invoke<void>('resize_session', { id, cols, rows }),
   stop: (id: string) => invoke<void>('stop_session', { id }),
   newConversation: (id: string) => invoke<void>('new_conversation', { id }),
-  openDir: (id: string) => invoke<void>('open_worker_dir', { id }),
+  openDir: (id: string, repo?: string) => invoke<void>('open_worker_dir', { id, repo }),
   openInVscode: (id: string, repo: string) => invoke<void>('open_in_vscode', { id, repo }),
   dismissHandover: (id: string) => invoke<void>('dismiss_handover', { id }),
   dismissAccountRequest: (id: string, name: string) => invoke<void>('dismiss_account_request', { id, name }),

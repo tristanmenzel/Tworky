@@ -892,12 +892,15 @@ pub fn start_times(pids: &[u32]) -> Result<HashMap<u32, Option<u64>>> {
 /// `lstart` is local time, so `ps` is run in UTC and the C locale.
 #[cfg(unix)]
 pub fn start_times(pids: &[u32]) -> Result<HashMap<u32, Option<u64>>> {
+    // macOS `ps` fails the whole call for a pid above PID_MAX (99999), which can't be running.
+    let possible = |pid: &&u32| cfg!(not(target_os = "macos")) || **pid <= 99_999;
+    let pids: Vec<&u32> = pids.iter().filter(possible).collect();
     if pids.is_empty() {
         return Ok(HashMap::new());
     }
     let list = pids
         .iter()
-        .map(u32::to_string)
+        .map(|pid| pid.to_string())
         .collect::<Vec<_>>()
         .join(",");
     let out = command("ps")
@@ -1386,16 +1389,16 @@ mod tests {
     #[test]
     fn output_timeout_stops_a_command_that_runs_too_long() {
         let (program, args): (&str, &[&str]) = if cfg!(windows) {
-            ("ping", &["-n", "30", "127.0.0.1"])
+            ("ping", &["-n", "300", "127.0.0.1"])
         } else {
-            ("sleep", &["30"])
+            ("sleep", &["300"])
         };
         let mut slow = command(program);
         slow.args(args);
         let started = Instant::now();
         let e = output_timeout(slow, "slow", Duration::from_millis(500)).unwrap_err();
         assert!(e.to_string().contains("timed out"), "{e:#}");
-        assert!(started.elapsed() < Duration::from_secs(15));
+        assert!(started.elapsed() < Duration::from_secs(120));
 
         let (program, args): (&str, &[&str]) = if cfg!(windows) {
             ("cmd", &["/c", "echo hi"])

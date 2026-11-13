@@ -1,4 +1,5 @@
-import type { Activity, BoardStatus, Card, Issue, IssueState, PrSummary, Service, Worker } from './api'
+import type { Activity, BoardStatus, Card, Issue, IssueState, Item, PrSummary, Service, Worker } from './api'
+import { ask } from './confirm.svelte'
 
 export function typeClass(type: string | null): string {
   const t = (type ?? '').toLowerCase()
@@ -68,12 +69,50 @@ export function issueState(issue: Issue): IssueState | null {
   return null
 }
 
-export function confirmCleanup(w: Worker, prs: PrSummary | null): boolean {
-  return confirm(
-    prs?.all_merged
-      ? `Clean up ${w.id}? This stops the session, removes the stack (including volumes), worktrees and branches Tworky created.`
-      : `${w.id} has no confirmation that all PRs are merged${prs ? '' : ' (PR status not checked)'}. Unpushed work in its worktrees will be lost. Clean up anyway?`,
-  )
+export type PrState =
+  | { kind: 'unknown' }
+  | { kind: 'none' }
+  | { kind: 'merged' }
+  | { kind: 'open'; count: number }
+  | { kind: 'unmerged' }
+
+export function prState(summary: PrSummary | null, worktrees: number): PrState {
+  if (!worktrees) return { kind: 'none' }
+  if (!summary || summary.repos.length < worktrees || summary.repos.some((r) => r.error)) return { kind: 'unknown' }
+  if (summary.all_merged) return { kind: 'merged' }
+  const count = summary.repos.flatMap((r) => r.pull_requests).filter((p) => p.state === 'OPEN').length
+  return count ? { kind: 'open', count } : { kind: 'unmerged' }
+}
+
+function cleanupWarning(w: Worker, prs: PrSummary | null): string | null {
+  const state = prState(prs, w.worktrees.length)
+  if (w.pr && state.kind !== 'none') {
+    if (!prs || prs.repos.length < w.worktrees.length || prs.repos.some((r) => !r.status)) return 'Local changes not checked'
+    const unsaved = prs.repos.some((r) => r.status && (r.status.dirty_files || r.status.unpushed_commits))
+    return unsaved ? 'Some work is not pushed' : null
+  }
+  if (state.kind === 'unknown') return 'PR status not checked'
+  return state.kind === 'open' || state.kind === 'unmerged' ? 'Not all PRs are merged' : null
+}
+
+export async function confirmCleanup(
+  w: Worker,
+  prs: PrSummary | null,
+  { removeItem = false, scratch = false }: { removeItem?: boolean; scratch?: boolean } = {},
+): Promise<boolean> {
+  const warning = cleanupWarning(w, prs)
+  const label = removeItem ? 'Clean up and remove' : 'Clean up'
+  return ask({
+    title: `Clean up ${w.id}?`,
+    message: `Stops the session and removes its stack (including volumes), worktrees and the branches Tworky created${removeItem || scratch ? ', then takes the item off the list' : ''}.`,
+    warning: warning ? { title: warning, message: 'Uncommitted and unpushed work will be lost.' } : undefined,
+    confirmLabel: warning ? `${label} anyway` : label,
+    danger: true,
+  })
+}
+
+export function ownsItem(w: Worker, items: Item[]): boolean {
+  return items.some((i) => i.name === w.item?.name || (i.source.kind === 'issue' && i.source.id === w.issue?.id))
 }
 
 const SHELL_WORDS = new Set(['sh', 'bash', 'zsh', 'cmd', '/d', '/s', '/c', '-c'])

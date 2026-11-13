@@ -535,6 +535,17 @@ impl Workspace {
     fn drop_worktree(&self, w: &WorkerRecord, repo: &RepoConfig, log: Log) -> Result<()> {
         let path = w.dir.join(&repo.name);
         let record = w.worktrees.iter().find(|t| t.repo == repo.name);
+        if !repo.source.is_dir() {
+            if path.exists() {
+                log(&format!(
+                    "▸ {}: the clone at {} is gone, so removing the worktree folder without git",
+                    repo.name,
+                    repo.source.display()
+                ));
+                remove_dir(&path)?;
+            }
+            return Ok(());
+        }
         if git::is_worktree(&path) || record.is_some() {
             log(&format!("▸ {}: removing worktree", repo.name));
             git::worktree_remove(&repo.source, &path)?;
@@ -966,10 +977,18 @@ impl Workspace {
         if let Some(project) = &project {
             let ctx = template_context(&w, project, &IssueIndex::default());
             for hook in &project.hooks.teardown {
-                if Self::has_worktree(&w, &hook.cwd) {
-                    let r = self.run_hook(&w, hook, &ctx, log);
-                    attempt(errors, "teardown hook", r, log);
+                if !Self::has_worktree(&w, &hook.cwd) {
+                    continue;
                 }
+                if !w.dir.join(&hook.cwd).is_dir() {
+                    log(&format!(
+                        "  skipping the teardown hook in {}: the folder is gone",
+                        hook.cwd
+                    ));
+                    continue;
+                }
+                let r = self.run_hook(&w, hook, &ctx, log);
+                attempt(errors, "teardown hook", r, log);
             }
         }
 
@@ -1011,6 +1030,39 @@ impl Workspace {
             self.state.save(&w)?;
             bail!("cleanup incomplete: {}", errors.join("; "))
         }
+    }
+
+    pub fn item_for_worker(&self, w: &WorkerRecord) -> Result<Option<String>> {
+        if let Some(item) = &w.item {
+            return Ok(Some(item.name.clone()));
+        }
+        match w.issue_id() {
+            Some(issue_id) => Ok(self.state.item_for_issue(issue_id)?.map(|i| i.name)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn cleanup_and_remove_item(
+        &self,
+        id: &str,
+        session_pid: Option<u32>,
+        log: Log,
+    ) -> Result<()> {
+        let w = self.worker(id)?;
+        let item = self.item_for_worker(&w)?;
+        self.cleanup(id, session_pid, log)?;
+        match item {
+            Some(name) => {
+                if self.state.get_item(&name)?.is_some() {
+                    self.state.delete_item(&name)?;
+                    log(&format!("✓ removed {name} from the list"));
+                } else {
+                    log(&format!("  {name} is already off the list"));
+                }
+            }
+            None => log("  the worker has no item on the list"),
+        }
+        Ok(())
     }
 }
 
@@ -1821,6 +1873,89 @@ start_url = "http://localhost:5173/home"
         assert!(ws.state.get_item("tidy-seal").unwrap().is_some());
     }
 
+    fn issue_ref_t() -> IssueRef {
+        let idx = index();
+        let t = idx.get("T").unwrap();
+        IssueRef {
+            id: t.id.clone(),
+            number: t.number,
+            repo: t.repo.clone(),
+            title: t.title.clone(),
+            url: t.url.clone(),
+        }
+    }
+
+    #[test]
+    fn cleanup_and_remove_item_removes_a_custom_item() {
+        let (_d, ws) = workspace();
+        insert_item(&ws, "tidy-seal", ItemSource::Custom, false);
+        let w = ws.plan_item("tidy-seal", &IssueIndex::default()).unwrap();
+        let mut lines = Vec::new();
+        ws.cleanup_and_remove_item(&w.id, None, &mut |l| lines.push(l.to_string()))
+            .unwrap();
+        assert!(ws.state.get(&w.id).unwrap().is_none());
+        assert!(ws.state.get_item("tidy-seal").unwrap().is_none());
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "✓ removed tidy-seal from the list")
+        );
+    }
+
+    #[test]
+    fn cleanup_and_remove_item_removes_an_issue_item() {
+        let (_d, ws) = workspace();
+        insert_item(&ws, "keen-lynx", ItemSource::Issue(issue_ref_t()), false);
+        let w = ws.plan_item("keen-lynx", &index()).unwrap();
+        ws.cleanup_and_remove_item(&w.id, None, &mut |_| {})
+            .unwrap();
+        assert!(ws.state.get(&w.id).unwrap().is_none());
+        assert!(ws.state.get_item("keen-lynx").unwrap().is_none());
+    }
+
+    #[test]
+    fn cleanup_and_remove_item_tolerates_a_scratch_item() {
+        let (_d, ws) = workspace();
+        insert_item(&ws, "quiet-lynx", ItemSource::Custom, true);
+        let w = ws.plan_item("quiet-lynx", &IssueIndex::default()).unwrap();
+        ws.cleanup_and_remove_item(&w.id, None, &mut |_| {})
+            .unwrap();
+        assert!(ws.state.get_item("quiet-lynx").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_cleanup_keeps_the_item() {
+        let (_d, mut ws, _source, id) = git_workspace();
+        let project = &mut ws.config.projects[0];
+        project.stack = None;
+        project.hooks.teardown = toml::from_str::<crate::config::Hooks>(
+            "[[teardown]]\ncwd = \"platform\"\nrun = \"exit 1\"",
+        )
+        .unwrap()
+        .teardown;
+        ws.add_worktree(&id, "platform", None, None, &mut |_| {})
+            .unwrap();
+        insert_item(&ws, "keen-lynx", ItemSource::Issue(issue_ref_t()), false);
+
+        assert!(ws.cleanup_and_remove_item(&id, None, &mut |_| {}).is_err());
+        assert!(ws.state.get_item("keen-lynx").unwrap().is_some());
+        assert_eq!(
+            ws.state.get(&id).unwrap().unwrap().status,
+            WorkerStatus::Failed
+        );
+    }
+
+    #[test]
+    fn cleanup_and_remove_item_cleans_up_a_worker_with_no_item() {
+        let (_d, ws) = workspace();
+        let w = ws.plan(&index(), "T").unwrap();
+        let mut lines = Vec::new();
+        ws.cleanup_and_remove_item(&w.id, None, &mut |l| lines.push(l.to_string()))
+            .unwrap();
+        assert!(ws.state.get(&w.id).unwrap().is_none());
+        assert!(lines.iter().any(|l| l.contains("no item on the list")));
+    }
+
     #[test]
     fn prepare_writes_only_claude_md_and_graft_settings() {
         let (_d, ws) = workspace();
@@ -1959,6 +2094,40 @@ start_url = "http://localhost:5173/home"
         assert_eq!(t.origin, BranchOrigin::Existing);
         ws.remove_worktree(&id, "platform", &mut log).unwrap();
         assert!(git::local_branch_exists(&source, "someone-elses"));
+    }
+
+    #[test]
+    fn cleans_up_after_the_clone_is_deleted() {
+        let (d, mut ws, _source, id) = git_workspace();
+        ws.config.projects[0].stack = None;
+        ws.add_worktree(&id, "platform", None, None, &mut |_| {})
+            .unwrap();
+        let dir = ws.state.get(&id).unwrap().unwrap().dir;
+        ws.config.projects[0].repos[0].source = d.path().join("deleted-clone");
+
+        ws.cleanup(&id, None, &mut |_| {}).unwrap();
+        assert!(!dir.exists());
+        assert!(ws.state.get(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn cleans_up_after_the_worktree_folder_is_deleted() {
+        let (_d, mut ws, source, id) = git_workspace();
+        let project = &mut ws.config.projects[0];
+        project.stack = None;
+        project.hooks.teardown = toml::from_str::<crate::config::Hooks>(
+            "[[teardown]]\ncwd = \"platform\"\nrun = \"exit 1\"",
+        )
+        .unwrap()
+        .teardown;
+        ws.add_worktree(&id, "platform", None, None, &mut |_| {})
+            .unwrap();
+        let dir = ws.state.get(&id).unwrap().unwrap().dir;
+        std::fs::remove_dir_all(dir.join("platform")).unwrap();
+
+        ws.cleanup(&id, None, &mut |_| {}).unwrap();
+        assert!(!dir.exists());
+        assert!(!git::local_branch_exists(&source, "feat/header-layout-327"));
     }
 
     #[test]

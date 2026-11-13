@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod browser;
+mod keep_awake;
 mod pty;
+mod title;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -34,9 +36,13 @@ struct AppState {
     assets: Mutex<HashMap<String, std::sync::Arc<github::Asset>>>,
     background_tasks: Mutex<tworky_core::claude_config::BackgroundTasks>,
     activity: Mutex<HashMap<String, Session>>,
+    keep_awake: Mutex<keep_awake::Control>,
+    keep_awake_changed: std::sync::Condvar,
 }
 
-const FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How often the UI refreshes issues from GitHub, and how long a project's repos go between
+/// fetches for the existing-work view.
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 type CmdResult<T> = Result<T, String>;
 
@@ -60,6 +66,7 @@ struct IssuesPayload {
     /// project name → the Projects board number whose Status is shown
     status_boards: BTreeMap<String, u64>,
     config_error: Option<String>,
+    refresh_secs: u64,
 }
 
 fn is_subtask(ws: Option<&Workspace>, issue: &tworky_core::hierarchy::Issue) -> bool {
@@ -123,6 +130,7 @@ fn issues_payload(index: &IssueIndex) -> IssuesPayload {
             .filter_map(|p| Some((p.name.clone(), p.status_board?)))
             .collect(),
         config_error,
+        refresh_secs: REFRESH_INTERVAL.as_secs(),
     }
 }
 
@@ -195,7 +203,10 @@ async fn existing_work(
         let project = subject_project(&ws, &index, &subject)?;
         let fetch = project.as_ref().is_some_and(|p| {
             let mut fetched = state.fetched.lock().unwrap();
-            let stale = refresh || fetched.get(p).is_none_or(|t| t.elapsed() > FETCH_INTERVAL);
+            let stale = refresh
+                || fetched
+                    .get(p)
+                    .is_none_or(|t| t.elapsed() > REFRESH_INTERVAL);
             if stale {
                 fetched.insert(p.clone(), std::time::Instant::now());
             }
@@ -824,14 +835,22 @@ fn run_session_job(
 }
 
 #[tauri::command]
-async fn cleanup_worker(app: AppHandle, id: String) -> CmdResult<()> {
+async fn cleanup_worker(app: AppHandle, id: String, remove_item: bool) -> CmdResult<()> {
     browser::forget_worker(&app, &id).await;
     if let Some(mcp) = app.try_state::<browser::Mcp>() {
         mcp.revoke(&id);
     }
     let job_id = id.clone();
-    blocking(move || run_session_job(app, id, move |ws, pid, log| ws.cleanup(&job_id, pid, log)))
-        .await
+    blocking(move || {
+        run_session_job(app, id, move |ws, pid, log| {
+            if remove_item {
+                ws.cleanup_and_remove_item(&job_id, pid, log)
+            } else {
+                ws.cleanup(&job_id, pid, log)
+            }
+        })
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1103,14 +1122,23 @@ async fn new_conversation(app: AppHandle, id: String) -> CmdResult<()> {
 }
 
 #[tauri::command]
-async fn open_worker_dir(id: String) -> CmdResult<()> {
+async fn open_worker_dir(id: String, repo: Option<String>) -> CmdResult<()> {
     blocking(move || {
         let w = workspace()?
             .state
             .get(&id)
             .map_err(err)?
             .ok_or("worker not found")?;
-        tauri_plugin_opener::open_path(&w.dir, None::<&str>).map_err(err)
+        let dir = match repo {
+            Some(repo) => {
+                if !w.worktrees.iter().any(|t| t.repo == repo) {
+                    return Err(format!("{repo} is not a worktree of {id}"));
+                }
+                w.dir.join(repo)
+            }
+            None => w.dir,
+        };
+        tauri_plugin_opener::open_path(&dir, None::<&str>).map_err(err)
     })
     .await
 }
@@ -1260,7 +1288,9 @@ fn main() {
                 tauri::async_runtime::spawn(browser::restore(handle.clone()));
                 tauri::async_runtime::spawn(browser::keep_cookies_periodically(handle.clone()));
             }
+            let keep_awake_handle = handle.clone();
             std::thread::spawn(move || watch_activity(handle));
+            std::thread::spawn(move || keep_awake::run(keep_awake_handle));
             Ok(())
         })
         .register_asynchronous_uri_scheme_protocol("ghimg", |ctx, request, responder| {
@@ -1320,6 +1350,8 @@ fn main() {
             dismiss_update_failure,
             start_update,
             restart_for_update,
+            keep_awake::keep_awake_status,
+            keep_awake::set_keep_awake,
             browser::browser_tabs,
             browser::browser_open,
             browser::browser_navigate,

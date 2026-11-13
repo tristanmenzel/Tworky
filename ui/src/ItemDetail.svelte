@@ -3,9 +3,11 @@
   import { openUrl } from '@tauri-apps/plugin-opener'
   import type { Item, Job, LocalStatus, Worker } from './api'
   import { ExistingWorkLoader } from './existingWork.svelte'
+  import { ownsItem } from './issue'
   import LocalWork from './LocalWork.svelte'
   import Markdown from './Markdown.svelte'
   import PullRequests from './PullRequests.svelte'
+  import WrapUp from './WrapUp.svelte'
 
   interface Props {
     item: Item
@@ -21,6 +23,7 @@
     onRemove: (name: string) => void
     onOpenWorker: (worker: Worker) => void
     onError: (message: string) => void
+    issuesRefreshed: number
   }
 
   let {
@@ -37,6 +40,7 @@
     onRemove,
     onOpenWorker,
     onError,
+    issuesRefreshed,
   }: Props = $props()
 
   let issueUrl = $state('')
@@ -50,6 +54,7 @@
 
   $effect(() => {
     const name = itemName
+    void issuesRefreshed
     untrack(() => existing.load({ kind: 'item', name }, false))
   })
 
@@ -62,10 +67,6 @@
     } finally {
       linking = false
     }
-  }
-
-  function remove() {
-    if (confirm(`Remove item ${item.name} (“${item.title}”)?`)) onRemove(item.name)
   }
 </script>
 
@@ -109,7 +110,17 @@
     </section>
 
     {#if worker}
-      <LocalWork {worker} {jobs} {local} {localFailed} log={logs} {onOpenWorker} {onError} />
+      <LocalWork
+        {worker}
+        {jobs}
+        {local}
+        {localFailed}
+        log={logs}
+        ownsItem={ownsItem(worker, [item])}
+        cleanup={false}
+        {onOpenWorker}
+        {onError}
+      />
     {/if}
 
     {#if item.source.kind === 'custom'}
@@ -139,20 +150,15 @@
       </section>
     {/if}
 
-    <section class="panel box">
-      <h2>Remove</h2>
-      <div class="row">
-        <span class="muted">
-          {worker ? `Clean up worker ${worker.id} first; then the item can be removed.` : 'Take this item off the list.'}
-        </span>
-        <button
-          class="danger"
-          disabled={!!worker}
-          title={worker ? 'Clean up the worker first' : undefined}
-          onclick={remove}>Remove from list</button
-        >
-      </div>
-    </section>
+    <WrapUp
+      {worker}
+      ownsItem={!!worker && ownsItem(worker, [item])}
+      scratch={item.scratch}
+      label={item.name}
+      title={item.title}
+      onRemove={() => onRemove(item.name)}
+      {onError}
+    />
   </div>
 
   <div class="column">
@@ -247,9 +253,6 @@
     display: flex;
     gap: 8px;
     align-items: center;
-  }
-  .row .muted {
-    margin-right: auto;
   }
   input {
     flex: 1;

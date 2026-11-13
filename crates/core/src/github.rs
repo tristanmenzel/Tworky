@@ -394,14 +394,62 @@ pub fn review_requests() -> Result<Vec<PrHit>> {
         .collect())
 }
 
-pub fn pull_request_by_url(url: &str) -> Result<PrHit> {
-    let page = graphql(
-        &format!(
-            "query($url: URI!) {{ resource(url: $url) {{ ... on PullRequest {{ ...P }} }} }} {PR_HIT}"
-        ),
-        &[("url", url)],
-    )?;
-    pr_hit(&page["data"]["resource"]).with_context(|| format!("{url} is not a pull request"))
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrReference {
+    Url(String),
+    InRepo {
+        owner: String,
+        name: String,
+        number: u64,
+    },
+}
+
+pub fn parse_pr_reference(reference: &str) -> Option<PrReference> {
+    match parse_issue_query(reference) {
+        IssueQuery::Url(url) => Some(PrReference::Url(url)),
+        IssueQuery::Text(text) if text.contains("github.com/") => Some(PrReference::Url(text)),
+        IssueQuery::InRepo(repo, number) => {
+            let (owner, name) = repo.split_once('/')?;
+            let valid = |part: &str| !part.is_empty() && !part.contains('/');
+            (valid(owner) && valid(name)).then(|| PrReference::InRepo {
+                owner: owner.to_string(),
+                name: name.to_string(),
+                number,
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn pull_request(reference: &str) -> Result<PrHit> {
+    let reference = reference.trim();
+    let node = match parse_pr_reference(reference) {
+        Some(PrReference::Url(url)) => {
+            let page = graphql(
+                &format!(
+                    "query($url: URI!) {{ resource(url: $url) {{ ... on PullRequest {{ ...P }} }} }} {PR_HIT}"
+                ),
+                &[("url", &url)],
+            )?;
+            page["data"]["resource"].clone()
+        }
+        Some(PrReference::InRepo {
+            owner,
+            name,
+            number,
+        }) => {
+            let page = graphql(
+                &format!(
+                    "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) \
+                     {{ issueOrPullRequest(number: {number}) {{ ... on PullRequest {{ ...P }} }} }} }} {PR_HIT}"
+                ),
+                &[("owner", &owner), ("name", &name)],
+            )?;
+            page["data"]["repository"]["issueOrPullRequest"].clone()
+        }
+        None => bail!("expected a pull request URL or owner/repo#number, got '{reference}'"),
+    };
+    pr_hit(&node).with_context(|| format!("{reference} is not a pull request"))
 }
 
 fn assigned_issues_query(query: &str, is_subtask: IsSubtask) -> Result<IssueIndex> {
@@ -963,6 +1011,38 @@ mod tests {
             IssueQuery::Text("fix #12 login".into())
         );
         assert_eq!(parse_issue_query("o#12"), IssueQuery::Text("o#12".into()));
+    }
+
+    #[test]
+    fn parses_pr_references() {
+        assert_eq!(
+            parse_pr_reference("https://github.com/o/r/pull/5"),
+            Some(PrReference::Url("https://github.com/o/r/pull/5".into()))
+        );
+        assert_eq!(
+            parse_pr_reference("github.com/o/r/pull/5"),
+            Some(PrReference::Url("github.com/o/r/pull/5".into()))
+        );
+        assert_eq!(
+            parse_pr_reference(" o/r#12 "),
+            Some(PrReference::InRepo {
+                owner: "o".into(),
+                name: "r".into(),
+                number: 12
+            })
+        );
+        for rejected in [
+            "/o/r#12",
+            "o/r#abc",
+            "o/r/x#12",
+            "#12",
+            "12",
+            "fix login",
+            "",
+            "   ",
+        ] {
+            assert_eq!(parse_pr_reference(rejected), None, "{rejected:?}");
+        }
     }
 
     fn f(id: &str, number: u64, ty: &str, assignees: &[&str]) -> Value {

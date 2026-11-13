@@ -1,18 +1,27 @@
 <script lang="ts">
   import { untrack } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import type { Activity, Card, Issue, IssueState, Job, LocalStatus, Verdict, Worker } from './api'
-  import { activityOf, boardStatusName, childrenOf, isMine, sessionLabel, shownBoards, typeClass } from './issue'
+  import type { Activity, Card, Issue, IssueState, Item, Job, LocalStatus, Verdict, Worker } from './api'
+  import {
+    activityOf,
+    boardStatusName,
+    childrenOf,
+    isMine,
+    ownsItem,
+    sessionLabel,
+    shownBoards,
+    typeClass,
+  } from './issue'
   import { ExistingWorkLoader } from './existingWork.svelte'
   import { withoutPr } from './prs'
   import { running } from './running'
-  import ActionMenu from './ActionMenu.svelte'
   import BoardSelect from './BoardSelect.svelte'
   import LocalWork from './LocalWork.svelte'
   import Markdown from './Markdown.svelte'
   import PullRequests from './PullRequests.svelte'
   import StatusSelect from './StatusSelect.svelte'
   import WorkerDot from './WorkerDot.svelte'
+  import WrapUp from './WrapUp.svelte'
 
   interface Props {
     card: Card
@@ -21,6 +30,7 @@
     projects: Record<string, string>
     statusBoards: Record<string, number>
     viewer: string
+    items: Item[]
     workers: Worker[]
     exited: Record<string, boolean>
     jobs: Record<string, Job[]>
@@ -34,6 +44,7 @@
     onOpenWorker: (worker: Worker) => void
     onRemove: (itemName: string) => void
     onError: (message: string) => void
+    issuesRefreshed: number
   }
 
   let {
@@ -43,6 +54,7 @@
     projects,
     statusBoards,
     viewer,
+    items,
     workers,
     exited,
     jobs,
@@ -56,6 +68,7 @@
     onOpenWorker,
     onRemove,
     onError,
+    issuesRefreshed,
   }: Props = $props()
 
   const DESCRIPTION_LINES = 12
@@ -112,6 +125,7 @@
 
   $effect(() => {
     const id = workScopeId
+    void issuesRefreshed
     untrack(() => existing.load({ kind: 'issue', id }, false))
   })
 
@@ -212,8 +226,8 @@
             </div>
           </div>
           <div class="side">
-            <div class="actions">
-              {#if !worker}
+            {#if !worker}
+              <div class="actions">
                 <button
                   class="primary"
                   disabled={!project}
@@ -222,20 +236,8 @@
                     : 'No project config matches this repo'}
                   onclick={() => onBegin(issue.id)}>Begin session</button
                 >
-              {/if}
-              <ActionMenu
-                items={[
-                  {
-                    label: 'Remove from list',
-                    danger: true,
-                    disabled: worker ? `Clean up worker ${worker.id} first` : false,
-                    onSelect: () => {
-                      if (confirm(`Take ${issue.repo}#${issue.number} off the work list?`)) onRemove(card.item)
-                    },
-                  },
-                ]}
-              />
-            </div>
+              </div>
+            {/if}
             <div class="glance">
               {#if activity}
                 {@const pill = ACTIVITY_PILLS[activity]}
@@ -346,11 +348,22 @@
           local={local[worker.id] ?? null}
           localFailed={localFailed[worker.id] ?? false}
           log={logs[worker.id] ?? []}
+          ownsItem={ownsItem(worker, items)}
+          cleanup={false}
           {onOpenWorker}
           {onError}
         />
       </div>
     {/if}
+
+    <WrapUp
+      {worker}
+      ownsItem={!!worker && ownsItem(worker, items)}
+      label="{issue.repo}#{issue.number}"
+      title={issue.title}
+      onRemove={() => onRemove(card.item)}
+      {onError}
+    />
   </div>
 
   <div class="column prs" bind:this={prsEl}>
