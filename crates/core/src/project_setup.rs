@@ -298,6 +298,16 @@ impl Workspace {
                 ),
             );
         }
+        for (key, port) in &project.ports {
+            if crate::ports::is_browser_blocked(*port) {
+                problem(
+                    Level::Warning,
+                    format!(
+                        "port {key} = {port} is blocked by browsers (ERR_UNSAFE_PORT), so if it serves pages, the main checkout can't be opened on it in a browser tab"
+                    ),
+                );
+            }
+        }
         if project.stack.is_some() && project.ports.is_empty() {
             problem(
                 Level::Warning,
@@ -581,6 +591,43 @@ start_service = "web"
         )))
         .expect("warns with a stack too");
         assert!(with_stack.contains("unless the stack publishes them all"));
+    }
+
+    #[test]
+    fn check_warns_about_browser_blocked_base_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        let repos = [crate::config::NewRepo {
+            name_with_owner: "acme/portal".into(),
+            source: dir.path().join("portal"),
+            base: "origin/main".into(),
+        }];
+        crate::config::create_repo_project(&paths, &[], &repos, None).unwrap();
+        let file = paths.projects_dir().join("portal.toml");
+        let base = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, base + "\n[ports]\nvite = 6000\napi = 4000\n").unwrap();
+        let config = Config::load_from(paths).unwrap();
+        let ws = Workspace {
+            state: crate::state::State::open(&config.paths.state_db()).unwrap(),
+            config,
+            claude_home: None,
+        };
+        let blocked: Vec<_> = ws
+            .check_project("portal")
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.level == Level::Warning && f.text.contains("blocked by browsers"))
+            .map(|f| f.text)
+            .collect();
+        assert_eq!(
+            blocked,
+            [
+                "port vite = 6000 is blocked by browsers (ERR_UNSAFE_PORT), so if it serves pages, the main checkout can't be opened on it in a browser tab"
+            ]
+        );
     }
 
     #[test]
