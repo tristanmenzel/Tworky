@@ -82,7 +82,7 @@ You can also make a project directly with **+** under **Projects**, or write the
 1. Select the item and press **Begin session**. Claude Code opens in a terminal tab with the worker's instructions loaded.
 2. Tell Claude what to do. It checks out the repos, starts the stack and runs dev servers as it needs them.
 3. Follow progress from the item's **Overview**: local work (worktrees, services, containers) on one side, branches and PRs on the other. A dot on each item shows whether its session is working, waiting for you or idle.
-4. When the PRs are merged, press **Clean up**.
+4. When the PRs are merged, choose **Clean up** from the **Clean up** menu, or **Clean up and remove item** to also take the item off the work list.
 
 Each project has shared **memory** (Projects › Memory): facts every session on the project reads when it starts, such as how to run the app or a known trap. Sessions propose additions and add them only after you agree.
 

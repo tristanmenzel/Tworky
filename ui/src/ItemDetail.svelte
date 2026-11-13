@@ -116,7 +116,7 @@
         {local}
         {localFailed}
         log={logs}
-        removeItem={removeItemReason(worker, [item])}
+        removeItemDisabled={removeItemReason(worker, [item])}
         {onOpenWorker}
         {onError}
       />

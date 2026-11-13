@@ -357,7 +357,7 @@
           local={local[worker.id] ?? null}
           localFailed={localFailed[worker.id] ?? false}
           log={logs[worker.id] ?? []}
-          removeItem={removeItemReason(worker, items)}
+          removeItemDisabled={removeItemReason(worker, items)}
           {onOpenWorker}
           {onError}
         />

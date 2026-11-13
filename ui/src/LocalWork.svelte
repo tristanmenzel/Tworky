@@ -12,13 +12,12 @@
     local: LocalStatus | null
     localFailed: boolean
     log: string[]
-    /** A reason the worker's item can't be removed with it, or `false` when it can. */
-    removeItem: string | false
+    removeItemDisabled: string | false
     onOpenWorker: (worker: Worker) => void
     onError: (message: string) => void
   }
 
-  let { worker, jobs, local, localFailed, log, removeItem, onOpenWorker, onError }: Props = $props()
+  let { worker, jobs, local, localFailed, log, removeItemDisabled, onOpenWorker, onError }: Props = $props()
 
   let checking = $state(false)
   let stopping = $state<Record<string, boolean>>({})
@@ -107,7 +106,7 @@
 
   const cleanupItems = $derived<MenuItem[]>([
     { label: 'Clean up', onSelect: () => cleanup(false) },
-    { label: 'Clean up and remove item', danger: true, disabled: removeItem, onSelect: () => cleanup(true) },
+    { label: 'Clean up and remove item', danger: true, disabled: removeItemDisabled, onSelect: () => cleanup(true) },
   ])
 
   async function cleanup(removeItem: boolean) {

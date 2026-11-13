@@ -77,7 +77,6 @@ export function confirmCleanup(w: Worker, prs: PrSummary | null, removeItem = fa
   )
 }
 
-/** Why "Clean up and remove item" isn't available for the worker, or `false` when it owns an item on the list. */
 export function removeItemReason(w: Worker, items: Item[]): string | false {
   const owns = !!w.item || items.some((i) => i.source.kind === 'issue' && i.source.id === w.issue?.id)
   return owns ? false : "This worker's issue isn't on the list"
