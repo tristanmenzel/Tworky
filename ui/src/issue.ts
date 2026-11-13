@@ -1,4 +1,4 @@
-import type { Activity, BoardStatus, Card, Issue, IssueState, PrSummary, Service, Worker } from './api'
+import type { Activity, BoardStatus, Card, Issue, IssueState, Item, PrSummary, Service, Worker } from './api'
 
 export function typeClass(type: string | null): string {
   const t = (type ?? '').toLowerCase()
@@ -68,12 +68,17 @@ export function issueState(issue: Issue): IssueState | null {
   return null
 }
 
-export function confirmCleanup(w: Worker, prs: PrSummary | null): boolean {
+export function confirmCleanup(w: Worker, prs: PrSummary | null, removeItem = false): boolean {
+  const also = removeItem ? ' Its item is also taken off the work list.' : ''
   return confirm(
     prs?.all_merged
-      ? `Clean up ${w.id}? This stops the session, removes the stack (including volumes), worktrees and branches Tworky created.`
-      : `${w.id} has no confirmation that all PRs are merged${prs ? '' : ' (PR status not checked)'}. Unpushed work in its worktrees will be lost. Clean up anyway?`,
+      ? `Clean up ${w.id}? This stops the session, removes the stack (including volumes), worktrees and branches Tworky created.${also}`
+      : `${w.id} has no confirmation that all PRs are merged${prs ? '' : ' (PR status not checked)'}. Unpushed work in its worktrees will be lost.${also} Clean up anyway?`,
   )
+}
+
+export function ownsItem(w: Worker, items: Item[]): boolean {
+  return items.some((i) => i.name === w.item?.name || (i.source.kind === 'issue' && i.source.id === w.issue?.id))
 }
 
 const SHELL_WORDS = new Set(['sh', 'bash', 'zsh', 'cmd', '/d', '/s', '/c', '-c'])

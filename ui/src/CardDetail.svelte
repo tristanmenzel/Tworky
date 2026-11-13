@@ -1,8 +1,17 @@
 <script lang="ts">
   import { untrack } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import type { Activity, Card, Issue, IssueState, Job, LocalStatus, Verdict, Worker } from './api'
-  import { activityOf, boardStatusName, childrenOf, isMine, sessionLabel, shownBoards, typeClass } from './issue'
+  import type { Activity, Card, Issue, IssueState, Item, Job, LocalStatus, Verdict, Worker } from './api'
+  import {
+    activityOf,
+    boardStatusName,
+    childrenOf,
+    isMine,
+    ownsItem,
+    sessionLabel,
+    shownBoards,
+    typeClass,
+  } from './issue'
   import { ExistingWorkLoader } from './existingWork.svelte'
   import { withoutPr } from './prs'
   import { running } from './running'
@@ -21,6 +30,7 @@
     projects: Record<string, string>
     statusBoards: Record<string, number>
     viewer: string
+    items: Item[]
     workers: Worker[]
     exited: Record<string, boolean>
     jobs: Record<string, Job[]>
@@ -43,6 +53,7 @@
     projects,
     statusBoards,
     viewer,
+    items,
     workers,
     exited,
     jobs,
@@ -346,6 +357,7 @@
           local={local[worker.id] ?? null}
           localFailed={localFailed[worker.id] ?? false}
           log={logs[worker.id] ?? []}
+          ownsItem={ownsItem(worker, items)}
           {onOpenWorker}
           {onError}
         />

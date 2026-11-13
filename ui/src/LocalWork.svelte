@@ -12,11 +12,12 @@
     local: LocalStatus | null
     localFailed: boolean
     log: string[]
+    ownsItem: boolean
     onOpenWorker: (worker: Worker) => void
     onError: (message: string) => void
   }
 
-  let { worker, jobs, local, localFailed, log, onOpenWorker, onError }: Props = $props()
+  let { worker, jobs, local, localFailed, log, ownsItem, onOpenWorker, onError }: Props = $props()
 
   let checking = $state(false)
   let stopping = $state<Record<string, boolean>>({})
@@ -103,11 +104,16 @@
     stopping[key] = false
   }
 
-  async function cleanup() {
+  const cleanupItems = $derived<MenuItem[]>([
+    { label: 'Clean up', onSelect: () => cleanup(false) },
+    ...(ownsItem ? [{ label: 'Clean up and remove item', danger: true, onSelect: () => cleanup(true) }] : []),
+  ])
+
+  async function cleanup(removeItem: boolean) {
     checking = true
     const summary = await api.prs(worker.id).catch(() => null)
     checking = false
-    if (confirmCleanup(worker, summary)) act(() => api.cleanup(worker.id))
+    if (confirmCleanup(worker, summary, removeItem)) act(() => api.cleanup(worker.id, removeItem))
   }
 
   function serviceAddress(s: ServiceStatus): string | null {
@@ -133,9 +139,13 @@
         onclick={() => act(() => api.stop(worker.id))}>Stop everything</button
       >
     {/if}
-    <button class="danger" disabled={checking || worker.busy || worker.status === 'cleaning'} onclick={cleanup}>
-      {checking ? 'Checking PRs…' : 'Clean up'}
-    </button>
+    <ActionMenu
+      label="Clean up {worker.id}"
+      trigger={checking ? 'Checking PRs…' : 'Clean up ▾'}
+      danger
+      disabled={checking || worker.busy || worker.status === 'cleaning'}
+      items={cleanupItems}
+    />
     <ActionMenu items={menu} label="More actions for {worker.id}" />
   </div>
 
