@@ -2,6 +2,7 @@
   import { untrack } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import type { Activity, Card, Issue, IssueState, Item, Job, LocalStatus, Verdict, Worker } from './api'
+  import { ask } from './confirm.svelte'
   import {
     activityOf,
     boardStatusName,
@@ -240,8 +241,13 @@
                     label: 'Remove from list',
                     danger: true,
                     disabled: worker ? `Clean up worker ${worker.id} first` : false,
-                    onSelect: () => {
-                      if (confirm(`Take ${issue.repo}#${issue.number} off the work list?`)) onRemove(card.item)
+                    onSelect: async () => {
+                      const ok = await ask({
+                        title: `Take ${issue.repo}#${issue.number} off the list?`,
+                        confirmLabel: 'Remove from list',
+                        danger: true,
+                      })
+                      if (ok) onRemove(card.item)
                     },
                   },
                 ]}

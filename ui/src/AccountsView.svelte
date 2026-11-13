@@ -2,6 +2,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { untrack } from 'svelte'
   import { api, type Account, type AccountsPayload, type Service } from './api'
+  import { ask } from './confirm.svelte'
 
   interface Props {
     project: string
@@ -118,8 +119,14 @@
     }
   }
 
-  function remove(name: string) {
-    if (confirm(`Remove ${name} and its stored password?`)) void act(() => api.removeAccount(project, name))
+  async function remove(name: string) {
+    const ok = await ask({
+      title: `Remove ${name}?`,
+      message: 'Its stored password is deleted too.',
+      confirmLabel: 'Remove account',
+      danger: true,
+    })
+    if (ok) void act(() => api.removeAccount(project, name))
   }
 </script>
 

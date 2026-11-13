@@ -1,6 +1,7 @@
 <script lang="ts">
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { api, type Job, type LocalStatus, type LocalWorktree, type ServiceStatus, type Worker } from './api'
+  import { ask } from './confirm.svelte'
   import { activityOf, confirmCleanup, formatAge, formatBytes, jobLabel, sessionLabel } from './issue'
   import { running } from './running'
   import ActionMenu, { type MenuItem } from './ActionMenu.svelte'
@@ -85,8 +86,14 @@
     {
       label: 'New conversation…',
       disabled: worker.claude_started ? false : 'No conversation has started yet',
-      onSelect: () =>
-        confirm('Start a new Claude conversation for this worker?') && act(() => api.newConversation(worker.id)),
+      onSelect: async () => {
+        const ok = await ask({
+          title: 'Start a new conversation?',
+          message: `The current Claude conversation for ${worker.id} ends.`,
+          confirmLabel: 'New conversation',
+        })
+        if (ok) act(() => api.newConversation(worker.id))
+      },
     },
   ])
 
@@ -113,7 +120,7 @@
     checking = true
     const summary = await api.prs(worker.id).catch(() => null)
     checking = false
-    if (confirmCleanup(worker, summary, removeItem)) act(() => api.cleanup(worker.id, removeItem))
+    if (await confirmCleanup(worker, summary, removeItem)) act(() => api.cleanup(worker.id, removeItem))
   }
 
   function serviceAddress(s: ServiceStatus): string | null {

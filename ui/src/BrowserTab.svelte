@@ -66,9 +66,11 @@
         return
       }
       const origin = await api.browserFillEmail(tab.id, false)
-      const allowed = await confirmOverBrowser(
-        `Remember ${origin} as a login page for ${tab.account}?\n\nIts password can then be filled there, by you and by Claude.`,
-      )
+      const allowed = await confirmOverBrowser({
+        title: `Remember ${origin} as a login page for ${tab.account}?`,
+        message: 'Its password can then be filled there, by you and by Claude.',
+        confirmLabel: 'Remember',
+      })
       if (allowed) await api.browserFillEmail(tab.id, true, origin)
     })
     busy = false
@@ -93,7 +95,13 @@
   }
 
   async function endSession() {
-    if (!(await confirmOverBrowser(`Sign ${tab.account} out of every site in this browser?`))) return
+    const ok = await confirmOverBrowser({
+      title: `Sign ${tab.account} out of every site?`,
+      message: 'Ends every session this browser holds for the account.',
+      confirmLabel: 'End session',
+      danger: true,
+    })
+    if (!ok) return
     busy = true
     await call(() => api.browserEndSession(tab.id))
     busy = false

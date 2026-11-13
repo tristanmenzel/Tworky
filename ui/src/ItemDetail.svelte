@@ -2,6 +2,7 @@
   import { untrack } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import type { Item, Job, LocalStatus, Worker } from './api'
+  import { ask } from './confirm.svelte'
   import { ExistingWorkLoader } from './existingWork.svelte'
   import { ownsItem } from './issue'
   import LocalWork from './LocalWork.svelte'
@@ -65,8 +66,14 @@
     }
   }
 
-  function remove() {
-    if (confirm(`Remove item ${item.name} (“${item.title}”)?`)) onRemove(item.name)
+  async function remove() {
+    const ok = await ask({
+      title: `Remove ${item.name}?`,
+      message: `“${item.title}” comes off the list.`,
+      confirmLabel: 'Remove item',
+      danger: true,
+    })
+    if (ok) onRemove(item.name)
   }
 </script>
 

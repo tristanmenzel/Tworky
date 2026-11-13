@@ -77,7 +77,12 @@
   async function restart() {
     if (liveSessions > 0) {
       const sessions = liveSessions === 1 ? '1 running session' : `${liveSessions} running sessions`
-      if (!(await confirmOverBrowser(`Restart to update? ${sessions} will be stopped.`))) return
+      const ok = await confirmOverBrowser({
+        title: 'Restart to update?',
+        message: `${sessions} will be stopped.`,
+        confirmLabel: 'Restart',
+      })
+      if (!ok) return
     }
     await api.restartForUpdate()
   }
