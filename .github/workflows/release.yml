@@ -1,8 +1,10 @@
 name: Release
 
-# Every push to main publishes a release that scripts/install.{sh,ps1} and the app's Update button
-# install. The builds run with a read-only token and hand their bundles to the publish job, which
-# uploads all three and only then publishes the release, so every published release has every
+# Every push to main publishes a release, v<major>.<minor>.<run number>, that
+# scripts/install.{sh,ps1} and the app's Update button install. Major and minor come from Cargo.toml;
+# the build stamps the full version into the app. The builds run with a read-only token and hand
+# their bundles to the publish job, which uploads all three and only then publishes the release,
+# so every published release has every
 # platform's build. The builds are unsigned: the scripts download them with curl or
 # Invoke-WebRequest, which set neither the Mark-of-the-Web nor com.apple.quarantine, so SmartScreen
 # and Gatekeeper never check them.
@@ -30,18 +32,22 @@ jobs:
       contents: write
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
       - id: tag
-        run: echo "tag=build-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(node scripts/set-version.mjs).${GITHUB_RUN_NUMBER}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
       - name: Draft the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes=$(bash scripts/release-notes.sh "$GITHUB_SHA")
+          notes=$(bash scripts/release-notes.sh "$GITHUB_SHA" "${{ steps.tag.outputs.tag }}")
           grep -q '^commit: ' <<<"$notes" || { echo "release notes have no commit: line" >&2; exit 1; }
           gh release delete "${{ steps.tag.outputs.tag }}" --cleanup-tag --yes 2>/dev/null || true
           gh release create "${{ steps.tag.outputs.tag }}" --draft --target "$GITHUB_SHA" \
@@ -94,6 +100,8 @@ jobs:
 
       - run: npm ci
 
+      - run: node scripts/set-version.mjs "${{ needs.create.outputs.version }}"
+
       - run: npm run tauri build -- ${{ matrix.args }}
 
       - name: Archive the app (macOS)
@@ -144,7 +152,7 @@ jobs:
           {
             kept=0
             while IFS="$(printf '\t')" read -r tag draft; do
-              case "$tag" in build-*) ;; *) continue ;; esac
+              case "$tag" in v*|build-*) ;; *) continue ;; esac
               if [ "$draft" = true ]; then
                 gh release delete "$tag" --cleanup-tag --yes </dev/null || true
               elif [ "$kept" -lt "$KEEP_RELEASES" ]; then

@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Prints the release notes for a build of <sha>: one bullet per `Change:` trailer in the commits
-# since the newest published build-* release, then `commit: <sha>`, which update.rs reads.
+# Prints the release notes for the release <tag> of <sha>: one bullet per `Change:` trailer in the
+# commits since the newest other published release, then `commit: <sha>`, which update.rs reads.
 #
-#   scripts/release-notes.sh <sha>
+#   scripts/release-notes.sh <sha> <tag>
 #
 # Needs full history and tags, and a gh that can read the repo's releases (GH_REPO picks the repo).
 set -euo pipefail
 
-sha=$(git rev-parse --verify "${1:?usage: release-notes.sh <sha>}^{commit}")
-tag="build-${sha::7}"
+sha=$(git rev-parse --verify "${1:?usage: release-notes.sh <sha> <tag>}^{commit}")
+tag=${2:?usage: release-notes.sh <sha> <tag>}
 
 prev_tag=$(gh release list --exclude-drafts --limit 100 --json tagName,createdAt \
-  --jq "[.[] | select((.tagName | startswith(\"build-\")) and .tagName != \"$tag\")]
+  --jq "[.[] | select((.tagName | startswith(\"v\") or startswith(\"build-\")) and .tagName != \"$tag\")]
         | sort_by(.createdAt) | last | .tagName // empty")
 
 prev=

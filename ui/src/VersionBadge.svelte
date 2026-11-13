@@ -127,16 +127,16 @@
         >Update failed</button
       >
     {:else if info.status?.kind === 'latest'}
-      <span class="pill ok" title={`Built from ${info.commit}${checkedLine}`}>latest</span>
+      <span class="pill ok" title={`Tworky ${info.version}, built from ${info.commit}${checkedLine}`}>latest</span>
     {:else if info.status?.kind === 'behind'}
-      <span class="pill warn" title={`Built from ${info.commit}; the latest release is ${info.status.tag}${checkedLine}`}>
+      <span class="pill warn" title={`Tworky ${info.version}, built from ${info.commit}; the latest release is ${info.status.tag}${checkedLine}`}>
         {info.status.commits === 1 ? '1 commit behind' : `${info.status.commits} commits behind`}
       </span>
       <button class="action" onclick={update} title="Download the latest release">Update</button>
     {:else}
       <span
         class="pill muted"
-        title={`Built from ${info.commit}${info.status?.kind === 'unknown' ? `: ${info.status.reason}` : info.error ? `\n${info.error}` : ''}${checkedLine}`}
+        title={`Tworky ${info.version}, built from ${info.commit}${info.status?.kind === 'unknown' ? `: ${info.status.reason}` : info.error ? `\n${info.error}` : ''}${checkedLine}`}
         >{info.short}</span
       >
     {/if}

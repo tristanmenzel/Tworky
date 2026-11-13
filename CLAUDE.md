@@ -43,7 +43,7 @@ Everything on the list is an **item** with a random name such as `brisk-otter`, 
   - `tauri-build` checks that those resource files exist even for debug builds, so on a fresh clone run `node scripts/build-cli.mjs` before `cargo build` or `npm run tauri dev`.
   - On Linux, building needs `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config`.
 - `.github/workflows/ci.yml` runs fmt, clippy, tests and svelte-check on Windows, macOS and Ubuntu for pushes to main and for PRs. It builds no installers.
-- `.github/workflows/release.yml` publishes a release, `build-<sha7>`, for every push to main: the NSIS installer, a universal macOS `.app` (as `Tworky-universal.app.tar.gz`) and an x64 AppImage. It keeps the newest 10. See Versioning and updates.
+- `.github/workflows/release.yml` publishes a release, `v<major>.<minor>.<run number>`, for every push to main: the NSIS installer, a universal macOS `.app` (as `Tworky-universal.app.tar.gz`) and an x64 AppImage. It keeps the newest 10. See Versioning and updates.
 - Installing for users:
   - macOS / Linux: `curl -fsSL https://raw.githubusercontent.com/tristanmenzel/Tworky/main/scripts/install.sh | sh`
   - Windows: ``& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tristanmenzel/Tworky/main/scripts/install.ps1)))``
@@ -115,6 +115,7 @@ A commit a user would notice carries a `Change: <one terse line>` trailer, worde
   - On first run, `Paths::migrate_legacy` copies `%APPDATA%\work-app` and `%LOCALAPPDATA%\work-app\state.db` to the new folders, and never overwrites anything already there.
   - Workers keep the `compose_project` saved on their record, so `wa-<id>` stacks still work alongside new `tw-<id>` ones.
 - **Versioning and updates** (`build_info.rs`, `update.rs`, `VersionBadge`, `scripts/install.{sh,ps1}`).
+  - **Version.** Major and minor are the `[workspace.package]` version in `Cargo.toml`, bumped by hand. `release.yml` appends the workflow's run number and `scripts/set-version.mjs` stamps the result into `Cargo.toml`, `tauri.conf.json` and `package.json` before building, so the installer, the app and `tw --version` carry it. Local builds keep the checked-in `.0`. Releases from before this were tagged `build-<sha7>`, and the notes and pruning still accept them.
   - **Build commit.** `crates/core/build.rs` embeds the build commit (`GITHUB_SHA` in CI, else `git rev-parse HEAD`) and a dirty flag. `tw --version` and the `tw issue` footer show it.
   - **Release notes.** `scripts/release-notes.sh` writes each release's body: a bullet per `Change:` trailer since the newest published release, then the `commit:` line `update.rs` reads.
   - **Badge.** The badge by the username compares the commit with the latest release through the unauthenticated GitHub API (`curl` on `…/compare/<commit>...<tag>`). A rate-limited request shows the status as unknown. `ahead_by` is how many commits behind this build is. A commit GitHub doesn't know, or no release at all, shows the short sha in grey. Dev builds show no badge.

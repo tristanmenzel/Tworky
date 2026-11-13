@@ -387,6 +387,7 @@ export type UpdateStatus =
   | { kind: 'unknown'; reason: string }
 
 export interface VersionInfo {
+  version: string
   commit: string
   short: string
   dev: boolean

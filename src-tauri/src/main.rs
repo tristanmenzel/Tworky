@@ -940,6 +940,7 @@ fn dismiss_account_requests(id: String) -> CmdResult<()> {
 
 #[derive(Serialize)]
 struct VersionInfo {
+    version: String,
     commit: String,
     short: String,
     dev: bool,
@@ -957,6 +958,7 @@ fn tworky_repo() -> CmdResult<String> {
 #[tauri::command]
 async fn update_status() -> CmdResult<VersionInfo> {
     let mut info = VersionInfo {
+        version: env!("CARGO_PKG_VERSION").into(),
         commit: build_info::COMMIT.into(),
         short: build_info::SHORT.into(),
         dev: feedback::is_dev_build(),
