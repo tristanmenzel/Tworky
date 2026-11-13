@@ -58,7 +58,7 @@
     subjectUrl,
   } from './issue'
 
-  const POLL_MS = 5 * 60 * 1000
+  const DUE_CHECK_MS = 30_000
   const JOBS_POLL_MS = 10_000
   const ITEM_PREFIX = 'item:'
 
@@ -86,6 +86,8 @@
   let generations = $state<Record<string, number>>({})
   let exited = $state<Record<string, boolean>>({})
   let refreshKey = $state(0)
+  let issuesRefreshedAt = Date.now()
+  let issuesRefreshed = $state(0)
   const liveSessionCount = $derived(workers.filter((w) => w.session_alive && !exited[w.id]).length)
   let logs = $state<Record<string, string[]>>({})
   let jobs = $state<Record<string, Job[]>>({})
@@ -213,8 +215,10 @@
 
   async function loadIssues(refresh: boolean) {
     loading = true
+    if (refresh) issuesRefreshedAt = Date.now()
     try {
       payload = await api.issues(refresh)
+      if (refresh) issuesRefreshed++
       if (payload.config_error) showError(`Config: ${payload.config_error}`)
       if (selectedId === null && payload.cards.length) selectedId = payload.cards[0].id
     } catch (e) {
@@ -222,6 +226,11 @@
     } finally {
       loading = false
     }
+  }
+
+  function refreshIssuesIfDue() {
+    if (document.hidden || loading || !payload) return
+    if (Date.now() - issuesRefreshedAt >= payload.refresh_secs * 1000) loadIssues(true)
   }
 
   async function loadWorkers() {
@@ -588,7 +597,8 @@
     loadProjects()
     loadJobs()
     api.browserTabs().then((tabs) => (browserTabs = tabs), showError)
-    const timer = setInterval(() => loadIssues(true), POLL_MS)
+    const timer = setInterval(refreshIssuesIfDue, DUE_CHECK_MS)
+    document.addEventListener('visibilitychange', refreshIssuesIfDue)
     const jobsTimer = setInterval(() => {
       if (document.hidden) return
       loadJobs()
@@ -626,6 +636,7 @@
     return () => {
       clearInterval(timer)
       clearInterval(jobsTimer)
+      document.removeEventListener('visibilitychange', refreshIssuesIfDue)
       unlisten.forEach((p) => p.then((f) => f()))
     }
   })
@@ -848,6 +859,7 @@
                 onRemove={removeItem}
                 onOpenWorker={openTerminal}
                 onError={showError}
+                {issuesRefreshed}
               />
             {/key}
           {:else if selectedCard && issues.has(selectedCard.id)}
@@ -873,6 +885,7 @@
                 onOpenWorker={openTerminal}
                 onRemove={removeItem}
                 onError={showError}
+                {issuesRefreshed}
               />
             {/key}
           {:else}

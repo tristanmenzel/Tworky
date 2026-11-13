@@ -44,6 +44,7 @@
     onOpenWorker: (worker: Worker) => void
     onRemove: (itemName: string) => void
     onError: (message: string) => void
+    issuesRefreshed: number
   }
 
   let {
@@ -67,6 +68,7 @@
     onOpenWorker,
     onRemove,
     onError,
+    issuesRefreshed,
   }: Props = $props()
 
   const DESCRIPTION_LINES = 12
@@ -123,6 +125,7 @@
 
   $effect(() => {
     const id = workScopeId
+    void issuesRefreshed
     untrack(() => existing.load({ kind: 'issue', id }, false))
   })
 

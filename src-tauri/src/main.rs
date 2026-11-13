@@ -40,7 +40,9 @@ struct AppState {
     keep_awake_changed: std::sync::Condvar,
 }
 
-const FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How often the UI refreshes issues from GitHub, and how long a project's repos go between
+/// fetches for the existing-work view.
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 type CmdResult<T> = Result<T, String>;
 
@@ -64,6 +66,7 @@ struct IssuesPayload {
     /// project name → the Projects board number whose Status is shown
     status_boards: BTreeMap<String, u64>,
     config_error: Option<String>,
+    refresh_secs: u64,
 }
 
 fn is_subtask(ws: Option<&Workspace>, issue: &tworky_core::hierarchy::Issue) -> bool {
@@ -127,6 +130,7 @@ fn issues_payload(index: &IssueIndex) -> IssuesPayload {
             .filter_map(|p| Some((p.name.clone(), p.status_board?)))
             .collect(),
         config_error,
+        refresh_secs: REFRESH_INTERVAL.as_secs(),
     }
 }
 
@@ -199,7 +203,10 @@ async fn existing_work(
         let project = subject_project(&ws, &index, &subject)?;
         let fetch = project.as_ref().is_some_and(|p| {
             let mut fetched = state.fetched.lock().unwrap();
-            let stale = refresh || fetched.get(p).is_none_or(|t| t.elapsed() > FETCH_INTERVAL);
+            let stale = refresh
+                || fetched
+                    .get(p)
+                    .is_none_or(|t| t.elapsed() > REFRESH_INTERVAL);
             if stale {
                 fetched.insert(p.clone(), std::time::Instant::now());
             }
