@@ -4,8 +4,7 @@ name: Release
 # scripts/install.{sh,ps1} and the app's Update button install. Major and minor come from Cargo.toml;
 # the build stamps the full version into the app. The builds run with a read-only token and hand
 # their bundles to the publish job, which uploads all three and only then publishes the release,
-# so every published release has every
-# platform's build. The builds are unsigned: the scripts download them with curl or
+# so every published release has every platform's build. The builds are unsigned: the scripts download them with curl or
 # Invoke-WebRequest, which set neither the Mark-of-the-Web nor com.apple.quarantine, so SmartScreen
 # and Gatekeeper never check them.
 on:

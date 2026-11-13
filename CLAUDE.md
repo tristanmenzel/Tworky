@@ -43,7 +43,7 @@ Everything on the list is an **item** with a random name such as `brisk-otter`, 
   - `tauri-build` checks that those resource files exist even for debug builds, so on a fresh clone run `node scripts/build-cli.mjs` before `cargo build` or `npm run tauri dev`.
   - On Linux, building needs `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config`.
 - `.github/workflows/ci.yml` runs fmt, clippy, tests and svelte-check on Windows, macOS and Ubuntu for pushes to main and for PRs. It builds no installers.
-- `.github/workflows/release.yml` publishes a release, `v<major>.<minor>.<run number>`, for every push to main: the NSIS installer, a universal macOS `.app` (as `Tworky-universal.app.tar.gz`) and an x64 AppImage. It keeps the newest 10. See Versioning and updates.
+- `.github/workflows/release.yml` publishes a release, `v<major>.<minor>.<run number>`, for every push to main that changes more than the install scripts, `README.md` or `CLAUDE.md` (the app fetches the scripts from main): the NSIS installer, a universal macOS `.app` (as `Tworky-universal.app.tar.gz`) and an x64 AppImage. It keeps the newest 10. See Versioning and updates.
 - Installing for users:
   - macOS / Linux: `curl -fsSL https://raw.githubusercontent.com/tristanmenzel/Tworky/main/scripts/install.sh | sh`
   - Windows: ``& ([scriptblock]::Create((irm https://raw.githubusercontent.com/tristanmenzel/Tworky/main/scripts/install.ps1)))``
