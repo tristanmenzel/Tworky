@@ -6,6 +6,19 @@ use anyhow::{Result, bail};
 
 pub type PortMap = BTreeMap<String, u16>;
 
+/// https://fetch.spec.whatwg.org/#bad-port
+pub const BLOCKED_PORTS: &[u16] = &[
+    0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101,
+    102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427,
+    465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990,
+    993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667,
+    6668, 6669, 6679, 6697, 10080,
+];
+
+pub fn is_browser_blocked(port: u16) -> bool {
+    BLOCKED_PORTS.contains(&port)
+}
+
 /// Slot 0 is the developer's main checkout, so workers start at slot 1.
 pub fn ports_for_slot(base: &PortMap, slot: u16, stride: u16) -> PortMap {
     base.iter()
@@ -86,14 +99,24 @@ pub fn allocate(
         .chain(used.iter().copied())
         .flat_map(|s| ports_for_slot(base, s, stride).into_values())
         .collect();
+    let mut blocked = 0;
     for slot in 1..=max_slots {
         if used.contains(&slot) {
             continue;
         }
         let ports = ports_for_slot(base, slot, stride);
+        if ports.values().any(|p| is_browser_blocked(*p)) {
+            blocked += 1;
+            continue;
+        }
         if ports.values().all(|p| !taken.contains(p) && probe(*p)) {
             return Ok((slot, ports));
         }
+    }
+    if blocked > 0 {
+        bail!(
+            "no free port slot (max_slots = {max_slots}); {blocked} slot(s) were skipped because their ports are blocked by browsers, so clean up a worker, raise max_slots or change the base ports"
+        )
     }
     bail!("no free port slot (max_slots = {max_slots}); clean up a worker or raise max_slots")
 }
@@ -128,7 +151,31 @@ mod tests {
 
     #[test]
     fn exhausts() {
-        assert!(allocate(&base(), 100, 2, &[1, 2], |_| true).is_err());
+        let err = allocate(&base(), 100, 2, &[1, 2], |_| true).unwrap_err();
+        assert!(!err.to_string().contains("blocked"), "{err}");
+    }
+
+    #[test]
+    fn skips_browser_blocked_slots() {
+        let base: PortMap = [("vite".to_string(), 1420)].into();
+        let (slot, ports) = allocate(&base, 100, 10, &[1, 2], |_| true).unwrap();
+        assert_eq!(slot, 4, "slot 3 puts vite on 1720");
+        assert_eq!(ports["vite"], 1820);
+    }
+
+    #[test]
+    fn exhaustion_mentions_blocked_slots() {
+        let base: PortMap = [("vite".to_string(), 1420)].into();
+        let err = allocate(&base, 100, 3, &[1, 2], |_| true).unwrap_err();
+        assert!(err.to_string().contains("1 slot(s) were skipped"), "{err}");
+    }
+
+    #[test]
+    fn knows_browser_blocked_ports() {
+        assert!(is_browser_blocked(1720));
+        assert!(is_browser_blocked(6000));
+        assert!(is_browser_blocked(10080));
+        assert!(!is_browser_blocked(1420));
     }
 
     #[test]
