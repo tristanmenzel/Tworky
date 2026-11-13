@@ -378,7 +378,7 @@ impl Workspace {
 
     /// Puts a pull request on the work list, to review or finish it in a worker on its branch.
     pub fn add_pull_request_item(&self, url: &str, choice: &ProjectChoice) -> Result<AddOutcome> {
-        let pr = github::pull_request_by_url(url.trim())?;
+        let pr = github::pull_request(url)?;
         if let Some(existing) = self.state.item_for_pull_request(&pr.url)? {
             bail!(
                 "{} PR #{} is already on the list as {}",
