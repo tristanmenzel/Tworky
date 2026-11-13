@@ -12,12 +12,12 @@
     local: LocalStatus | null
     localFailed: boolean
     log: string[]
-    removeItemDisabled: string | false
+    ownsItem: boolean
     onOpenWorker: (worker: Worker) => void
     onError: (message: string) => void
   }
 
-  let { worker, jobs, local, localFailed, log, removeItemDisabled, onOpenWorker, onError }: Props = $props()
+  let { worker, jobs, local, localFailed, log, ownsItem, onOpenWorker, onError }: Props = $props()
 
   let checking = $state(false)
   let stopping = $state<Record<string, boolean>>({})
@@ -106,7 +106,7 @@
 
   const cleanupItems = $derived<MenuItem[]>([
     { label: 'Clean up', onSelect: () => cleanup(false) },
-    { label: 'Clean up and remove item', danger: true, disabled: removeItemDisabled, onSelect: () => cleanup(true) },
+    ...(ownsItem ? [{ label: 'Clean up and remove item', danger: true, onSelect: () => cleanup(true) }] : []),
   ])
 
   async function cleanup(removeItem: boolean) {

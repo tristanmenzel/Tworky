@@ -77,9 +77,8 @@ export function confirmCleanup(w: Worker, prs: PrSummary | null, removeItem = fa
   )
 }
 
-export function removeItemReason(w: Worker, items: Item[]): string | false {
-  const owns = items.some((i) => i.name === w.item?.name || (i.source.kind === 'issue' && i.source.id === w.issue?.id))
-  return owns ? false : "This worker's issue isn't on the list"
+export function ownsItem(w: Worker, items: Item[]): boolean {
+  return items.some((i) => i.name === w.item?.name || (i.source.kind === 'issue' && i.source.id === w.issue?.id))
 }
 
 const SHELL_WORDS = new Set(['sh', 'bash', 'zsh', 'cmd', '/d', '/s', '/c', '-c'])

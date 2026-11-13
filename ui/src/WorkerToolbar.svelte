@@ -10,7 +10,7 @@
     accounts: string[]
     /** How many of the project's services have a port on this worker. */
     services: number
-    removeItemDisabled: string | false
+    ownsItem: boolean
     onResume: () => void
     onTerminate: () => Promise<void>
     onOpenBrowser: (account: string) => void
@@ -19,7 +19,7 @@
     onError: (message: string) => void
   }
 
-  let { worker, accounts, services, removeItemDisabled, onResume, onTerminate, onOpenBrowser, onOpenAnonymous, onCreateProfile, onError }: Props =
+  let { worker, accounts, services, ownsItem, onResume, onTerminate, onOpenBrowser, onOpenAnonymous, onCreateProfile, onError }: Props =
     $props()
 
   const noService = $derived(services ? false : 'The project has no service with a port')
@@ -44,7 +44,7 @@
 
   const cleanupItems = $derived<MenuItem[]>([
     { label: 'Clean up', onSelect: () => cleanup(false) },
-    { label: 'Clean up and remove item', danger: true, disabled: removeItemDisabled, onSelect: () => cleanup(true) },
+    ...(ownsItem ? [{ label: 'Clean up and remove item', danger: true, onSelect: () => cleanup(true) }] : []),
   ])
 
   async function cleanup(removeItem: boolean) {

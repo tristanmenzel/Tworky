@@ -3,7 +3,7 @@
   import { openUrl } from '@tauri-apps/plugin-opener'
   import type { Item, Job, LocalStatus, Worker } from './api'
   import { ExistingWorkLoader } from './existingWork.svelte'
-  import { removeItemReason } from './issue'
+  import { ownsItem } from './issue'
   import LocalWork from './LocalWork.svelte'
   import Markdown from './Markdown.svelte'
   import PullRequests from './PullRequests.svelte'
@@ -116,7 +116,7 @@
         {local}
         {localFailed}
         log={logs}
-        removeItemDisabled={removeItemReason(worker, [item])}
+        ownsItem={ownsItem(worker, [item])}
         {onOpenWorker}
         {onError}
       />

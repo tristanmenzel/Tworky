@@ -7,7 +7,7 @@
     boardStatusName,
     childrenOf,
     isMine,
-    removeItemReason,
+    ownsItem,
     sessionLabel,
     shownBoards,
     typeClass,
@@ -357,7 +357,7 @@
           local={local[worker.id] ?? null}
           localFailed={localFailed[worker.id] ?? false}
           log={logs[worker.id] ?? []}
-          removeItemDisabled={removeItemReason(worker, items)}
+          ownsItem={ownsItem(worker, items)}
           {onOpenWorker}
           {onError}
         />

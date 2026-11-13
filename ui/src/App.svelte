@@ -50,7 +50,7 @@
     activityRank,
     formatBytes,
     jobLabel,
-    removeItemReason,
+    ownsItem,
     serviceUrl,
     subjectLabel,
     subjectUrl,
@@ -901,7 +901,7 @@
                   local={local[w.id] ?? null}
                   localFailed={localFailed[w.id] ?? false}
                   log={logs[w.id] ?? []}
-                  removeItemDisabled={removeItemReason(w, items)}
+                  ownsItem={ownsItem(w, items)}
                   onOpenWorker={openTerminal}
                   onError={showError}
                 />
@@ -1012,7 +1012,7 @@
                 worker={w}
                 accounts={accountsOf(w)}
                 services={servicesOf(w).length}
-                removeItemDisabled={removeItemReason(w, items)}
+                ownsItem={ownsItem(w, items)}
                 onResume={() => mountTerminal({ ...w, session_alive: false })}
                 onTerminate={() => terminate(w)}
                 onOpenBrowser={(account) => openBrowser(w, account)}
