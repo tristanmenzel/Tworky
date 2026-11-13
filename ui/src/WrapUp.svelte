@@ -23,7 +23,7 @@
 
   const workerId = $derived(worker?.id)
   const worktreeKey = $derived(worker?.worktrees.map((t) => `${t.repo}:${t.branch}`).join(',') ?? '')
-  const pr = $derived(prState(summary))
+  const pr = $derived(prState(summary, worker?.worktrees.length ?? 0))
   const disabled = $derived(!worker || checking || worker.busy || worker.status === 'cleaning')
 
   const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`

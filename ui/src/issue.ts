@@ -76,21 +76,22 @@ export type PrState =
   | { kind: 'open'; count: number }
   | { kind: 'unmerged' }
 
-export function prState(summary: PrSummary | null): PrState {
-  if (!summary || summary.repos.some((r) => r.error)) return { kind: 'unknown' }
-  if (!summary.repos.length) return { kind: 'none' }
+export function prState(summary: PrSummary | null, worktrees: number): PrState {
+  if (!worktrees) return { kind: 'none' }
+  if (!summary || summary.repos.length < worktrees || summary.repos.some((r) => r.error)) return { kind: 'unknown' }
   if (summary.all_merged) return { kind: 'merged' }
   const count = summary.repos.flatMap((r) => r.pull_requests).filter((p) => p.state === 'OPEN').length
   return count ? { kind: 'open', count } : { kind: 'unmerged' }
 }
 
 function cleanupWarning(w: Worker, prs: PrSummary | null): string | null {
-  const state = prState(prs)
-  if (state.kind === 'unknown') return 'PR status not checked'
-  if (w.pr) {
-    const unsaved = prs?.repos.some((r) => r.status && (r.status.dirty_files || r.status.unpushed_commits))
+  const state = prState(prs, w.worktrees.length)
+  if (w.pr && state.kind !== 'none') {
+    if (!prs || prs.repos.length < w.worktrees.length || prs.repos.some((r) => !r.status)) return 'Local changes not checked'
+    const unsaved = prs.repos.some((r) => r.status && (r.status.dirty_files || r.status.unpushed_commits))
     return unsaved ? 'Some work is not pushed' : null
   }
+  if (state.kind === 'unknown') return 'PR status not checked'
   return state.kind === 'open' || state.kind === 'unmerged' ? 'Not all PRs are merged' : null
 }
 
