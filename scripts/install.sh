@@ -94,12 +94,25 @@ set_phase downloading
 download=$(mktemp -d "${TMPDIR:-/tmp}/tworky.XXXXXX") || fail 'could not make a download folder'
 releases=$(curl -fsSL "https://api.github.com/repos/$repo/releases?per_page=20" </dev/null) \
   || fail "could not list the releases of $repo"
-# Releases are newest first and drafts are hidden, but the Windows build is published first, so the
-# newest release may not have this platform's build yet.
+# The API doesn't list releases in publish order, so take the newest by published_at that has this
+# platform's build. The Windows build is published first, so the newest release may lack it for a
+# while. A release's published_at precedes its assets in the JSON; drafts are hidden.
 url=
-for candidate in $(printf '%s' "$releases" | grep -o '"browser_download_url": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/'); do
-  # shellcheck disable=SC2254 # $pattern is a glob on purpose
-  case "${candidate##*/}" in $pattern) url=$candidate; break ;; esac
+published=
+newest=
+for token in $(printf '%s' "$releases" \
+  | grep -oE '"(published_at|browser_download_url)": *"[^"]*"' \
+  | sed 's/^"\([a-z_]*\)": *"\([^"]*\)"$/\1=\2/'); do
+  case "$token" in
+    published_at=*) published=${token#published_at=} ;;
+    browser_download_url=*)
+      candidate=${token#browser_download_url=}
+      # shellcheck disable=SC2254 # $pattern is a glob on purpose
+      case "${candidate##*/}" in
+        $pattern)
+          if [ -z "$url" ] || [ "$published" \> "$newest" ]; then url=$candidate; newest=$published; fi ;;
+      esac ;;
+  esac
 done
 [ -n "$url" ] || fail "No recent release has a $pattern build"
 log "Downloading $url"

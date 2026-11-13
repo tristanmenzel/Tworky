@@ -72,9 +72,10 @@ try {
     }
     $ProgressPreference = 'SilentlyContinue'
 
-    # Releases are newest first, and drafts are hidden from unauthenticated callers.
+    # The API doesn't list releases in publish order. Drafts are hidden from unauthenticated callers.
     $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=20" -UseBasicParsing
-    $asset = $releases | ForEach-Object { $_.assets } |
+    $asset = $releases | Sort-Object { [datetime]$_.published_at } -Descending |
+        ForEach-Object { $_.assets } |
         Where-Object { $_.name -like '*_x64-setup.exe' } | Select-Object -First 1
     if (-not $asset) { throw 'No recent release has a Windows installer.' }
 
