@@ -81,24 +81,29 @@ pub struct Browser {
     resetting: Resetting,
 }
 
-/// Profiles whose session is being reset. Opening a tab on one is refused under the `tabs`
-/// lock, so each tab of the profile is either closed by the reset or never opens.
+/// Profiles whose session is being reset, lowercased as WebView2 ignores case in profile names.
+/// Opening a tab on one is refused under the `tabs` lock, so each tab of the profile is either
+/// closed by the reset or never opens.
 #[derive(Default)]
 struct Resetting(Mutex<HashSet<String>>);
 
 impl Resetting {
     fn contains(&self, profile: &str) -> bool {
-        self.0.lock().unwrap().contains(profile)
-    }
-
-    fn start(&self, profile: &str) -> Option<ResetGuard<'_>> {
         self.0
             .lock()
             .unwrap()
-            .insert(profile.to_string())
+            .contains(&profile.to_ascii_lowercase())
+    }
+
+    fn start(&self, profile: &str) -> Option<ResetGuard<'_>> {
+        let profile = profile.to_ascii_lowercase();
+        self.0
+            .lock()
+            .unwrap()
+            .insert(profile.clone())
             .then(|| ResetGuard {
                 resetting: self,
-                profile: profile.to_string(),
+                profile,
             })
     }
 }
@@ -191,33 +196,41 @@ impl Browser {
         Ok(tab)
     }
 
-    /// Marks the profile as resetting and returns its open tabs, for the reset to close.
-    fn begin_reset(&self, profile: &str) -> CmdResult<(ResetGuard<'_>, Vec<Arc<Tab>>)> {
+    /// Marks the profile as resetting and returns its saved name and open tabs, for the reset to
+    /// close.
+    fn begin_reset(&self, profile: &str) -> CmdResult<(ResetGuard<'_>, String, Vec<Arc<Tab>>)> {
         let tabs = self.tabs.lock().unwrap();
-        match self.saved.lock().unwrap().profiles.get(profile) {
+        let saved = self.saved.lock().unwrap();
+        let (profile, entry) = match saved_profile(&saved, profile) {
             None => {
                 return Err(
                     "no session to reset: the account has no browser profile on this worker".into(),
                 );
             }
-            Some(p) if p.anonymous => {
-                return Err(
-                    "an anonymous tab has no session to reset; close the tab to discard it".into(),
-                );
-            }
-            Some(_) => {}
+            Some(found) => found,
+        };
+        if entry.anonymous {
+            return Err(
+                "an anonymous tab has no session to reset; close the tab to discard it".into(),
+            );
         }
+        let profile = profile.clone();
+        drop(saved);
         let guard = self
             .resetting
-            .start(profile)
+            .start(&profile)
             .ok_or("the account's session is already being reset")?;
         let mut open: Vec<_> = tabs
             .values()
-            .filter(|t| t.profile == profile)
+            .filter(|t| t.profile.eq_ignore_ascii_case(&profile))
             .cloned()
             .collect();
         open.sort_by_key(|t| t.id);
-        Ok((guard, open))
+        Ok((guard, profile, open))
+    }
+
+    fn is_saved(&self, profile: &str) -> bool {
+        self.saved.lock().unwrap().profiles.contains_key(profile)
     }
 
     fn remove(&self, id: u64) -> Option<Arc<Tab>> {
@@ -270,6 +283,17 @@ impl Browser {
             self.set_kept_cookies(profile, kept);
         }
     }
+}
+
+/// The saved entry for a profile, matched ignoring ASCII case as WebView2 does, so a reset
+/// still finds it after the account is renamed to a different case.
+fn saved_profile<'a>(saved: &'a Saved, profile: &str) -> Option<(&'a String, &'a SavedProfile)> {
+    saved.profiles.get_key_value(profile).or_else(|| {
+        saved
+            .profiles
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(profile))
+    })
 }
 
 /// Anonymous tabs aren't reopened after a restart.
@@ -353,16 +377,18 @@ fn profile_name(worker: &str, account: &str) -> String {
     valid_profile_name(format!("tw-{worker}-{account}"))
 }
 
-/// Which of the project's accounts now owns a tab's profile. The account may have been renamed
-/// or removed since the tab opened, and then none does.
-pub(super) fn profile_account<'a>(
+/// Which of the project's accounts now map to a tab's profile. The account may have been renamed
+/// or removed since the tab opened, and then none does; names that differ only in characters a
+/// profile name can't hold share one.
+pub(super) fn profile_accounts<'a>(
     worker: &str,
     profile: &str,
     names: impl IntoIterator<Item = &'a str>,
-) -> Option<&'a str> {
+) -> Vec<&'a str> {
     names
         .into_iter()
-        .find(|name| profile_name(worker, name).eq_ignore_ascii_case(profile))
+        .filter(|name| profile_name(worker, name).eq_ignore_ascii_case(profile))
+        .collect()
 }
 
 /// A fresh profile for one anonymous tab. The random part keeps a reused tab id from finding
@@ -1165,12 +1191,16 @@ pub async fn browser_fill_email(
 /// account is signed out and its next tab starts fresh.
 pub async fn reset_session(app: &AppHandle, profile: &str) -> CmdResult<()> {
     let browser = app.state::<Browser>();
-    let (_resetting, tabs) = browser.begin_reset(profile)?;
+    let (_resetting, profile, tabs) = browser.begin_reset(profile)?;
     for tab in tabs {
         close(app, tab.id).await;
     }
-    host::clear_profile(app, profile).await?;
-    browser.set_kept_cookies(profile, Vec::new());
+    if !browser.is_saved(&profile) {
+        changed(app);
+        return Ok(());
+    }
+    host::clear_profile(app, &profile).await?;
+    browser.set_kept_cookies(&profile, Vec::new());
     changed(app);
     Ok(())
 }
@@ -1291,7 +1321,8 @@ mod tests {
         browser.insert(new_tab(2, Some("Admin"))).unwrap();
         browser.insert(new_tab(3, Some("Tester 1"))).unwrap();
 
-        let (guard, open) = browser.begin_reset(&profile).unwrap();
+        let (guard, saved, open) = browser.begin_reset(&profile).unwrap();
+        assert_eq!(saved, profile);
         let ids: Vec<_> = open.iter().map(|t| t.id).collect();
         assert_eq!(ids, [1, 3]);
         assert_eq!(
@@ -1307,19 +1338,48 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_matches_profiles_ignoring_case_after_a_rename() {
+        let old = profile_name("w", "tester 1");
+        let browser = browser_with_profile(&old, false);
+        browser.insert(new_tab(1, Some("tester 1"))).unwrap();
+        browser.insert(new_tab(2, Some("Admin"))).unwrap();
+
+        let (guard, saved, open) = browser.begin_reset(&profile_name("w", "Tester 1")).unwrap();
+        assert_eq!(saved, old);
+        let ids: Vec<_> = open.iter().map(|t| t.id).collect();
+        assert_eq!(ids, [1]);
+        assert_eq!(
+            browser.insert(new_tab(3, Some("tester 1"))).err().unwrap(),
+            RESETTING
+        );
+        assert_eq!(
+            browser.insert(new_tab(4, Some("TESTER 1"))).err().unwrap(),
+            RESETTING
+        );
+        assert!(browser.begin_reset(&old).is_err());
+
+        drop(guard);
+        assert!(browser.insert(new_tab(3, Some("tester 1"))).is_ok());
+    }
+
+    #[test]
     fn a_tab_profile_resolves_to_its_account_until_it_is_renamed_or_removed() {
         let profile = profile_name("w", "Tester 1");
         assert_eq!(
-            profile_account("w", &profile, ["Admin", "Tester 1"]),
-            Some("Tester 1")
+            profile_accounts("w", &profile, ["Admin", "Tester 1"]),
+            ["Tester 1"]
         );
         assert_eq!(
-            profile_account("w", &profile, ["Admin", "tester 1"]),
-            Some("tester 1")
+            profile_accounts("w", &profile, ["Admin", "tester 1"]),
+            ["tester 1"]
         );
-        assert_eq!(profile_account("w", &profile, ["Admin", "Tester 2"]), None);
-        assert_eq!(profile_account("w", &profile, ["Admin"]), None);
-        assert_eq!(profile_account("other", &profile, ["Tester 1"]), None);
+        assert!(profile_accounts("w", &profile, ["Admin", "Tester 2"]).is_empty());
+        assert!(profile_accounts("w", &profile, ["Admin"]).is_empty());
+        assert!(profile_accounts("other", &profile, ["Tester 1"]).is_empty());
+        assert_eq!(
+            profile_accounts("w", &profile, ["Tester 1", "Tester.1"]),
+            ["Tester 1", "Tester.1"]
+        );
     }
 
     #[test]

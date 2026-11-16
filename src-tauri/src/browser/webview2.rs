@@ -449,7 +449,7 @@ async fn clear(app: &AppHandle, profile: &str, delete: bool) -> Result<(), Strin
                         Box::new(move |handler| {
                             clearable.ClearBrowsingDataAll(&handler).map_err(Into::into)
                         }),
-                        Box::new(|_| Ok(())),
+                        Box::new(|cleared| cleared),
                     )?;
                     if delete && let Ok(deletable) = profile.cast::<ICoreWebView2Profile8>() {
                         deletable.Delete()?;

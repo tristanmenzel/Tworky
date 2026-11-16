@@ -30,7 +30,7 @@ use tworky_core::config::{AccountConfig, Config, Paths, ServiceConfig};
 use tworky_core::ports::PortMap;
 use tworky_core::worker::{McpEndpoint, Workspace};
 
-use super::{Browser, Tab, host, page, profile_account};
+use super::{Browser, Tab, host, page, profile_accounts};
 
 const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 const MAX_WAIT: Duration = Duration::from_secs(25);
@@ -205,13 +205,14 @@ impl TworkyMcp {
         }
         let (project, worker, profile) =
             (tab.project.clone(), tab.worker.clone(), tab.profile.clone());
+        let own = tab.account().map(|a| a.name);
         let password = tauri::async_runtime::spawn_blocking(move || {
             let config = Config::load().map_err(|e| format!("{e:#}"))?;
             let names: Vec<&str> = config
                 .project(&project)
                 .map(|p| p.accounts.iter().map(|a| a.name.as_str()).collect())
                 .unwrap_or_default();
-            let account = password_owner(&worker, &profile, names)?;
+            let account = password_owner(&worker, &profile, own.as_deref(), names)?;
             tworky_core::accounts::password(&project, account).map_err(|e| {
                 format!(
                     "could not read the account's stored password to check entries against: {e:#}"
@@ -293,16 +294,30 @@ struct ReadNetworkArgs {
     failed_only: Option<bool>,
 }
 
-const ACCOUNT_CHANGED: &str = "this tab's account was renamed or removed since the tab opened, so its entries can't be checked against the account's password; reset or reopen the tab";
+const ACCOUNT_CHANGED: &str = "this tab's account was renamed or removed since the tab opened, so its entries can't be checked against the account's password; close the tab and open a new one as the account with open_tab, or ask the user to press the tab's Reset session button";
 
-/// The account whose password a tab's entries are checked against. Fails closed when the tab's
-/// account no longer exists under the name its profile was made for.
+const ACCOUNT_AMBIGUOUS: &str = "this tab's account was renamed or removed since the tab opened, and several accounts now share its browser profile, so its entries can't be checked against one password; close the tab and open a new one as the account with open_tab, or ask the user to press the tab's Reset session button";
+
+/// The account whose password a tab's entries are checked against: the tab's own account while
+/// it still exists on the tab's profile, else the one account now on that profile. Fails closed
+/// when there is none, or several.
 fn password_owner<'a>(
     worker: &str,
     profile: &str,
+    own: Option<&str>,
     names: impl IntoIterator<Item = &'a str>,
 ) -> Result<&'a str, String> {
-    profile_account(worker, profile, names).ok_or_else(|| ACCOUNT_CHANGED.to_string())
+    let owners = profile_accounts(worker, profile, names);
+    if let Some(own) = own
+        && let Some(name) = owners.iter().find(|name| name.eq_ignore_ascii_case(own))
+    {
+        return Ok(name);
+    }
+    match owners[..] {
+        [only] => Ok(only),
+        [] => Err(ACCOUNT_CHANGED.to_string()),
+        _ => Err(ACCOUNT_AMBIGUOUS.to_string()),
+    }
 }
 
 fn level_name(level: Level) -> &'static str {
@@ -1512,15 +1527,37 @@ mod tests {
     fn the_password_check_fails_closed_when_the_tab_account_is_gone() {
         let profile = super::super::profile_name("w", "Tester 1");
         assert_eq!(
-            password_owner("w", &profile, ["Admin", "Tester 1"]),
+            password_owner("w", &profile, Some("Tester 1"), ["Admin", "Tester 1"]),
             Ok("Tester 1")
         );
         for current in [&["Admin", "Tester 2"][..], &["Admin"], &[]] {
             assert_eq!(
-                password_owner("w", &profile, current.iter().copied()),
+                password_owner("w", &profile, Some("Tester 1"), current.iter().copied()),
                 Err(ACCOUNT_CHANGED.to_string())
             );
         }
+    }
+
+    #[test]
+    fn the_password_check_uses_the_tab_account_when_accounts_share_a_profile() {
+        let profile = super::super::profile_name("w", "QA.User");
+        let accounts = ["QA User", "QA.User"];
+        assert_eq!(
+            password_owner("w", &profile, Some("QA.User"), accounts),
+            Ok("QA.User")
+        );
+        assert_eq!(
+            password_owner("w", &profile, Some("qa user"), accounts),
+            Ok("QA User")
+        );
+        assert_eq!(
+            password_owner("w", &profile, Some("QA_User"), accounts),
+            Err(ACCOUNT_AMBIGUOUS.to_string())
+        );
+        assert_eq!(
+            password_owner("w", &profile, Some("QA_User"), ["Admin", "QA.User"]),
+            Ok("QA.User")
+        );
     }
 
     #[test]
