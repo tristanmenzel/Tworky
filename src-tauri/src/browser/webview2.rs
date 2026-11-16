@@ -3,13 +3,18 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 use tokio::sync::oneshot;
 use tworky_browser::cdp::Cdp;
+use tworky_browser::diagnostics::{
+    Diagnostics, LoadingFailed, LoadingFinished, Part, RequestWillBeSent, ResponseReceived,
+};
 use tworky_browser::login::{BINDING, LoginMessage};
+use tworky_browser::page::PageEvents;
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     ICoreWebView2, ICoreWebView2_13, ICoreWebView2Profile2, ICoreWebView2Profile8,
     ICoreWebView2Settings4,
@@ -21,7 +26,7 @@ use webview2_com::{
 use windows::Win32::UI::WindowsAndMessaging::{
     HWND_BOTTOM, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
 };
-use windows::core::{HSTRING, Interface, PWSTR, w};
+use windows::core::{HSTRING, Interface, PCWSTR, PWSTR, w};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{
     NewWindowResponse, PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder,
@@ -242,6 +247,7 @@ pub async fn create(app: &AppHandle, tab: &Arc<Tab>, profile: &str) -> Result<()
         disable_password_autosave(&core);
         watch_source(&core, &view, &tab);
         watch_login(app, &core, &tab)?;
+        watch_diagnostics(&core, &tab.events);
         HOST.with(|h| {
             let mut h = h.borrow_mut();
             stack(&view, h.shown.tab == Some(id));
@@ -309,6 +315,91 @@ fn watch_login(app: &AppHandle, core: &ICoreWebView2, tab: &Arc<Tab>) -> Result<
         core.GetDevToolsProtocolEventReceiver(w!("Runtime.bindingCalled"))
             .and_then(|receiver| receiver.add_DevToolsProtocolEventReceived(&handler, &mut token))
             .map_err(|e| format!("could not watch for login forms: {e}"))
+    }
+}
+
+/// These handlers run on the UI thread for every console message and request, so each only
+/// parses the fields it keeps and records them: no CDP calls and no `changed`.
+fn watch_diagnostics(core: &ICoreWebView2, events: &Arc<PageEvents>) {
+    receive(
+        core,
+        events,
+        w!("Runtime.consoleAPICalled"),
+        Part::Console,
+        Diagnostics::console_api_called,
+    );
+    receive(
+        core,
+        events,
+        w!("Runtime.exceptionThrown"),
+        Part::Console,
+        Diagnostics::exception_thrown,
+    );
+    receive(
+        core,
+        events,
+        w!("Log.entryAdded"),
+        Part::Console,
+        Diagnostics::log_entry_added,
+    );
+    receive(
+        core,
+        events,
+        w!("Network.requestWillBeSent"),
+        Part::Network,
+        |d, event: RequestWillBeSent| d.requests.will_be_sent(event, Instant::now()),
+    );
+    receive(
+        core,
+        events,
+        w!("Network.responseReceived"),
+        Part::Network,
+        |d, event: ResponseReceived| d.requests.response_received(event),
+    );
+    receive(
+        core,
+        events,
+        w!("Network.loadingFinished"),
+        Part::Network,
+        |d, event: LoadingFinished| d.requests.loading_finished(event),
+    );
+    receive(
+        core,
+        events,
+        w!("Network.loadingFailed"),
+        Part::Network,
+        |d, event: LoadingFailed| d.requests.loading_failed(event),
+    );
+}
+
+fn receive<E: DeserializeOwned + 'static>(
+    core: &ICoreWebView2,
+    events: &Arc<PageEvents>,
+    name: PCWSTR,
+    part: Part,
+    record: impl Fn(&mut Diagnostics, E) + 'static,
+) {
+    let target = events.clone();
+    let handler = DevToolsProtocolEventReceivedEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else { return Ok(()) };
+        let mut json = PWSTR::null();
+        unsafe { args.ParameterObjectAsJson(&mut json)? };
+        if let Ok(event) = serde_json::from_str::<E>(&take_pwstr(json)) {
+            record(&mut target.diagnostics(), event);
+        }
+        Ok(())
+    }));
+    let mut token = 0;
+    let watched = unsafe {
+        core.GetDevToolsProtocolEventReceiver(name)
+            .and_then(|receiver| receiver.add_DevToolsProtocolEventReceived(&handler, &mut token))
+    };
+    if let Err(e) = watched {
+        let name = unsafe { name.to_string() }.unwrap_or_default();
+        events.diagnostics().turn_off(
+            part,
+            format!("{name} is off because it could not be watched: {e}"),
+        );
     }
 }
 

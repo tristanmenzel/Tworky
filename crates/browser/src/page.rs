@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -7,6 +8,7 @@ use url::Url;
 
 use crate::cdp::{self, Cdp, evaluate};
 use crate::device;
+use crate::diagnostics::{Diagnostics, Part};
 use crate::interact::{self, WaitCondition};
 use crate::login::{self, Account, LoginField, LoginMessage};
 use crate::snapshot;
@@ -17,6 +19,7 @@ pub const SUBMIT_WAIT: Duration = Duration::from_secs(8);
 pub const LOGIN_FORM_WAIT: Duration = Duration::from_secs(5);
 pub const ACTION_SETTLE: Duration = Duration::from_millis(300);
 pub const WAIT_POLL: Duration = Duration::from_millis(250);
+const NETWORK_FALLBACK_BUFFER: u64 = 1024 * 1024;
 
 const READ_PAGE_SCRIPT: &str = r#"(() => ({
   url: location.href,
@@ -42,19 +45,31 @@ pub struct PageState {
     pub opened: Vec<u64>,
 }
 
-/// What the host tells a page about itself: loads, the login detector's reports and popups.
-/// The tools wait on it.
-pub struct PageEvents(watch::Sender<PageState>);
+/// What the host tells a page about itself: loads, the login detector's reports and popups,
+/// which the tools wait on, and the page's console and requests.
+pub struct PageEvents {
+    state: watch::Sender<PageState>,
+    diagnostics: Mutex<Diagnostics>,
+}
 
 impl Default for PageEvents {
     fn default() -> Self {
-        PageEvents(watch::Sender::new(PageState::default()))
+        PageEvents {
+            state: watch::Sender::new(PageState::default()),
+            diagnostics: Mutex::default(),
+        }
     }
 }
 
 impl PageEvents {
+    pub fn diagnostics(&self) -> MutexGuard<'_, Diagnostics> {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn load_started(&self, url: &str) {
-        self.0.send_modify(|s| {
+        self.state.send_modify(|s| {
             s.url = url.to_string();
             s.loading = true;
             s.navigations += 1;
@@ -63,7 +78,7 @@ impl PageEvents {
     }
 
     pub fn load_finished(&self, url: &str) {
-        self.0.send_modify(|s| {
+        self.state.send_modify(|s| {
             s.url = url.to_string();
             s.loading = false;
             s.loads += 1;
@@ -72,14 +87,14 @@ impl PageEvents {
 
     /// A same-document navigation (history.pushState, a fragment change).
     pub fn url_changed(&self, url: &str) {
-        self.0.send_modify(|s| s.url = url.to_string());
+        self.state.send_modify(|s| s.url = url.to_string());
     }
 
     /// Records a report from the login detector and returns it, so the host can act on a
     /// fill request. The form is tied to the page's origin at the time.
     pub fn login_message(&self, payload: &str) -> Option<LoginMessage> {
         let message = LoginMessage::parse(payload)?;
-        self.0.send_modify(|s| match &message {
+        self.state.send_modify(|s| match &message {
             LoginMessage::LoginForm { fields } => {
                 s.login = Url::parse(&s.url).ok().map(|url| LoginForm {
                     fields: fields.clone(),
@@ -93,15 +108,15 @@ impl PageEvents {
     }
 
     pub fn opened_tab(&self, tab: u64) {
-        self.0.send_modify(|s| s.opened.push(tab));
+        self.state.send_modify(|s| s.opened.push(tab));
     }
 
     pub fn state(&self) -> PageState {
-        self.0.borrow().clone()
+        self.state.borrow().clone()
     }
 
     async fn wait(&self, timeout: Duration, ready: impl FnMut(&PageState) -> bool) -> bool {
-        let mut rx = self.0.subscribe();
+        let mut rx = self.state.subscribe();
         tokio::time::timeout(timeout, rx.wait_for(ready))
             .await
             .is_ok_and(|r| r.is_ok())
@@ -142,14 +157,55 @@ impl<C: Cdp> Page<'_, C> {
         state
     }
 
-    /// Prepares a new tab before its first navigation: the login detector, and mobile
-    /// emulation for a mobile account.
+    /// Prepares a new tab before its first navigation: the login detector, diagnostics, and
+    /// mobile emulation for a mobile account.
     pub async fn prepare(&self) -> Result<(), String> {
         login::install_detector(self.cdp).await?;
+        self.enable_diagnostics().await;
         if self.mobile {
             device::emulate(self.cdp).await?;
         }
         Ok(())
+    }
+
+    /// Never fails: a part that can't be enabled is left off, with a note saying why.
+    async fn enable_diagnostics(&self) {
+        let off = |part, note: String| self.events.diagnostics().turn_off(part, note);
+        match self.cdp.call("Page.getFrameTree", json!({})).await {
+            Ok(tree) => match tree["frameTree"]["frame"]["id"].as_str() {
+                Some(id) => self.events.diagnostics().set_main_frame(id),
+                None => off(
+                    Part::MainFrame,
+                    "loads are not numbered because Page.getFrameTree returned no main frame"
+                        .into(),
+                ),
+            },
+            Err(e) => off(
+                Part::MainFrame,
+                format!("loads are not numbered because {e}"),
+            ),
+        }
+        if let Err(e) = self.cdp.call("Log.enable", json!({})).await {
+            off(
+                Part::Console,
+                format!("browser log entries are off because {e}"),
+            );
+        }
+        let unbuffered = json!({
+            "maxTotalBufferSize": 0,
+            "maxResourceBufferSize": 0,
+            "maxPostDataSize": 0,
+        });
+        if self.cdp.call("Network.enable", unbuffered).await.is_err() {
+            let buffered = json!({
+                "maxTotalBufferSize": NETWORK_FALLBACK_BUFFER,
+                "maxResourceBufferSize": NETWORK_FALLBACK_BUFFER,
+                "maxPostDataSize": 0,
+            });
+            if let Err(e) = self.cdp.call("Network.enable", buffered).await {
+                off(Part::Network, format!("requests are off because {e}"));
+            }
+        }
     }
 
     async fn load(&self, start: impl Future<Output = Result<(), String>>) -> Result<Value, String> {
@@ -571,5 +627,101 @@ mod tests {
         assert_eq!(read["text"], "abc");
         assert_eq!(read["truncated"], true);
         assert_eq!(read["error_page"], true);
+    }
+
+    fn notes(events: &PageEvents, part: Part) -> Vec<String> {
+        events
+            .diagnostics()
+            .notes(part)
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn prepare_enables_diagnostics_without_buffering_bodies() {
+        let events = PageEvents::default();
+        let cdp = FakeCdp::answering(|method, _| {
+            Ok(match method {
+                "Page.getFrameTree" => json!({ "frameTree": { "frame": { "id": "MAIN" } } }),
+                _ => json!({}),
+            })
+        });
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            mobile: false,
+        };
+        page.prepare().await.unwrap();
+        assert!(cdp.methods().contains(&"Log.enable".to_string()));
+        assert_eq!(
+            cdp.params("Network.enable"),
+            [json!({ "maxTotalBufferSize": 0, "maxResourceBufferSize": 0, "maxPostDataSize": 0 })]
+        );
+        assert_eq!(events.diagnostics().main_frame(), Some("MAIN"));
+        for part in [Part::Console, Part::Network, Part::MainFrame] {
+            assert!(notes(&events, part).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_retries_network_with_small_buffers() {
+        let events = PageEvents::default();
+        let cdp = FakeCdp::answering(|method, params| match method {
+            "Network.enable" if params["maxTotalBufferSize"] == 0 => {
+                Err("Network.enable failed: Invalid parameters".into())
+            }
+            _ => Ok(json!({})),
+        });
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            mobile: false,
+        };
+        page.prepare().await.unwrap();
+        let calls = cdp.params("Network.enable");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1],
+            json!({
+                "maxTotalBufferSize": 1024 * 1024,
+                "maxResourceBufferSize": 1024 * 1024,
+                "maxPostDataSize": 0,
+            })
+        );
+        assert!(notes(&events, Part::Network).is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_succeeds_when_every_diagnostics_call_fails() {
+        let events = PageEvents::default();
+        let cdp = FakeCdp::answering(|method, _| match method {
+            "Page.getFrameTree" | "Log.enable" | "Network.enable" => {
+                Err(format!("{method} failed: nope"))
+            }
+            _ => Ok(json!({})),
+        });
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            mobile: false,
+        };
+        page.prepare().await.unwrap();
+        assert!(
+            cdp.methods()
+                .contains(&"Page.addScriptToEvaluateOnNewDocument".to_string())
+        );
+        assert_eq!(events.diagnostics().main_frame(), None);
+        assert_eq!(
+            notes(&events, Part::Network),
+            ["requests are off because Network.enable failed: nope"]
+        );
+        assert_eq!(
+            notes(&events, Part::Console),
+            ["browser log entries are off because Log.enable failed: nope"]
+        );
+        assert_eq!(
+            notes(&events, Part::MainFrame),
+            ["loads are not numbered because Page.getFrameTree failed: nope"]
+        );
     }
 }
