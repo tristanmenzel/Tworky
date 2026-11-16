@@ -6,6 +6,7 @@ use std::fmt;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use regex::{Captures, Regex};
 use serde::de::{self, IgnoredAny, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -16,9 +17,12 @@ pub const WITHHELD: &str = "entry withheld: it contained the account's password"
 pub const PENDING_AFTER: Duration = Duration::from_secs(5);
 
 const MAX_TEXT: usize = 500;
+/// The fewest characters of a password beside a `[redacted]` or `…` that withhold an entry.
+const SHORTEST_PART: usize = 2;
 /// Bounds the work redaction does on the UI thread for a huge message.
 const MAX_INPUT: usize = 16_000;
 const CONSOLE_CAP: usize = 200;
+const CONSOLE_ERROR_CAP: usize = 50;
 const OPEN_CAP: usize = 100;
 const ORDINARY_CAP: usize = 200;
 const FAILED_CAP: usize = 50;
@@ -62,6 +66,18 @@ static AUTH_SCHEME: LazyLock<Regex> =
     LazyLock::new(|| regex(r"\b(Bearer|Basic)([ \t]+)([A-Za-z0-9+/=._~\-]+)"));
 static RUN: LazyLock<Regex> = LazyLock::new(|| regex(r"[A-Za-z0-9+_\-/]+=*"));
 static PATH_WORD: LazyLock<Regex> = LazyLock::new(|| regex(r"^(?:[A-Z]?[a-z0-9_\-]+)+$"));
+
+/// The set `Url` percent-encodes in a path.
+const PATH_ENCODED: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}');
 
 pub fn is_sensitive_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
@@ -110,17 +126,20 @@ fn cut_url_in_text(found: &str) -> String {
     format!("{}{location}{trailing}", cut_url(url))
 }
 
-fn token_shaped(run: &str) -> bool {
-    let hex = run.len() >= 32 && run.chars().all(|c| c.is_ascii_hexdigit());
-    let mixed = run.len() >= 24
+fn mixed_case(run: &str) -> bool {
+    run.len() >= 24
         && run.chars().any(|c| c.is_ascii_uppercase())
         && run.chars().any(|c| c.is_ascii_lowercase())
-        && run.chars().any(|c| c.is_ascii_digit());
-    hex || mixed
 }
 
-/// A run with a `/` is a path when one of its segments reads as a word, and then only its
-/// token-shaped segments go. Otherwise it is tested whole, as standard base64 can hold `/`.
+fn token_shaped(run: &str) -> bool {
+    let hex = run.len() >= 32 && run.chars().all(|c| c.is_ascii_hexdigit());
+    hex || (mixed_case(run) && run.chars().any(|c| c.is_ascii_digit()))
+}
+
+/// A run with a `/` is a path when one of its segments reads as a word of 3 or more
+/// characters, and then only its token-shaped segments go. Otherwise it is tested whole as
+/// standard base64, where the `/` stands in for a digit.
 fn redact_run(run: &str) -> String {
     if !run.contains('/') {
         return if token_shaped(run) {
@@ -129,8 +148,11 @@ fn redact_run(run: &str) -> String {
             run.to_string()
         };
     }
-    let path = run.split('/').any(|segment| PATH_WORD.is_match(segment));
-    if !path && token_shaped(&run.replace('/', "")) {
+    let path = run
+        .split('/')
+        .any(|segment| segment.len() >= 3 && PATH_WORD.is_match(segment));
+    let whole = run.replace('/', "");
+    if !path && (token_shaped(&whole) || mixed_case(&whole)) {
         return REDACTED.to_string();
     }
     run.split('/')
@@ -219,19 +241,41 @@ fn json_escaped(text: &str) -> String {
     quoted[1..quoted.len() - 1].to_string()
 }
 
-/// Whether an entry must be withheld because it contains the account's password. An entry cut
-/// at the input cap is also withheld when it ends partway into the password.
+/// Whether a password prefix of `shortest` characters or more ends right before `marker`, or a
+/// suffix starts right after it: redaction or the browser shortened the text and left part of
+/// the password showing.
+fn beside_marker(text: &str, marker: &str, form: &str, shortest: usize) -> bool {
+    text.match_indices(marker).any(|(at, _)| {
+        let before = &text[..at];
+        let after = &text[at + marker.len()..];
+        form.char_indices().skip(1).any(|(cut, _)| {
+            let (prefix, suffix) = form.split_at(cut);
+            (prefix.chars().count() >= shortest && before.ends_with(prefix))
+                || (suffix.chars().count() >= shortest && after.starts_with(suffix))
+        })
+    })
+}
+
+/// Whether an entry must be withheld because it contains the account's password, raw, JSON
+/// escaped or percent-encoded, or part of it beside a `[redacted]` or `…`. An entry cut at the
+/// input cap is also withheld when it ends partway into the password.
 pub fn withheld(password: &str, entry: &impl Entry) -> bool {
     if password.trim().is_empty() {
         return false;
     }
     let escaped = json_escaped(password);
-    let forms = [password, escaped.as_str()];
+    let encoded = utf8_percent_encode(password, PATH_ENCODED).to_string();
+    let forms = [password, escaped.as_str(), encoded.as_str()];
+    let shortest = password.chars().count().min(SHORTEST_PART);
     let texts = entry.texts();
-    if texts
-        .iter()
-        .any(|text| forms.iter().any(|form| text.contains(form)))
-    {
+    if texts.iter().any(|text| {
+        forms.iter().any(|form| {
+            text.contains(form)
+                || [REDACTED, "…"]
+                    .iter()
+                    .any(|marker| beside_marker(text, marker, form, shortest))
+        })
+    }) {
         return true;
     }
     entry.cut()
@@ -556,21 +600,34 @@ impl Entry for ConsoleEntry {
     }
 }
 
+/// Errors are kept apart from other entries, so verbose logging can't push one out.
 #[derive(Default)]
 pub struct ConsoleLog {
-    entries: VecDeque<ConsoleEntry>,
+    errors: VecDeque<(u64, ConsoleEntry)>,
+    others: VecDeque<(u64, ConsoleEntry)>,
+    next_seq: u64,
 }
 
 impl ConsoleLog {
     fn push(&mut self, entry: ConsoleEntry) {
-        if self.entries.len() == CONSOLE_CAP {
-            self.entries.pop_front();
+        let (pool, cap) = if entry.level == Level::Error {
+            (&mut self.errors, CONSOLE_ERROR_CAP)
+        } else {
+            (&mut self.others, CONSOLE_CAP)
+        };
+        if pool.len() == cap {
+            pool.pop_front();
         }
-        self.entries.push_back(entry);
+        pool.push_back((self.next_seq, entry));
+        self.next_seq += 1;
     }
 
+    /// Oldest first.
     pub fn entries(&self) -> impl Iterator<Item = &ConsoleEntry> {
-        self.entries.iter()
+        let mut entries: Vec<&(u64, ConsoleEntry)> =
+            self.errors.iter().chain(&self.others).collect();
+        entries.sort_by_key(|(seq, _)| *seq);
+        entries.into_iter().map(|(_, entry)| entry)
     }
 }
 
@@ -1779,6 +1836,113 @@ mod tests {
             entries[2].location.as_deref(),
             Some("http://localhost:2020/missing")
         );
+    }
+
+    #[test]
+    fn a_password_suffix_after_a_redaction_is_withheld() {
+        for (password, logged, stored) in [
+            ("Tr0ub4dor&3", "pwd=Tr0ub4dor&3", "pwd=[redacted]&3"),
+            (
+                "correct;horse;battery",
+                "password: correct;horse;battery",
+                "password: [redacted];horse;battery",
+            ),
+        ] {
+            let entry = console_entry(&clean(logged).0);
+            assert_eq!(entry.text, stored);
+            assert!(withheld(password, &entry), "{stored}");
+        }
+    }
+
+    #[test]
+    fn a_password_prefix_before_a_redaction_is_withheld() {
+        let entry = console_entry(&clean("Summer!aB3dE5fG7hI9jK1lM3nO5pQ7").0);
+        assert_eq!(entry.text, "Summer![redacted]");
+        assert!(withheld("Summer!aB3dE5fG7hI9jK1lM3nO5pQ7", &entry));
+    }
+
+    #[test]
+    fn a_password_shortened_by_an_ellipsis_is_withheld() {
+        let entry = console_entry("{note: '…xxxxhunt…'}");
+        assert!(withheld("hunter2pass", &entry));
+        let entry = console_entry("{note: '…ter2pass'}");
+        assert!(withheld("hunter2pass", &entry));
+        assert!(!withheld("zebra-crossing", &entry));
+    }
+
+    #[test]
+    fn an_unrelated_redaction_is_not_withheld() {
+        for text in ["token=[redacted]", "pwd=[redacted]&x=1", "[1, 2, …]"] {
+            assert!(!withheld("Tr0ub4dor&3", &console_entry(text)), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_percent_encoded_password_is_withheld() {
+        let mut log = RequestLog::default();
+        log.will_be_sent(
+            sent("1", "L1", "MAIN", "http://a.test/u/my pass", None),
+            Instant::now(),
+        );
+        let request = &log.entries(Instant::now(), false)[0];
+        assert_eq!(request.url, "http://a.test/u/my%20pass");
+        assert!(withheld("my pass", request));
+    }
+
+    #[test]
+    fn a_base64_run_with_a_short_segment_is_redacted() {
+        assert_eq!(
+            redact("key wJalrXUtnFEMIabc/k/MDENGbPxRfiCYEXAMPLE set"),
+            "key [redacted] set"
+        );
+        for text in [
+            "src/components/AuthenticationProvider.tsx",
+            "a/b/c",
+            "I/O error",
+        ] {
+            assert_eq!(redact(text), text);
+        }
+    }
+
+    #[test]
+    fn an_error_survives_300_other_console_entries() {
+        let mut diagnostics = Diagnostics::default();
+        diagnostics.console_api_called(parse(json!({
+            "type": "error", "args": [{ "type": "string", "value": "startup failed" }],
+        })));
+        for i in 0..300 {
+            let kind = if i % 2 == 0 { "info" } else { "warning" };
+            diagnostics.console_api_called(parse(json!({
+                "type": kind, "args": [{ "type": "string", "value": format!("m{i}") }],
+            })));
+        }
+        let entries: Vec<&ConsoleEntry> = diagnostics.console.entries().collect();
+        assert_eq!(entries.len(), 201);
+        assert_eq!(entries[0].text, "startup failed");
+        assert_eq!(entries[1].text, "m100");
+        assert_eq!(entries[200].text, "m299");
+    }
+
+    #[test]
+    fn errors_keep_the_last_50_in_order_with_other_entries() {
+        let mut diagnostics = Diagnostics::default();
+        for i in 0..60 {
+            diagnostics.console_api_called(parse(json!({
+                "type": "error", "args": [{ "type": "string", "value": format!("e{i}") }],
+            })));
+            diagnostics.console_api_called(parse(json!({
+                "type": "log", "args": [{ "type": "string", "value": format!("m{i}") }],
+            })));
+        }
+        let texts: Vec<&str> = diagnostics
+            .console
+            .entries()
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(texts.len(), 110);
+        assert_eq!(&texts[..3], ["m0", "m1", "m2"]);
+        assert_eq!(&texts[10..13], ["e10", "m10", "e11"]);
+        assert_eq!(texts.last(), Some(&"m59"));
     }
 
     #[test]

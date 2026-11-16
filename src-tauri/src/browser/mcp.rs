@@ -26,11 +26,11 @@ use tworky_browser::diagnostics::{
 use tworky_browser::interact::{self, Button, KeyPress, Target, WaitCondition};
 use tworky_browser::snapshot::parse_ref;
 use tworky_core::activity::{self, AccountRequest, Handover};
-use tworky_core::config::{AccountConfig, Paths, ServiceConfig};
+use tworky_core::config::{AccountConfig, Config, Paths, ServiceConfig};
 use tworky_core::ports::PortMap;
 use tworky_core::worker::{McpEndpoint, Workspace};
 
-use super::{Browser, Tab, host, page};
+use super::{Browser, Tab, host, page, profile_account};
 
 const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 const MAX_WAIT: Duration = Duration::from_secs(25);
@@ -200,18 +200,26 @@ impl TworkyMcp {
     /// The tab's account's stored password, read fresh so it is never kept on the tab. Empty
     /// for an anonymous tab or an account with no password.
     async fn password(tab: &Tab) -> Result<String, String> {
-        let Some(account) = tab.account() else {
+        if tab.anonymous() {
             return Ok(String::new());
-        };
-        let project = tab.project.clone();
+        }
+        let (project, worker, profile) =
+            (tab.project.clone(), tab.worker.clone(), tab.profile.clone());
         let password = tauri::async_runtime::spawn_blocking(move || {
-            tworky_core::accounts::password(&project, &account.name)
+            let config = Config::load().map_err(|e| format!("{e:#}"))?;
+            let names: Vec<&str> = config
+                .project(&project)
+                .map(|p| p.accounts.iter().map(|a| a.name.as_str()).collect())
+                .unwrap_or_default();
+            let account = password_owner(&worker, &profile, names)?;
+            tworky_core::accounts::password(&project, account).map_err(|e| {
+                format!(
+                    "could not read the account's stored password to check entries against: {e:#}"
+                )
+            })
         })
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| {
-            format!("could not read the account's stored password to check entries against: {e:#}")
-        })?;
+        .map_err(|e| e.to_string())??;
         Ok(password
             .filter(|password| !password.trim().is_empty())
             .unwrap_or_default())
@@ -277,6 +285,18 @@ struct ReadNetworkArgs {
     tab: u64,
     /// Only failed requests: status 400 or more, a network error, blocked, canceled, abandoned, or still pending after 5s. Defaults to false.
     failed_only: Option<bool>,
+}
+
+const ACCOUNT_CHANGED: &str = "this tab's account was renamed or removed since the tab opened, so its entries can't be checked against the account's password; reset or reopen the tab";
+
+/// The account whose password a tab's entries are checked against. Fails closed when the tab's
+/// account no longer exists under the name its profile was made for.
+fn password_owner<'a>(
+    worker: &str,
+    profile: &str,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<&'a str, String> {
+    profile_account(worker, profile, names).ok_or_else(|| ACCOUNT_CHANGED.to_string())
 }
 
 fn level_name(level: Level) -> &'static str {
@@ -1140,7 +1160,7 @@ impl TworkyMcp {
     }
 
     #[tool(
-        description = "Read the tab's recent console messages, uncaught exceptions and browser log entries, oldest first (the last 200, kept across navigations): level, source, text, url:line:col, time and load (the page load it arrived in, numbered from 1). level is \"error\", \"warning\" (the default: errors and warnings) or \"all\". Text is redacted: URLs are cut to origin and path, and tokens, secrets and the values of sensitive names are replaced with [redacted]. An entry containing the account's password is withheld whole. Storage values, headers and bodies are never read. notes say if capture is off and why."
+        description = "Read the tab's recent console messages, uncaught exceptions and browser log entries, oldest first (the last 50 errors and the last 200 other entries, kept across navigations): level, source, text, url:line:col, time and load (the page load it arrived in, numbered from 1). level is \"error\", \"warning\" (the default: errors and warnings) or \"all\". Text is redacted: URLs are cut to origin and path, and tokens, secrets and the values of sensitive names are replaced with [redacted]. An entry containing the account's password is withheld whole. Storage values, headers and bodies are never read. notes say if capture is off and why."
     )]
     async fn read_console(
         &self,
@@ -1440,6 +1460,21 @@ mod tests {
         assert_eq!(texts(&reply), [WITHHELD, "other"]);
         assert!(!reply.to_string().contains("hunter2"));
         assert_eq!(reply["entries"][0]["level"], "error");
+    }
+
+    #[test]
+    fn the_password_check_fails_closed_when_the_tab_account_is_gone() {
+        let profile = super::super::profile_name("w", "Tester 1");
+        assert_eq!(
+            password_owner("w", &profile, ["Admin", "Tester 1"]),
+            Ok("Tester 1")
+        );
+        for current in [&["Admin", "Tester 2"][..], &["Admin"], &[]] {
+            assert_eq!(
+                password_owner("w", &profile, current.iter().copied()),
+                Err(ACCOUNT_CHANGED.to_string())
+            );
+        }
     }
 
     #[test]

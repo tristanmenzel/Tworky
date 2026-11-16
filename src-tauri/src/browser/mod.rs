@@ -274,6 +274,18 @@ fn profile_name(worker: &str, account: &str) -> String {
     valid_profile_name(format!("tw-{worker}-{account}"))
 }
 
+/// Which of the project's accounts now owns a tab's profile. The account may have been renamed
+/// or removed since the tab opened, and then none does.
+pub(super) fn profile_account<'a>(
+    worker: &str,
+    profile: &str,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    names
+        .into_iter()
+        .find(|name| profile_name(worker, name).eq_ignore_ascii_case(profile))
+}
+
 /// A fresh profile for one anonymous tab. The random part keeps a reused tab id from finding
 /// an old profile's cookies.
 fn anonymous_profile_name(worker: &str, id: u64) -> String {
@@ -1092,6 +1104,22 @@ mod tests {
             status: Mutex::new(None),
             paused: Mutex::new(None),
         })
+    }
+
+    #[test]
+    fn a_tab_profile_resolves_to_its_account_until_it_is_renamed_or_removed() {
+        let profile = profile_name("w", "Tester 1");
+        assert_eq!(
+            profile_account("w", &profile, ["Admin", "Tester 1"]),
+            Some("Tester 1")
+        );
+        assert_eq!(
+            profile_account("w", &profile, ["Admin", "tester 1"]),
+            Some("tester 1")
+        );
+        assert_eq!(profile_account("w", &profile, ["Admin", "Tester 2"]), None);
+        assert_eq!(profile_account("w", &profile, ["Admin"]), None);
+        assert_eq!(profile_account("other", &profile, ["Tester 1"]), None);
     }
 
     #[test]

@@ -11,10 +11,14 @@
       open it in an account's tab, then check <code>read_console</code>,
       <code>read_network</code> and <code>list_storage</code>.
     </p>
+    <p>
+      Before opening it, set that test account's stored password to
+      <code>tworky-diagnostics-test-password</code>, so <code>read_console</code> can show it
+      withholds the entry that logs it.
+    </p>
     <ul id="results"></ul>
     <script>
-      // EDIT THIS to the password stored for the account you open this page as.
-      const ACCOUNT_PASSWORD = "change-me-to-the-stored-password";
+      const ACCOUNT_PASSWORD = "tworky-diagnostics-test-password";
 
       // A port where nothing listens, and that browsers do not block as unsafe.
       const DEAD_URL = "http://127.0.0.1:49151/unreachable";
