@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -11,6 +11,7 @@ use tworky_browser::login::{self, Account, LoginField};
 use tworky_browser::page::{Page, PageEvents};
 use tworky_core::config::AccountConfig;
 use tworky_core::services::Outcome;
+use tworky_core::state::WorkerRecord;
 use tworky_core::worker::Workspace;
 
 mod mcp;
@@ -77,7 +78,43 @@ pub struct Browser {
     saved: Mutex<Saved>,
     /// Until the saved tabs are reopened, the tab list on disk is theirs and isn't overwritten.
     restored: AtomicBool,
+    resetting: Resetting,
 }
+
+/// Profiles whose session is being reset. Opening a tab on one is refused under the `tabs`
+/// lock, so each tab of the profile is either closed by the reset or never opens.
+#[derive(Default)]
+struct Resetting(Mutex<HashSet<String>>);
+
+impl Resetting {
+    fn contains(&self, profile: &str) -> bool {
+        self.0.lock().unwrap().contains(profile)
+    }
+
+    fn start(&self, profile: &str) -> Option<ResetGuard<'_>> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(profile.to_string())
+            .then(|| ResetGuard {
+                resetting: self,
+                profile: profile.to_string(),
+            })
+    }
+}
+
+struct ResetGuard<'a> {
+    resetting: &'a Resetting,
+    profile: String,
+}
+
+impl Drop for ResetGuard<'_> {
+    fn drop(&mut self) {
+        self.resetting.0.lock().unwrap().remove(&self.profile);
+    }
+}
+
+const RESETTING: &str = "the account's session is being reset; open the tab again once it is done";
 
 #[derive(Clone, Serialize)]
 pub struct TabView {
@@ -144,10 +181,43 @@ impl Browser {
         tabs
     }
 
-    fn insert(&self, tab: Tab) -> Arc<Tab> {
+    fn insert(&self, tab: Tab) -> CmdResult<Arc<Tab>> {
+        let mut tabs = self.tabs.lock().unwrap();
+        if self.resetting.contains(&tab.profile) {
+            return Err(RESETTING.into());
+        }
         let tab = Arc::new(tab);
-        self.tabs.lock().unwrap().insert(tab.id, tab.clone());
-        tab
+        tabs.insert(tab.id, tab.clone());
+        Ok(tab)
+    }
+
+    /// Marks the profile as resetting and returns its open tabs, for the reset to close.
+    fn begin_reset(&self, profile: &str) -> CmdResult<(ResetGuard<'_>, Vec<Arc<Tab>>)> {
+        let tabs = self.tabs.lock().unwrap();
+        match self.saved.lock().unwrap().profiles.get(profile) {
+            None => {
+                return Err(
+                    "no session to reset: the account has no browser profile on this worker".into(),
+                );
+            }
+            Some(p) if p.anonymous => {
+                return Err(
+                    "an anonymous tab has no session to reset; close the tab to discard it".into(),
+                );
+            }
+            Some(_) => {}
+        }
+        let guard = self
+            .resetting
+            .start(profile)
+            .ok_or("the account's session is already being reset")?;
+        let mut open: Vec<_> = tabs
+            .values()
+            .filter(|t| t.profile == profile)
+            .cloned()
+            .collect();
+        open.sort_by_key(|t| t.id);
+        Ok((guard, open))
     }
 
     fn remove(&self, id: u64) -> Option<Arc<Tab>> {
@@ -190,6 +260,15 @@ impl Browser {
                 p.kept = kept;
             }
         });
+    }
+
+    /// A reset closes the tab before clearing its profile's kept cookies, so a write for a
+    /// closed tab would put back cookies from before the reset.
+    fn set_kept_cookies_if_open(&self, tab: u64, profile: &str, kept: Vec<cookies::CookieKey>) {
+        let tabs = self.tabs.lock().unwrap();
+        if tabs.contains_key(&tab) {
+            self.set_kept_cookies(profile, kept);
+        }
     }
 }
 
@@ -325,6 +404,45 @@ fn browser_account(account: AccountConfig) -> Account {
     }
 }
 
+pub(super) fn worker_account(
+    ws: &Workspace,
+    record: &WorkerRecord,
+    wanted: &str,
+) -> CmdResult<AccountConfig> {
+    let accounts = ws.worker_accounts(record).map_err(|e| format!("{e:#}"))?;
+    find_account(accounts, wanted, &record.project, || {
+        ws.unusable_account(record, wanted)
+    })
+}
+
+/// `unusable` says why a configured account is missing from the worker's list, if it is.
+fn find_account(
+    accounts: Vec<AccountConfig>,
+    wanted: &str,
+    project: &str,
+    unusable: impl FnOnce() -> Option<String>,
+) -> CmdResult<AccountConfig> {
+    let names: Vec<_> = accounts.iter().map(|a| a.name.clone()).collect();
+    accounts
+        .into_iter()
+        .find(|a| a.name.eq_ignore_ascii_case(wanted.trim()))
+        .ok_or_else(|| {
+            if let Some(why) = unusable() {
+                format!("{why}; fix it in Tworky's Projects › Accounts")
+            } else if names.is_empty() {
+                format!(
+                    "project {project} has no accounts; add them in Tworky's Projects › Accounts"
+                )
+            } else {
+                format!(
+                    "no account called {wanted}; use one of: {}, or ask the user for it with \
+                     request_account",
+                    names.join(", ")
+                )
+            }
+        })
+}
+
 pub fn check_open(account: Option<&str>, url: Option<&str>) -> CmdResult<()> {
     if account.is_none() && url.is_none_or(|u| u.trim().is_empty()) {
         return Err("an anonymous tab (no account) needs a url to open".into());
@@ -358,27 +476,7 @@ async fn open_tab_as(
             let Some(wanted) = wanted else {
                 return Ok((record.project, None));
             };
-            let accounts = ws.worker_accounts(&record).map_err(|e| format!("{e:#}"))?;
-            let names: Vec<_> = accounts.iter().map(|a| a.name.clone()).collect();
-            let found = accounts
-                .into_iter()
-                .find(|a| a.name.eq_ignore_ascii_case(wanted.trim()))
-                .ok_or_else(|| {
-                    if let Some(why) = ws.unusable_account(&record, &wanted) {
-                        format!("{why}; fix it in Tworky's Projects › Accounts")
-                    } else if names.is_empty() {
-                        format!(
-                            "project {} has no accounts; add them in Tworky's Projects › Accounts",
-                            record.project
-                        )
-                    } else {
-                        format!(
-                            "no account called {wanted}; use one of: {}, or ask the user \
-                             for it with request_account",
-                            names.join(", ")
-                        )
-                    }
-                })?;
+            let found = worker_account(&ws, &record, &wanted)?;
             let color = found.color.clone();
             Ok::<_, String>((record.project, Some((browser_account(found), color))))
         })
@@ -403,7 +501,7 @@ async fn open_tab_as(
         events: Arc::new(PageEvents::default()),
         status: Mutex::new(None),
         paused: Mutex::new(None),
-    });
+    })?;
     browser.update_saved(|s| {
         s.next_id = s.next_id.max(id);
         s.profiles
@@ -724,7 +822,7 @@ async fn keep_cookies(app: &AppHandle, tab: &Tab) {
     let browser = app.state::<Browser>();
     let kept = browser.kept_cookies(&tab.profile);
     match cookies::persist_session_cookies(&host::TabCdp::new(app, tab.id), &kept).await {
-        Ok(kept) => browser.set_kept_cookies(&tab.profile, kept),
+        Ok(kept) => browser.set_kept_cookies_if_open(tab.id, &tab.profile, kept),
         Err(e) => eprintln!("tab {}: could not keep its cookies: {e}", tab.id),
     }
 }
@@ -1063,17 +1161,25 @@ pub async fn browser_fill_email(
     Ok(page_origin)
 }
 
-#[tauri::command]
-pub async fn browser_end_session(app: AppHandle, tab: u64) -> CmdResult<Value> {
+/// Closes every tab on the profile, the user's included, and clears all its browser data, so the
+/// account is signed out and its next tab starts fresh.
+pub async fn reset_session(app: &AppHandle, profile: &str) -> CmdResult<()> {
     let browser = app.state::<Browser>();
-    let tab = browser.tab(tab)?;
-    if tab.anonymous() {
-        return Err("an anonymous tab has no session to end; close the tab to discard it".into());
+    let (_resetting, tabs) = browser.begin_reset(profile)?;
+    for tab in tabs {
+        close(app, tab.id).await;
     }
-    let cdp = host::TabCdp::new(&app, tab.id);
-    cookies::end_session(&cdp, &browser.kept_cookies(&tab.profile)).await?;
-    browser.set_kept_cookies(&tab.profile, Vec::new());
-    page(&cdp, &tab).reload().await
+    host::clear_profile(app, profile).await?;
+    browser.set_kept_cookies(profile, Vec::new());
+    changed(app);
+    Ok(())
+}
+
+/// Acts on the tab's own profile, so it still works once the account is renamed or removed.
+#[tauri::command]
+pub async fn browser_reset_session(app: AppHandle, tab: u64) -> CmdResult<()> {
+    let tab = app.state::<Browser>().tab(tab)?;
+    reset_session(&app, &tab.profile).await
 }
 
 #[cfg(test)]
@@ -1081,6 +1187,10 @@ mod tests {
     use super::*;
 
     fn tab(id: u64, account: Option<&str>) -> Arc<Tab> {
+        Arc::new(new_tab(id, account))
+    }
+
+    fn new_tab(id: u64, account: Option<&str>) -> Tab {
         let account = account.map(|name| Account {
             name: name.into(),
             username: String::new(),
@@ -1090,7 +1200,7 @@ mod tests {
         });
         let events = PageEvents::default();
         events.load_finished("http://localhost:5273/clients");
-        Arc::new(Tab {
+        Tab {
             id,
             worker: "w".into(),
             project: "p".into(),
@@ -1103,7 +1213,97 @@ mod tests {
             events: Arc::new(events),
             status: Mutex::new(None),
             paused: Mutex::new(None),
+        }
+    }
+
+    fn accounts(names: &[&str]) -> Vec<AccountConfig> {
+        names
+            .iter()
+            .map(|name| {
+                serde_json::from_value(serde_json::json!({ "name": name, "username": "u" }))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn accounts_are_found_by_name_ignoring_case() {
+        let found = find_account(accounts(&["Admin", "Tester 1"]), " tester 1 ", "p", || {
+            panic!("asked why a found account is unusable")
         })
+        .unwrap();
+        assert_eq!(found.name, "Tester 1");
+    }
+
+    #[test]
+    fn an_unknown_account_is_refused_with_the_names_to_use() {
+        let unknown =
+            find_account(accounts(&["Admin", "Tester 1"]), "Tester 2", "p", || None).unwrap_err();
+        assert!(unknown.contains("no account called Tester 2"), "{unknown}");
+        assert!(unknown.contains("Admin, Tester 1"), "{unknown}");
+
+        let none = find_account(Vec::new(), "Tester 1", "acme", || None).unwrap_err();
+        assert!(none.contains("project acme has no accounts"), "{none}");
+
+        let unusable = find_account(accounts(&["Admin"]), "Tester 1", "p", || {
+            Some("account Tester 1 names a missing service".into())
+        })
+        .unwrap_err();
+        assert!(unusable.starts_with("account Tester 1 names a missing service; fix it"));
+    }
+
+    fn browser_with_profile(profile: &str, anonymous: bool) -> Browser {
+        let browser = Browser::default();
+        browser.saved.lock().unwrap().profiles.insert(
+            profile.to_string(),
+            SavedProfile {
+                worker: "w".into(),
+                kept: Vec::new(),
+                anonymous,
+            },
+        );
+        browser
+    }
+
+    #[test]
+    fn a_profile_with_no_saved_entry_is_not_reset() {
+        let browser = Browser::default();
+        let profile = profile_name("w", "Tester 1");
+        let error = browser.begin_reset(&profile).err().unwrap();
+        assert!(error.starts_with("no session to reset"), "{error}");
+        assert!(!browser.resetting.contains(&profile));
+    }
+
+    #[test]
+    fn an_anonymous_profile_is_not_reset() {
+        let anonymous = new_tab(5, None);
+        let browser = browser_with_profile(&anonymous.profile, true);
+        let error = browser.begin_reset(&anonymous.profile).err().unwrap();
+        assert!(error.contains("anonymous"), "{error}");
+        assert!(!browser.resetting.contains(&anonymous.profile));
+    }
+
+    #[test]
+    fn a_reset_refuses_tabs_on_its_profile_until_its_guard_drops() {
+        let profile = profile_name("w", "Tester 1");
+        let browser = browser_with_profile(&profile, false);
+        browser.insert(new_tab(1, Some("Tester 1"))).unwrap();
+        browser.insert(new_tab(2, Some("Admin"))).unwrap();
+        browser.insert(new_tab(3, Some("Tester 1"))).unwrap();
+
+        let (guard, open) = browser.begin_reset(&profile).unwrap();
+        let ids: Vec<_> = open.iter().map(|t| t.id).collect();
+        assert_eq!(ids, [1, 3]);
+        assert_eq!(
+            browser.insert(new_tab(4, Some("Tester 1"))).err().unwrap(),
+            RESETTING
+        );
+        assert!(browser.insert(new_tab(5, Some("Admin"))).is_ok());
+        assert!(browser.begin_reset(&profile).is_err());
+
+        drop(guard);
+        assert!(!browser.resetting.contains(&profile));
+        assert!(browser.insert(new_tab(4, Some("Tester 1"))).is_ok());
     }
 
     #[test]

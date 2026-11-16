@@ -438,7 +438,7 @@ export const api = {
   /** Returns the page's origin. With `origin`, refuses if the page has left it. */
   browserFillEmail: (tab: number, persist: boolean, origin: string | null = null) =>
     invoke<string>('browser_fill_email', { tab, persist, origin }),
-  browserEndSession: (tab: number) => invoke<unknown>('browser_end_session', { tab }),
+  browserResetSession: (tab: number) => invoke<void>('browser_reset_session', { tab }),
   browserStartService: (tab: number) => invoke<void>('browser_start_service', { tab }),
   browserRetry: (tab: number) => invoke<void>('browser_retry', { tab }),
   accounts: (project: string) => invoke<AccountsPayload>('list_accounts', { project }),

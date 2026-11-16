@@ -65,7 +65,7 @@ fn reissue(cookie: &Value, expires: f64) -> Value {
 }
 
 /// Gives session cookies, and ones kept earlier, a 30-day expiry so a sign-in survives a
-/// restart. Returns the cookies now kept, for `end_session` to find later.
+/// restart. Returns the cookies now kept, to renew on the next call.
 pub async fn persist_session_cookies(
     cdp: &impl Cdp,
     kept: &[CookieKey],
@@ -89,23 +89,6 @@ pub async fn persist_session_cookies(
         }
     }
     Ok(still_kept)
-}
-
-/// Signs the account out: deletes session cookies and the ones `persist_session_cookies` kept.
-pub async fn end_session(cdp: &impl Cdp, kept: &[CookieKey]) -> Result<(), String> {
-    for cookie in all_cookies(cdp).await? {
-        let Some(key) = CookieKey::of(&cookie) else {
-            continue;
-        };
-        if is_session(&cookie) || kept.contains(&key) {
-            cdp.call(
-                "Network.deleteCookies",
-                json!({ "name": key.name, "domain": key.domain, "path": key.path }),
-            )
-            .await?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -162,19 +145,5 @@ mod tests {
         let params = reissue(&cookie, 1.0);
         assert_eq!(params["domain"], ".example.com");
         assert!(params.get("url").is_none());
-    }
-
-    #[tokio::test]
-    async fn ending_a_session_deletes_session_and_kept_cookies() {
-        let cdp = jar();
-        end_session(&cdp, &[key("old", "app.test", "/a")])
-            .await
-            .unwrap();
-        let deleted: Vec<_> = cdp
-            .params("Network.deleteCookies")
-            .iter()
-            .map(|p| p["name"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(deleted, ["sid", "old"]);
     }
 }

@@ -1363,7 +1363,7 @@ fn main() {
             browser::browser_close,
             browser::browser_sign_in,
             browser::browser_fill_email,
-            browser::browser_end_session,
+            browser::browser_reset_session,
         ])
         .build(tauri::generate_context!())
         .expect("building tauri app")

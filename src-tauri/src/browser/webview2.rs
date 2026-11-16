@@ -248,6 +248,16 @@ pub async fn create(app: &AppHandle, tab: &Arc<Tab>, profile: &str) -> Result<()
         watch_source(&core, &view, &tab);
         watch_login(app, &core, &tab)?;
         watch_diagnostics(&core, &tab.events);
+        if !app
+            .state::<super::Browser>()
+            .tabs
+            .lock()
+            .unwrap()
+            .contains_key(&id)
+        {
+            drop(view);
+            return Err(format!("tab {id} was closed while it opened"));
+        }
         HOST.with(|h| {
             let mut h = h.borrow_mut();
             stack(&view, h.shown.tab == Some(id));
@@ -412,14 +422,23 @@ pub async fn destroy(app: &AppHandle, id: u64) {
     .await;
 }
 
-/// Clears and deletes a profile's data through a webview of its own, as WebView2 offers no
-/// other way. Its tabs must be closed first.
+/// Clears and deletes a profile's data. Its tabs must be closed first.
 pub async fn delete_profile(app: &AppHandle, profile: &str) -> Result<(), String> {
+    clear(app, profile, true).await
+}
+
+/// Clears a profile's data, keeping the profile. Its tabs must be closed first.
+pub async fn clear_profile(app: &AppHandle, profile: &str) -> Result<(), String> {
+    clear(app, profile, false).await
+}
+
+/// Goes through a webview of the profile's own, as WebView2 offers no other way.
+async fn clear(app: &AppHandle, profile: &str, delete: bool) -> Result<(), String> {
     let dir = data_dir()?;
     let profile = profile.to_string();
     on_main(app, move |app| {
         let view = build(app, dir, profile, |builder| builder)?;
-        let deleted = unsafe {
+        let cleared = unsafe {
             view.webview()
                 .cast::<ICoreWebView2_13>()
                 .and_then(|core| core.Profile())
@@ -432,14 +451,14 @@ pub async fn delete_profile(app: &AppHandle, profile: &str) -> Result<(), String
                         }),
                         Box::new(|_| Ok(())),
                     )?;
-                    if let Ok(deletable) = profile.cast::<ICoreWebView2Profile8>() {
+                    if delete && let Ok(deletable) = profile.cast::<ICoreWebView2Profile8>() {
                         deletable.Delete()?;
                     }
                     Ok(())
                 })
         };
         drop(view);
-        deleted.map_err(|e| e.to_string())
+        cleared.map_err(|e| e.to_string())
     })
     .await
 }

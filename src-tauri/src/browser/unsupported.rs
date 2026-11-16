@@ -40,6 +40,10 @@ pub async fn delete_profile(_: &AppHandle, _: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub async fn clear_profile(_: &AppHandle, _: &str) -> Result<(), String> {
+    Err(UNSUPPORTED.into())
+}
+
 pub async fn history(_: &AppHandle, _: u64, _: &str) -> Result<(), String> {
     Err(UNSUPPORTED.into())
 }

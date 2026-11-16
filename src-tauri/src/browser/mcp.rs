@@ -251,6 +251,12 @@ struct TabArgs {
     tab: u64,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct ResetSessionArgs {
+    /// Account name, as shown by list_accounts.
+    account: String,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum ConsoleLevel {
@@ -1221,6 +1227,38 @@ impl TworkyMcp {
     }
 
     #[tool(
+        description = "Reset an account's browser session on this worker: close every tab of the account here, including the user's, and clear all its browser data (cookies, storage, cache), which signs it out. Use it when stored state keeps a page stuck, such as a blank page after an interrupted sign-in. Nothing is reopened; the next open_tab starts fresh, so sign_in again. Afterwards tell the user that the account's tabs closed and it was signed out."
+    )]
+    async fn reset_session(
+        &self,
+        Parameters(args): Parameters<ResetSessionArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = async {
+            let worker = self.worker(&ctx)?;
+            let lookup = worker.clone();
+            let account = tauri::async_runtime::spawn_blocking(move || {
+                let ws = Workspace::open().map_err(|e| format!("{e:#}"))?;
+                let record = ws
+                    .state
+                    .get(&lookup)
+                    .map_err(|e| format!("{e:#}"))?
+                    .ok_or_else(|| format!("worker {lookup} not found"))?;
+                super::worker_account(&ws, &record, &args.account).map(|a| a.name)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            super::reset_session(&self.app, &super::profile_name(&worker, &account)).await?;
+            Ok(Reply::Json(json!({
+                "reset": account,
+                "note": "Tell the user that this account's tabs closed and it was signed out.",
+            })))
+        }
+        .await;
+        respond(result)
+    }
+
+    #[tool(
         description = "Hand the change over to the user for acceptance testing, once it is built and you have checked it yourself in the browser. Tworky marks this worker Ready for UAT, notifies the user, and shows your summary, the steps as a checklist, and buttons for the tabs. Leave those tabs open on the pages to check, signed in as the right accounts. Call it as the last thing in your turn, then end the turn with a short message; the handover stays until the user dismisses it or sends you a new prompt."
     )]
     async fn hand_over(
@@ -1408,6 +1446,14 @@ mod tests {
         let failed = parse(json!({ "tab": 3, "failed_only": true })).unwrap();
         assert_eq!(failed.failed_only, Some(true));
         assert!(parse(json!({ "tab": 3, "failed_only": "yes" })).is_err());
+    }
+
+    #[test]
+    fn reset_session_takes_an_account() {
+        let parse = |json: Value| serde_json::from_value::<ResetSessionArgs>(json);
+        let args = parse(json!({ "account": "Tester 1" })).unwrap();
+        assert_eq!(args.account, "Tester 1");
+        assert!(parse(json!({ "tab": 3 })).is_err());
     }
 
     fn console(entries: &[(&str, &str)]) -> Diagnostics {
