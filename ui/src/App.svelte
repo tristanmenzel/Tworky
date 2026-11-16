@@ -546,6 +546,18 @@
     else anonymousFor = w
   }
 
+  function pickAnonymous(w: Worker, service: ServiceLink) {
+    anonymousFor = null
+    void openBrowser(w, null, service.url)
+  }
+
+  async function profileCreated(w: Worker, request: AccountRequest | null, name: string) {
+    createProfileFor = null
+    if (request) await api.dismissAccountRequest(w.id, request.name).catch((e) => showError(String(e)))
+    await loadProjects()
+    await openBrowser(w, name)
+  }
+
   async function openBrowser(w: Worker, account: string | null, url: string | null = null) {
     try {
       const id = await api.browserOpen(w.id, account, url)
@@ -1057,10 +1069,7 @@
     {@const w = anonymousFor}
     <ServicePickerDialog
       services={servicesOf(w)}
-      onPick={(s) => {
-        anonymousFor = null
-        void openBrowser(w, null, s.url)
-      }}
+      onPick={(s) => pickAnonymous(w, s)}
       onClose={() => (anonymousFor = null)}
     />
   {/if}
@@ -1074,12 +1083,7 @@
       initialName={request?.name}
       initialEmail={request?.username}
       initialService={request?.service}
-      onCreated={async (name) => {
-        createProfileFor = null
-        if (request) await api.dismissAccountRequest(w.id, request.name).catch((e) => showError(String(e)))
-        await loadProjects()
-        await openBrowser(w, name)
-      }}
+      onCreated={(name) => profileCreated(w, request, name)}
       onClose={() => (createProfileFor = null)}
     />
   {/if}
