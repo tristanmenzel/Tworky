@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::cdp::{self, Cdp, evaluate};
 use crate::device;
-use crate::diagnostics::{Diagnostics, Part};
+use crate::diagnostics::{Diagnostics, Part, cut_url, redact};
 use crate::interact::{self, WaitCondition};
 use crate::login::{self, Account, LoginField, LoginMessage};
 use crate::snapshot;
@@ -20,6 +20,34 @@ pub const LOGIN_FORM_WAIT: Duration = Duration::from_secs(5);
 pub const ACTION_SETTLE: Duration = Duration::from_millis(300);
 pub const WAIT_POLL: Duration = Duration::from_millis(250);
 const NETWORK_FALLBACK_BUFFER: u64 = 1024 * 1024;
+pub const STORAGE_WAIT: Duration = Duration::from_secs(3);
+
+/// Reads key and database names only. Errors are reported by name, since a message can quote
+/// the page.
+const STORAGE_NAMES_SCRIPT: &str = r#"(async () => {
+  const errors = [];
+  const failed = (what, e) => errors.push(`${what}: ${(e && e.name) || "error"}`);
+  const keys = (what) => {
+    try {
+      const storage = window[what];
+      const names = [];
+      for (let i = 0; i < storage.length; i++) names.push(storage.key(i));
+      return names;
+    } catch (e) {
+      failed(what, e);
+      return null;
+    }
+  };
+  const local = keys("localStorage");
+  const session = keys("sessionStorage");
+  let databases = null;
+  try {
+    databases = (await indexedDB.databases()).map((db) => db.name);
+  } catch (e) {
+    failed("indexedDB", e);
+  }
+  return { local, session, databases, errors };
+})()"#;
 
 const READ_PAGE_SCRIPT: &str = r#"(() => ({
   url: location.href,
@@ -135,6 +163,18 @@ pub struct Page<'a, C: Cdp> {
     pub mobile: bool,
 }
 
+fn names(list: &Value, key: Option<&str>) -> Value {
+    match list.as_array() {
+        Some(items) => items
+            .iter()
+            .filter_map(|item| key.map_or(Some(item), |key| item.get(key)))
+            .filter_map(Value::as_str)
+            .map(Value::from)
+            .collect(),
+        None => Value::Null,
+    }
+}
+
 fn merge(mut into: Value, from: Value) -> Value {
     if let (Value::Object(into), Value::Object(from)) = (&mut into, from) {
         into.extend(from);
@@ -206,6 +246,76 @@ impl<C: Cdp> Page<'_, C> {
                 off(Part::Network, format!("requests are off because {e}"));
             }
         }
+    }
+
+    /// The names of the page's cookies, local and session storage keys and IndexedDB databases.
+    /// No values are read. Cookie names come first, from the browser, so a page that doesn't
+    /// answer still has them.
+    pub async fn list_storage(&self) -> Value {
+        let url = self.events.state().url;
+        let mut notes = Vec::new();
+        let params = if url.is_empty() {
+            json!({})
+        } else {
+            json!({ "urls": [url] })
+        };
+        let cookies = match self.cdp.call("Network.getCookies", params).await {
+            Ok(list) => names(&list["cookies"], Some("name")),
+            Err(e) => {
+                notes.push(format!("cookie names are missing because {e}"));
+                Value::Null
+            }
+        };
+        let mut listing = json!({ "url": cut_url(&url), "cookies": cookies });
+        match tokio::time::timeout(STORAGE_WAIT, self.storage_names()).await {
+            Ok(Ok(storage)) => {
+                listing["local_storage"] = names(&storage["local"], None);
+                listing["session_storage"] = names(&storage["session"], None);
+                listing["indexed_db"] = names(&storage["databases"], None);
+                for error in storage["errors"].as_array().into_iter().flatten() {
+                    if let Some(error) = error.as_str() {
+                        notes.push(format!("could not list {}", redact(error)));
+                    }
+                }
+            }
+            Ok(Err(e)) => notes.push(format!(
+                "storage key and database names are missing because {}",
+                redact(&e)
+            )),
+            Err(_) => notes.push(format!(
+                "storage key and database names are missing because the page did not answer within {}s",
+                STORAGE_WAIT.as_secs()
+            )),
+        }
+        if !notes.is_empty() {
+            listing["notes"] = notes.into();
+        }
+        listing
+    }
+
+    /// Runs in an isolated world, where page script can't replace what the listing calls.
+    async fn storage_names(&self) -> Result<Value, String> {
+        let recorded = self.events.diagnostics().main_frame().map(str::to_string);
+        let frame = match recorded {
+            Some(frame) => frame,
+            None => {
+                self.cdp.call("Page.getFrameTree", json!({})).await?["frameTree"]["frame"]["id"]
+                    .as_str()
+                    .ok_or("Page.getFrameTree returned no main frame")?
+                    .to_string()
+            }
+        };
+        let world = self
+            .cdp
+            .call(
+                "Page.createIsolatedWorld",
+                json!({ "frameId": frame, "worldName": login::WORLD }),
+            )
+            .await?;
+        let context = world["executionContextId"]
+            .as_i64()
+            .ok_or("Page.createIsolatedWorld returned no execution context")?;
+        cdp::evaluate_awaiting(self.cdp, context, STORAGE_NAMES_SCRIPT).await
     }
 
     async fn load(&self, start: impl Future<Output = Result<(), String>>) -> Result<Value, String> {
@@ -627,6 +737,196 @@ mod tests {
         assert_eq!(read["text"], "abc");
         assert_eq!(read["truncated"], true);
         assert_eq!(read["error_page"], true);
+    }
+
+    fn storage_page(
+        respond: impl Fn(&str, &Value) -> Result<Value, String> + Send + Sync + 'static,
+    ) -> (PageEvents, FakeCdp) {
+        let events = PageEvents::default();
+        events.load_finished("http://localhost:2020/auth/callback?code=abc#state=xyz");
+        events.diagnostics().set_main_frame("MAIN");
+        let cdp = FakeCdp::answering(move |method, params| match method {
+            "Network.getCookies" => Ok(json!({ "cookies": [
+                { "name": "sid", "value": "cookie-value-1", "domain": "localhost" },
+                { "name": "pref", "value": "cookie-value-2", "domain": "localhost" },
+            ] })),
+            "Page.createIsolatedWorld" => Ok(json!({ "executionContextId": 42 })),
+            _ => respond(method, params),
+        });
+        (events, cdp)
+    }
+
+    #[tokio::test]
+    async fn list_storage_returns_names_only() {
+        let (events, cdp) = storage_page(|_, _| {
+            Ok(json!({ "result": { "value": {
+                "local": ["msal.account.keys", "theme"],
+                "session": [],
+                "databases": ["app-cache"],
+                "errors": [],
+            } } }))
+        });
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            mobile: false,
+        };
+        let listing = page.list_storage().await;
+        assert_eq!(
+            listing,
+            json!({
+                "url": "http://localhost:2020/auth/callback",
+                "cookies": ["sid", "pref"],
+                "local_storage": ["msal.account.keys", "theme"],
+                "session_storage": [],
+                "indexed_db": ["app-cache"],
+            })
+        );
+        assert!(!listing.to_string().contains("cookie-value"));
+        assert_eq!(
+            cdp.params("Network.getCookies"),
+            [json!({ "urls": ["http://localhost:2020/auth/callback?code=abc#state=xyz"] })]
+        );
+        let script = cdp.params("Runtime.evaluate")[0]["expression"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!script.contains("getItem"));
+    }
+
+    #[tokio::test]
+    async fn list_storage_evaluates_in_an_isolated_world_on_the_main_frame() {
+        let (events, cdp) =
+            storage_page(|_, _| Ok(json!({ "result": { "value": { "local": [] } } })));
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            mobile: false,
+        };
+        page.list_storage().await;
+        assert_eq!(
+            cdp.methods(),
+            [
+                "Network.getCookies",
+                "Page.createIsolatedWorld",
+                "Runtime.evaluate"
+            ]
+        );
+        assert_eq!(
+            cdp.params("Page.createIsolatedWorld"),
+            [json!({ "frameId": "MAIN", "worldName": "tworky" })]
+        );
+        let evaluate = &cdp.params("Runtime.evaluate")[0];
+        assert_eq!(evaluate["contextId"], 42);
+        assert_eq!(evaluate["awaitPromise"], true);
+    }
+
+    #[tokio::test]
+    async fn list_storage_reports_parts_the_page_could_not_list() {
+        let (events, cdp) = storage_page(|_, _| {
+            Ok(json!({ "result": { "value": {
+                "local": null,
+                "session": ["s"],
+                "databases": null,
+                "errors": ["localStorage: SecurityError", "indexedDB: UnknownError"],
+            } } }))
+        });
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            mobile: false,
+        };
+        let listing = page.list_storage().await;
+        assert_eq!(listing["local_storage"], Value::Null);
+        assert_eq!(listing["session_storage"], json!(["s"]));
+        assert_eq!(
+            listing["notes"],
+            json!([
+                "could not list localStorage: SecurityError",
+                "could not list indexedDB: UnknownError",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn list_storage_keeps_cookie_names_when_the_script_throws() {
+        let (events, cdp) = storage_page(|_, _| {
+            Ok(
+                json!({ "result": {}, "exceptionDetails": { "text": "Uncaught",
+                "exception": { "description": "TypeError: boom" } } }),
+            )
+        });
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            mobile: false,
+        };
+        let listing = page.list_storage().await;
+        assert_eq!(listing["cookies"], json!(["sid", "pref"]));
+        assert!(listing.get("local_storage").is_none());
+        assert_eq!(
+            listing["notes"],
+            json!(["storage key and database names are missing because TypeError: boom"])
+        );
+    }
+
+    /// Answers like `inner`, except that `method` never answers.
+    struct Hanging {
+        inner: FakeCdp,
+        method: &'static str,
+    }
+
+    impl Cdp for Hanging {
+        async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+            if method == self.method {
+                std::future::pending::<()>().await;
+            }
+            self.inner.call(method, params).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn list_storage_keeps_cookie_names_when_the_page_hangs() {
+        let (events, inner) = storage_page(|_, _| Ok(json!({})));
+        let cdp = Hanging {
+            inner,
+            method: "Runtime.evaluate",
+        };
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            mobile: false,
+        };
+        let started = tokio::time::Instant::now();
+        let listing = page.list_storage().await;
+        assert_eq!(started.elapsed(), STORAGE_WAIT);
+        assert_eq!(listing["cookies"], json!(["sid", "pref"]));
+        assert_eq!(
+            listing["notes"],
+            json!([
+                "storage key and database names are missing because the page did not answer within 3s"
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn list_storage_finds_the_main_frame_when_none_was_recorded() {
+        let events = PageEvents::default();
+        let cdp = FakeCdp::answering(|method, _| {
+            Ok(match method {
+                "Page.getFrameTree" => json!({ "frameTree": { "frame": { "id": "LATE" } } }),
+                "Page.createIsolatedWorld" => json!({ "executionContextId": 5 }),
+                _ => json!({ "result": { "value": {} } }),
+            })
+        });
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            mobile: false,
+        };
+        page.list_storage().await;
+        assert_eq!(cdp.params("Network.getCookies"), [json!({})]);
+        assert_eq!(cdp.params("Page.createIsolatedWorld")[0]["frameId"], "LATE");
     }
 
     fn notes(events: &PageEvents, part: Part) -> Vec<String> {

@@ -29,6 +29,31 @@ pub async fn evaluate(cdp: &impl Cdp, expression: &str) -> Result<Value, String>
             json!({ "expression": expression, "returnByValue": true }),
         )
         .await?;
+    evaluated(result)
+}
+
+/// Runs `expression` in one execution context, such as an isolated world, and returns its value
+/// once the promise it returns settles, failing if it threw or rejected.
+pub async fn evaluate_awaiting(
+    cdp: &impl Cdp,
+    context: i64,
+    expression: &str,
+) -> Result<Value, String> {
+    let result = cdp
+        .call(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "contextId": context,
+                "awaitPromise": true,
+                "returnByValue": true,
+            }),
+        )
+        .await?;
+    evaluated(result)
+}
+
+fn evaluated(result: Value) -> Result<Value, String> {
     if let Some(details) = result.get("exceptionDetails") {
         let message = details["exception"]["description"]
             .as_str()
@@ -183,6 +208,16 @@ mod tests {
         let clip = &cdp.params("Page.captureScreenshot")[0]["clip"];
         assert_eq!(clip["y"], 120.0);
         assert_eq!(clip["width"], 393.0);
+    }
+
+    #[tokio::test]
+    async fn evaluate_awaiting_runs_in_the_given_context() {
+        let cdp = FakeCdp::answering(|_, _| Ok(json!({ "result": { "value": 3 } })));
+        assert_eq!(evaluate_awaiting(&cdp, 7, "1 + 2").await.unwrap(), 3);
+        let params = &cdp.params("Runtime.evaluate")[0];
+        assert_eq!(params["contextId"], 7);
+        assert_eq!(params["awaitPromise"], true);
+        assert_eq!(params["returnByValue"], true);
     }
 
     #[tokio::test]

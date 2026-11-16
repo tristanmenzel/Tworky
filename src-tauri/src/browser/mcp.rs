@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
@@ -20,6 +20,9 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler,
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
+use tworky_browser::diagnostics::{
+    self, ConsoleEntry, Diagnostics, Level, Outcome, Part, Request as NetworkRequest, WITHHELD,
+};
 use tworky_browser::interact::{self, Button, KeyPress, Target, WaitCondition};
 use tworky_browser::snapshot::parse_ref;
 use tworky_core::activity::{self, AccountRequest, Handover};
@@ -194,6 +197,26 @@ impl TworkyMcp {
         Ok((tab, cdp))
     }
 
+    /// The tab's account's stored password, read fresh so it is never kept on the tab. Empty
+    /// for an anonymous tab or an account with no password.
+    async fn password(tab: &Tab) -> Result<String, String> {
+        let Some(account) = tab.account() else {
+            return Ok(String::new());
+        };
+        let project = tab.project.clone();
+        let password = tauri::async_runtime::spawn_blocking(move || {
+            tworky_core::accounts::password(&project, &account.name)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| {
+            format!("could not read the account's stored password to check entries against: {e:#}")
+        })?;
+        Ok(password
+            .filter(|password| !password.trim().is_empty())
+            .unwrap_or_default())
+    }
+
     async fn act(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -218,6 +241,149 @@ struct OpenTabArgs {
 struct TabArgs {
     /// Tab id returned by open_tab or list_tabs.
     tab: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum ConsoleLevel {
+    Error,
+    /// Errors and warnings.
+    #[default]
+    Warning,
+    All,
+}
+
+impl ConsoleLevel {
+    fn includes(self, level: Level) -> bool {
+        match self {
+            ConsoleLevel::Error => level == Level::Error,
+            ConsoleLevel::Warning => level >= Level::Warning,
+            ConsoleLevel::All => true,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ReadConsoleArgs {
+    /// Tab id returned by open_tab or list_tabs.
+    tab: u64,
+    /// "error", "warning" (the default: errors and warnings) or "all".
+    level: Option<ConsoleLevel>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ReadNetworkArgs {
+    /// Tab id returned by open_tab or list_tabs.
+    tab: u64,
+    /// Only failed requests: status 400 or more, a network error, blocked, canceled, abandoned, or still pending after 5s. Defaults to false.
+    failed_only: Option<bool>,
+}
+
+fn level_name(level: Level) -> &'static str {
+    match level {
+        Level::Debug => "debug",
+        Level::Info => "info",
+        Level::Warning => "warning",
+        Level::Error => "error",
+    }
+}
+
+fn with_off_notes(mut reply: Value, diagnostics: &Diagnostics, parts: &[Part]) -> Value {
+    let notes: Vec<&str> = parts
+        .iter()
+        .flat_map(|part| diagnostics.notes(*part))
+        .collect();
+    if !notes.is_empty() {
+        reply["notes"] = notes.into();
+    }
+    reply
+}
+
+fn console_entry(entry: &ConsoleEntry, password: &str) -> Value {
+    match diagnostics::readable(password, entry) {
+        None => json!({ "level": level_name(entry.level), "withheld": WITHHELD }),
+        Some(entry) => json!({
+            "level": level_name(entry.level),
+            "source": entry.source,
+            "text": entry.text,
+            "at": entry.location,
+            "time_ms": entry.timestamp,
+            "load": entry.load,
+        }),
+    }
+}
+
+fn console_reply(diagnostics: &Diagnostics, level: ConsoleLevel, password: &str) -> Value {
+    let entries: Vec<Value> = diagnostics
+        .console
+        .entries()
+        .filter(|entry| level.includes(entry.level))
+        .map(|entry| console_entry(entry, password))
+        .collect();
+    with_off_notes(
+        json!({ "entries": entries }),
+        diagnostics,
+        &[Part::Console, Part::MainFrame],
+    )
+}
+
+fn network_entry(request: &NetworkRequest, password: &str) -> Value {
+    let Some(request) = diagnostics::readable(password, request) else {
+        return json!({ "withheld": WITHHELD });
+    };
+    let mut entry = json!({
+        "method": request.method,
+        "url": request.url,
+        "type": request.resource_type,
+        "duration_ms": request.duration_ms,
+        "load": request.load,
+    });
+    let outcome = match request.outcome {
+        Outcome::Open => "open",
+        Outcome::Pending => "pending",
+        Outcome::Abandoned => "abandoned",
+        Outcome::Finished { status } => {
+            entry["status"] = status.into();
+            "finished"
+        }
+        Outcome::Redirected { status } => {
+            entry["status"] = status.into();
+            "redirected"
+        }
+        Outcome::Failed {
+            error,
+            canceled,
+            blocked,
+            status,
+        } => {
+            entry["status"] = status.into();
+            entry["error"] = error.into();
+            entry["canceled"] = canceled.into();
+            entry["blocked"] = blocked.into();
+            "failed"
+        }
+    };
+    entry["outcome"] = outcome.into();
+    entry
+}
+
+fn network_reply(
+    diagnostics: &Diagnostics,
+    now: Instant,
+    failed_only: bool,
+    password: &str,
+) -> Value {
+    let entries: Vec<Value> = diagnostics
+        .requests
+        .entries(now, failed_only)
+        .iter()
+        .map(|request| network_entry(request, password))
+        .collect();
+    with_off_notes(
+        json!({ "requests": entries }),
+        diagnostics,
+        &[Part::Network, Part::MainFrame],
+    )
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -974,6 +1140,67 @@ impl TworkyMcp {
     }
 
     #[tool(
+        description = "Read the tab's recent console messages, uncaught exceptions and browser log entries, oldest first (the last 200, kept across navigations): level, source, text, url:line:col, time and load (the page load it arrived in, numbered from 1). level is \"error\", \"warning\" (the default: errors and warnings) or \"all\". Text is redacted: URLs are cut to origin and path, and tokens, secrets and the values of sensitive names are replaced with [redacted]. An entry containing the account's password is withheld whole. Storage values, headers and bodies are never read. notes say if capture is off and why."
+    )]
+    async fn read_console(
+        &self,
+        Parameters(args): Parameters<ReadConsoleArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = async {
+            let (tab, _) = self.tab(&ctx, args.tab)?;
+            let password = Self::password(&tab).await?;
+            let reply = console_reply(
+                &tab.events.diagnostics(),
+                args.level.unwrap_or_default(),
+                &password,
+            );
+            Ok(Reply::Json(reply))
+        }
+        .await;
+        respond(result)
+    }
+
+    #[tool(
+        description = "Read the tab's recent requests, oldest first (kept across navigations): method, URL, resource type, outcome (finished, redirected, failed, pending: open for more than 5s, open, or abandoned), status, network error or blocked reason, duration and load (the page load it belongs to, numbered from 1). Every redirect hop is listed. failed_only lists only failed, abandoned and pending requests. Text is redacted: URLs are cut to origin and path, dropping query strings and fragments. Headers and bodies are never read. An entry containing the account's password is withheld whole. notes say if capture is off and why."
+    )]
+    async fn read_network(
+        &self,
+        Parameters(args): Parameters<ReadNetworkArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = async {
+            let (tab, _) = self.tab(&ctx, args.tab)?;
+            let password = Self::password(&tab).await?;
+            let reply = network_reply(
+                &tab.events.diagnostics(),
+                Instant::now(),
+                args.failed_only.unwrap_or(false),
+                &password,
+            );
+            Ok(Reply::Json(reply))
+        }
+        .await;
+        respond(result)
+    }
+
+    #[tool(
+        description = "List the names of the tab's cookies for its page, its localStorage and sessionStorage keys, and its IndexedDB databases. Values are never read. Cookie names come from the browser, so they are listed even when the page doesn't answer; the rest needs the page to answer within 3s, and notes say why anything is missing."
+    )]
+    async fn list_storage(
+        &self,
+        Parameters(args): Parameters<TabArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = async {
+            let (tab, cdp) = self.tab(&ctx, args.tab)?;
+            Ok(Reply::Json(page(&cdp, &tab).list_storage().await))
+        }
+        .await;
+        respond(result)
+    }
+
+    #[tool(
         description = "Hand the change over to the user for acceptance testing, once it is built and you have checked it yourself in the browser. Tworky marks this worker Ready for UAT, notifies the user, and shows your summary, the steps as a checklist, and buttons for the tabs. Leave those tabs open on the pages to check, signed in as the right accounts. Call it as the last thing in your turn, then end the turn with a short message; the handover stays until the user dismisses it or sends you a new prompt."
     )]
     async fn hand_over(
@@ -1055,6 +1282,8 @@ impl ServerHandler for TworkyMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Drives browser tabs in Tworky, beside this session's terminal, signed in as this worker's project test accounts. Each account has its own isolated browser session per worker, and start URLs point at this worker's dev server ports. Call list_accounts, then open_tab to get a tab id, then use navigate, read_page, screenshot and sign_in with that id. To interact, call snapshot to get element refs, then click, hover, drag, type, press_key, scroll or select_option with a ref, and wait_for to wait for the result. open_tab with no account gives an anonymous tab, signed in as nobody, for checking what a visitor sees. The user sees the same tabs and may open their own; list_tabs shows them all.\n\nTo test a UI change: open_tab as the account the change is for, which starts the dev server its page needs if the project defines it as a service (list_services; start others with start_service). When the project defines no service for a dev server you need, you can run it yourself, but tell the user they can't start or see it as a service, and suggest adding [[services]] in the project's setup session, sign_in if the page asks, then check the change with snapshot and screenshot, fixing what you find. When it works, leave tabs open on the pages to check and call hand_over with the steps for the user to accept it.
 
+If a page looks blank or stuck, check read_console and read_network before anything else; if both are empty, tell the user.
+
 When a task needs an account no account covers (a role, permission or data set), call request_account with a suggested name, email, service and the reason, tell the user, and end your turn. Never work around a missing account: don't sign up through the app, edit the database, reuse an account with the wrong role or change the project's accounts yourself.",
         )
     }
@@ -1132,6 +1361,106 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("url"), "{error}");
     }
+
+    #[test]
+    fn read_console_takes_a_level_defaulting_to_warnings() {
+        let parse = |json: Value| serde_json::from_value::<ReadConsoleArgs>(json);
+        let default = parse(json!({ "tab": 3 })).unwrap();
+        assert_eq!(default.tab, 3);
+        assert_eq!(default.level.unwrap_or_default(), ConsoleLevel::Warning);
+        for (name, level) in [
+            ("error", ConsoleLevel::Error),
+            ("warning", ConsoleLevel::Warning),
+            ("all", ConsoleLevel::All),
+        ] {
+            let args = parse(json!({ "tab": 3, "level": name })).unwrap();
+            assert_eq!(args.level, Some(level));
+        }
+        assert!(parse(json!({ "tab": 3, "level": "verbose" })).is_err());
+        assert!(parse(json!({ "tab": 3, "level": 1 })).is_err());
+        assert!(parse(json!({ "level": "all" })).is_err());
+    }
+
+    #[test]
+    fn read_network_lists_everything_unless_asked_for_failures() {
+        let parse = |json: Value| serde_json::from_value::<ReadNetworkArgs>(json);
+        assert_eq!(parse(json!({ "tab": 3 })).unwrap().failed_only, None);
+        let failed = parse(json!({ "tab": 3, "failed_only": true })).unwrap();
+        assert_eq!(failed.failed_only, Some(true));
+        assert!(parse(json!({ "tab": 3, "failed_only": "yes" })).is_err());
+    }
+
+    fn console(entries: &[(&str, &str)]) -> Diagnostics {
+        let mut diagnostics = Diagnostics::default();
+        for (kind, text) in entries {
+            diagnostics.console_api_called(
+                serde_json::from_value(json!({
+                    "type": kind,
+                    "args": [{ "type": "string", "value": text }],
+                    "timestamp": 1.0,
+                }))
+                .unwrap(),
+            );
+        }
+        diagnostics
+    }
+
+    fn texts(reply: &Value) -> Vec<String> {
+        reply["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                entry["text"]
+                    .as_str()
+                    .or(entry["withheld"].as_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn read_console_filters_by_level() {
+        let diagnostics = console(&[
+            ("log", "started"),
+            ("warning", "deprecated"),
+            ("error", "failed"),
+        ]);
+        let read = |level| texts(&console_reply(&diagnostics, level, ""));
+        assert_eq!(read(ConsoleLevel::Error), ["failed"]);
+        assert_eq!(read(ConsoleLevel::Warning), ["deprecated", "failed"]);
+        assert_eq!(read(ConsoleLevel::All), ["started", "deprecated", "failed"]);
+    }
+
+    #[test]
+    fn read_console_withholds_entries_with_the_password() {
+        let diagnostics = console(&[("error", "login with hunter2 failed"), ("error", "other")]);
+        let reply = console_reply(&diagnostics, ConsoleLevel::Error, "hunter2");
+        assert_eq!(texts(&reply), [WITHHELD, "other"]);
+        assert!(!reply.to_string().contains("hunter2"));
+        assert_eq!(reply["entries"][0]["level"], "error");
+    }
+
+    #[test]
+    fn diagnostics_tools_report_why_capture_is_off() {
+        let mut diagnostics = Diagnostics::default();
+        diagnostics.turn_off(
+            Part::Network,
+            "requests are off because Network.enable failed".into(),
+        );
+        let network = network_reply(&diagnostics, Instant::now(), false, "");
+        assert_eq!(
+            network["notes"],
+            json!(["requests are off because Network.enable failed"])
+        );
+        assert!(
+            console_reply(&diagnostics, ConsoleLevel::All, "")
+                .get("notes")
+                .is_none()
+        );
+    }
+
     fn request_args(name: &str, service: &str) -> RequestAccountArgs {
         serde_json::from_value(json!({
             "name": name,
