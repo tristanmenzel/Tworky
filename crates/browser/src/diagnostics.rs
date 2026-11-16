@@ -2,12 +2,13 @@
 //! is captured, and raw CDP payloads are never kept.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use regex::{Captures, Regex};
-use serde::Deserialize;
-use serde::de::IgnoredAny;
+use serde::de::{self, IgnoredAny, Visitor};
+use serde::{Deserialize, Deserializer};
 use url::Url;
 
 pub const REDACTED: &str = "[redacted]";
@@ -22,16 +23,20 @@ const OPEN_CAP: usize = 100;
 const ORDINARY_CAP: usize = 200;
 const FAILED_CAP: usize = 50;
 
-const SENSITIVE_NAMES: [&str; 9] = [
-    "password",
-    "passwd",
-    "pwd",
-    "secret",
-    "client_secret",
-    "cookie",
-    "authorization",
-    "apikey",
-    "api_key",
+const SENSITIVE_NAMES: [&str; 2] = ["pwd", "authorization"];
+const SENSITIVE_SUFFIXES: [&str; 8] = [
+    "token", "secret", "password", "passwd", "apikey", "api_key", "api-key", "cookie",
+];
+const EMPTY_VALUES: [&str; 9] = [
+    "null",
+    "undefined",
+    "true",
+    "false",
+    "''",
+    "\"\"",
+    "``",
+    r#"\"\""#,
+    r"\'\'",
 ];
 
 fn regex(pattern: &str) -> Regex {
@@ -45,32 +50,40 @@ static JWT: LazyLock<Regex> =
     LazyLock::new(|| regex(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*"));
 static NAME_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     let names = format!(
-        r"{}|[A-Za-z0-9_\-]*(?:token|secret)",
-        SENSITIVE_NAMES.join("|")
+        r"{}|[A-Za-z0-9_\-]*(?:{})",
+        SENSITIVE_NAMES.join("|"),
+        SENSITIVE_SUFFIXES.join("|")
     );
     regex(&format!(
-        r#"(?i)(^|[^A-Za-z0-9_$\-])(["']?)({names})(["']?)([ \t]*[:=][ \t]*)("(?:[^"\\\r\n]|\\.)*"?|'(?:[^'\\\r\n]|\\.)*'?|`[^`\r\n]*`?|[^,}};&\s][^,}};&\r\n]*)"#
+        r#"(?i)(^|[^A-Za-z0-9_$\-])(\\?["']?)({names})(\\?["']?)([ \t]*[:=][ \t]*)(\\"(?:[^\\\r\n]|\\\\\\"|\\[^"\r\n])*(?:\\")?|"(?:[^"\\\r\n]|\\.)*"?|'(?:[^'\\\r\n]|\\.)*'?|`[^`\r\n]*`?|[^,}};&\s][^,}};&\r\n]*)"#
     ))
 });
 static AUTH_SCHEME: LazyLock<Regex> =
-    LazyLock::new(|| regex(r"(?i)\b(bearer|basic)([ \t]+)[A-Za-z0-9+/=._~\-]+"));
-static RUN: LazyLock<Regex> = LazyLock::new(|| regex(r"[A-Za-z0-9+=_\-/]+"));
+    LazyLock::new(|| regex(r"\b(Bearer|Basic)([ \t]+)([A-Za-z0-9+/=._~\-]+)"));
+static RUN: LazyLock<Regex> = LazyLock::new(|| regex(r"[A-Za-z0-9+_\-/]+=*"));
+static PATH_WORD: LazyLock<Regex> = LazyLock::new(|| regex(r"^(?:[A-Z]?[a-z0-9_\-]+)+$"));
 
 pub fn is_sensitive_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    SENSITIVE_NAMES.contains(&name.as_str()) || name.ends_with("token") || name.ends_with("secret")
+    SENSITIVE_NAMES.contains(&name.as_str())
+        || SENSITIVE_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
 }
 
 /// Origin and path only: no userinfo, query or fragment.
 pub fn cut_url(raw: &str) -> String {
-    if let Ok(url) = Url::parse(raw) {
-        if let Some(host) = url.host_str() {
-            let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-            return format!("{}://{host}{port}{}", url.scheme(), url.path());
-        }
-        if url.scheme() == "data" {
-            return raw.split(',').next().unwrap_or(raw).to_string();
-        }
+    if raw
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+    {
+        return raw.split(',').next().unwrap_or(raw).to_string();
+    }
+    if let Ok(url) = Url::parse(raw)
+        && let Some(host) = url.host_str()
+    {
+        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+        return format!("{}://{host}{port}{}", url.scheme(), url.path());
     }
     let base = raw.split(['?', '#']).next().unwrap_or(raw);
     match base.split_once("://") {
@@ -98,9 +111,6 @@ fn cut_url_in_text(found: &str) -> String {
 }
 
 fn token_shaped(run: &str) -> bool {
-    if run.contains('/') {
-        return false;
-    }
     let hex = run.len() >= 32 && run.chars().all(|c| c.is_ascii_hexdigit());
     let mixed = run.len() >= 24
         && run.chars().any(|c| c.is_ascii_uppercase())
@@ -109,24 +119,61 @@ fn token_shaped(run: &str) -> bool {
     hex || mixed
 }
 
+/// A run with a `/` is a path when one of its segments reads as a word, and then only its
+/// token-shaped segments go. Otherwise it is tested whole, as standard base64 can hold `/`.
+fn redact_run(run: &str) -> String {
+    if !run.contains('/') {
+        return if token_shaped(run) {
+            REDACTED.to_string()
+        } else {
+            run.to_string()
+        };
+    }
+    let path = run.split('/').any(|segment| PATH_WORD.is_match(segment));
+    if !path && token_shaped(&run.replace('/', "")) {
+        return REDACTED.to_string();
+    }
+    run.split('/')
+        .map(|segment| {
+            if token_shaped(segment) {
+                REDACTED
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn redact_value(value: &str) -> String {
+    if EMPTY_VALUES.contains(&value.trim_end()) {
+        return value.to_string();
+    }
+    if value.starts_with("\\\"") {
+        return format!("\\\"{REDACTED}\\\"");
+    }
+    match value.chars().next() {
+        Some(quote @ ('"' | '\'' | '`')) => format!("{quote}{REDACTED}{quote}"),
+        _ => REDACTED.to_string(),
+    }
+}
+
 fn redact_prose(text: &str) -> String {
     let text = JWT.replace_all(text, REDACTED);
     let text = NAME_VALUE.replace_all(&text, |c: &Captures| {
-        let value = match c[6].chars().next() {
-            Some(quote @ ('"' | '\'' | '`')) => format!("{quote}{REDACTED}{quote}"),
-            _ => REDACTED.to_string(),
-        };
+        let value = redact_value(&c[6]);
         format!("{}{}{}{}{}{value}", &c[1], &c[2], &c[3], &c[4], &c[5])
     });
-    let text = AUTH_SCHEME.replace_all(&text, format!("${{1}}${{2}}{REDACTED}"));
-    RUN.replace_all(&text, |c: &Captures| {
-        if token_shaped(&c[0]) {
-            REDACTED.to_string()
+    let text = AUTH_SCHEME.replace_all(&text, |c: &Captures| {
+        let value = &c[3];
+        if value.len() >= 8 && !value.chars().all(|c| c.is_ascii_lowercase()) {
+            format!("{}{}{REDACTED}", &c[1], &c[2])
         } else {
             c[0].to_string()
         }
-    })
-    .into_owned()
+    });
+    RUN.replace_all(&text, |c: &Captures| redact_run(&c[0]))
+        .into_owned()
 }
 
 /// Pattern redaction of free text. URLs are cut to origin and path, and the token-shaped rule
@@ -143,34 +190,100 @@ pub fn redact(text: &str) -> String {
     out
 }
 
-fn truncate(text: String, max: usize) -> String {
-    if text.chars().count() <= max {
-        text
-    } else {
-        text.chars().take(max - 1).chain(['…']).collect()
+fn truncate(text: &mut String, max: usize) {
+    if text.chars().nth(max).is_some() {
+        let keep = text.char_indices().nth(max - 1).map_or(0, |(at, _)| at);
+        text.truncate(keep);
+        text.push('…');
     }
 }
 
-/// Redacts, then truncates to 500 characters.
-pub fn clean(text: &str) -> String {
-    let input: String;
-    let text = if text.len() > MAX_INPUT {
-        input = text.chars().take(MAX_INPUT).collect();
-        &input
-    } else {
-        text
-    };
-    truncate(redact(text), MAX_TEXT)
+/// Redacts the first 16,000 characters, and says whether there were more.
+pub fn clean(text: &str) -> (String, bool) {
+    match text.char_indices().nth(MAX_INPUT) {
+        Some((at, _)) => (redact(&text[..at]), true),
+        None => (redact(text), false),
+    }
 }
 
 /// Implemented by what the diagnostics keep, so a reader can withhold an entry.
-pub trait Entry {
-    fn contains(&self, needle: &str) -> bool;
+pub trait Entry: Clone {
+    fn texts(&self) -> Vec<&str>;
+    /// Whether any text was cut at the 16,000-character input cap.
+    fn cut(&self) -> bool;
+    fn truncate_texts(&mut self, max: usize);
 }
 
-/// Whether an entry must be withheld because it contains the account's password.
+fn json_escaped(text: &str) -> String {
+    let quoted = serde_json::to_string(text).unwrap_or_default();
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// Whether an entry must be withheld because it contains the account's password. An entry cut
+/// at the input cap is also withheld when it ends partway into the password.
 pub fn withheld(password: &str, entry: &impl Entry) -> bool {
-    !password.trim().is_empty() && entry.contains(password)
+    if password.trim().is_empty() {
+        return false;
+    }
+    let escaped = json_escaped(password);
+    let forms = [password, escaped.as_str()];
+    let texts = entry.texts();
+    if texts
+        .iter()
+        .any(|text| forms.iter().any(|form| text.contains(form)))
+    {
+        return true;
+    }
+    entry.cut()
+        && texts.iter().any(|text| {
+            forms.iter().any(|form| {
+                form.char_indices()
+                    .skip(1)
+                    .any(|(at, _)| text.ends_with(&form[..at]))
+            })
+        })
+}
+
+/// What a reader may show of an entry: `None` when it is withheld, else the entry with each
+/// text truncated to 500 characters.
+pub fn readable<T: Entry>(password: &str, entry: &T) -> Option<T> {
+    if withheld(password, entry) {
+        return None;
+    }
+    let mut entry = entry.clone();
+    entry.truncate_texts(MAX_TEXT);
+    Some(entry)
+}
+
+/// Keeps one character more than [`MAX_INPUT`], so [`clean`] can tell the text was cut.
+struct Capped(String);
+
+impl<'de> Deserialize<'de> for Capped {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl Visitor<'_> for Visit {
+            type Value = Capped;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<Capped, E> {
+                let end = text
+                    .char_indices()
+                    .nth(MAX_INPUT + 1)
+                    .map_or(text.len(), |(at, _)| at);
+                Ok(Capped(text[..end].to_string()))
+            }
+        }
+        deserializer.deserialize_str(Visit)
+    }
+}
+
+fn capped<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Capped::deserialize(deserializer).map(|capped| capped.0)
+}
+
+fn capped_option<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Option::<Capped>::deserialize(deserializer).map(|capped| capped.map(|capped| capped.0))
 }
 
 #[derive(Deserialize)]
@@ -178,7 +291,7 @@ pub fn withheld(password: &str, entry: &impl Entry) -> bool {
 enum Primitive {
     Bool(bool),
     Number(f64),
-    Text(String),
+    Text(Capped),
     Other(IgnoredAny),
 }
 
@@ -189,7 +302,9 @@ pub struct RemoteObject {
     kind: String,
     subtype: Option<String>,
     value: Option<Primitive>,
+    #[serde(default, deserialize_with = "capped_option")]
     unserializable_value: Option<String>,
+    #[serde(default, deserialize_with = "capped_option")]
     description: Option<String>,
     preview: Option<ObjectPreview>,
 }
@@ -208,11 +323,19 @@ struct PropertyPreview {
     name: String,
     #[serde(rename = "type", default)]
     kind: String,
+    #[serde(default, deserialize_with = "capped_option")]
     value: Option<String>,
 }
 
+fn empty_value(property: &PropertyPreview) -> bool {
+    matches!(
+        (property.kind.as_str(), property.value.as_deref()),
+        ("undefined" | "boolean", _) | ("object", Some("null")) | ("string", Some(""))
+    )
+}
+
 fn render_property(property: &PropertyPreview) -> String {
-    if is_sensitive_name(&property.name) {
+    if is_sensitive_name(&property.name) && !empty_value(property) {
         return REDACTED.to_string();
     }
     match (property.kind.as_str(), &property.value) {
@@ -248,7 +371,7 @@ fn render_preview(preview: &ObjectPreview) -> String {
 
 fn render_arg(arg: &RemoteObject) -> String {
     match &arg.value {
-        Some(Primitive::Text(text)) => return text.clone(),
+        Some(Primitive::Text(text)) => return text.0.clone(),
         Some(Primitive::Bool(value)) => return value.to_string(),
         Some(Primitive::Number(value)) => return value.to_string(),
         Some(Primitive::Other(_)) | None => {}
@@ -265,9 +388,23 @@ fn render_arg(arg: &RemoteObject) -> String {
     }
 }
 
-/// Console arguments as one line, before redaction.
+/// Console arguments as one line, before redaction, stopping once it passes the input cap.
 pub fn render_args(args: &[RemoteObject]) -> String {
-    args.iter().map(render_arg).collect::<Vec<_>>().join(" ")
+    let mut line = String::new();
+    let mut length = 0;
+    for arg in args {
+        if length > MAX_INPUT {
+            break;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+            length += 1;
+        }
+        let text = render_arg(arg);
+        length += text.chars().count();
+        line.push_str(&text);
+    }
+    line
 }
 
 #[derive(Deserialize)]
@@ -280,7 +417,7 @@ struct StackTrace {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CallFrame {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "capped")]
     url: String,
     #[serde(default)]
     line_number: i64,
@@ -288,7 +425,7 @@ struct CallFrame {
     column_number: i64,
 }
 
-fn location(url: &str, line: Option<i64>, column: Option<i64>) -> Option<String> {
+fn location(url: &str, line: Option<i64>, column: Option<i64>) -> Option<(String, bool)> {
     if url.is_empty() {
         return None;
     }
@@ -299,7 +436,7 @@ fn location(url: &str, line: Option<i64>, column: Option<i64>) -> Option<String>
     Some(clean(&at))
 }
 
-fn frame_location(stack: Option<&StackTrace>) -> Option<String> {
+fn frame_location(stack: Option<&StackTrace>) -> Option<(String, bool)> {
     let frame = stack?.call_frames.first()?;
     location(
         &frame.url,
@@ -331,8 +468,9 @@ pub struct ExceptionThrown {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExceptionDetails {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "capped")]
     text: String,
+    #[serde(default, deserialize_with = "capped_option")]
     url: Option<String>,
     #[serde(default)]
     line_number: i64,
@@ -354,10 +492,11 @@ struct LogEntry {
     source: String,
     #[serde(default)]
     level: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "capped")]
     text: String,
     #[serde(default)]
     timestamp: f64,
+    #[serde(default, deserialize_with = "capped_option")]
     url: Option<String>,
     line_number: Option<i64>,
     stack_trace: Option<StackTrace>,
@@ -387,19 +526,33 @@ pub struct ConsoleEntry {
     pub level: Level,
     /// `console`, `exception`, or the browser log's source (`network`, `security`, …).
     pub source: String,
+    /// Kept whole; [`readable`] truncates it.
     pub text: String,
     /// `url:line:col`.
     pub location: Option<String>,
     /// Milliseconds since the epoch.
     pub timestamp: f64,
     pub load: Option<u32>,
+    cut: bool,
 }
 
 impl Entry for ConsoleEntry {
-    fn contains(&self, needle: &str) -> bool {
-        self.text.contains(needle)
-            || self.source.contains(needle)
-            || self.location.as_deref().is_some_and(|l| l.contains(needle))
+    fn texts(&self) -> Vec<&str> {
+        let mut texts = vec![self.text.as_str(), self.source.as_str()];
+        texts.extend(self.location.as_deref());
+        texts
+    }
+
+    fn cut(&self) -> bool {
+        self.cut
+    }
+
+    fn truncate_texts(&mut self, max: usize) {
+        truncate(&mut self.text, max);
+        truncate(&mut self.source, max);
+        if let Some(location) = &mut self.location {
+            truncate(location, max);
+        }
     }
 }
 
@@ -438,6 +591,7 @@ pub struct RequestWillBeSent {
 
 #[derive(Deserialize)]
 struct RequestLine {
+    #[serde(deserialize_with = "capped")]
     url: String,
     method: String,
 }
@@ -468,10 +622,11 @@ pub struct LoadingFailed {
     request_id: String,
     #[serde(default)]
     timestamp: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "capped")]
     error_text: String,
     #[serde(default)]
     canceled: bool,
+    #[serde(default, deserialize_with = "capped_option")]
     blocked_reason: Option<String>,
     cors_error_status: Option<CorsErrorStatus>,
 }
@@ -479,6 +634,7 @@ pub struct LoadingFailed {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CorsErrorStatus {
+    #[serde(deserialize_with = "capped")]
     cors_error: String,
 }
 
@@ -519,7 +675,7 @@ impl Outcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
     pub method: String,
-    /// Origin and path.
+    /// Origin and path, kept whole; [`readable`] truncates it.
     pub url: String,
     pub resource_type: String,
     pub outcome: Outcome,
@@ -527,20 +683,37 @@ pub struct Request {
     pub duration_ms: Option<u64>,
     pub load: Option<u32>,
     seq: u64,
+    cut: bool,
 }
 
 impl Entry for Request {
-    fn contains(&self, needle: &str) -> bool {
-        let outcome = match &self.outcome {
-            Outcome::Failed { error, blocked, .. } => {
-                error.contains(needle) || blocked.as_deref().is_some_and(|b| b.contains(needle))
+    fn texts(&self) -> Vec<&str> {
+        let mut texts = vec![
+            self.method.as_str(),
+            self.url.as_str(),
+            self.resource_type.as_str(),
+        ];
+        if let Outcome::Failed { error, blocked, .. } = &self.outcome {
+            texts.push(error);
+            texts.extend(blocked.as_deref());
+        }
+        texts
+    }
+
+    fn cut(&self) -> bool {
+        self.cut
+    }
+
+    fn truncate_texts(&mut self, max: usize) {
+        truncate(&mut self.method, max);
+        truncate(&mut self.url, max);
+        truncate(&mut self.resource_type, max);
+        if let Outcome::Failed { error, blocked, .. } = &mut self.outcome {
+            truncate(error, max);
+            if let Some(blocked) = blocked {
+                truncate(blocked, max);
             }
-            _ => false,
-        };
-        outcome
-            || self.method.contains(needle)
-            || self.url.contains(needle)
-            || self.resource_type.contains(needle)
+        }
     }
 }
 
@@ -560,8 +733,8 @@ fn streams(resource_type: &str) -> bool {
 #[derive(Default)]
 pub struct RequestLog {
     main_frame: Option<String>,
-    /// Main-frame `loaderId`s, in the order first seen; load N is `loads[N - 1]`.
-    loads: Vec<String>,
+    /// Main-frame `loaderId`s, numbered from 1 in the order first seen.
+    loads: HashMap<String, u32>,
     open: HashMap<String, OpenRequest>,
     ordinary: VecDeque<Request>,
     failed: VecDeque<Request>,
@@ -574,12 +747,13 @@ impl RequestLog {
     }
 
     fn load_of(&mut self, loader: &str, frame: Option<&str>) -> Option<u32> {
-        if let Some(at) = self.loads.iter().rposition(|l| l == loader) {
-            return Some(at as u32 + 1);
+        if let Some(load) = self.loads.get(loader) {
+            return Some(*load);
         }
         if !loader.is_empty() && frame.is_some() && frame == self.main_frame.as_deref() {
-            self.loads.push(loader.to_string());
-            return self.current_load();
+            let load = self.loads.len() as u32 + 1;
+            self.loads.insert(loader.to_string(), load);
+            return Some(load);
         }
         self.current_load()
     }
@@ -596,11 +770,18 @@ impl RequestLog {
         pool.push_back(request);
     }
 
-    fn close(&mut self, id: &str, timestamp: f64, outcome: impl FnOnce(Option<u16>) -> Outcome) {
+    fn close(
+        &mut self,
+        id: &str,
+        timestamp: f64,
+        cut: bool,
+        outcome: impl FnOnce(Option<u16>) -> Outcome,
+    ) {
         let Some(open) = self.open.remove(id) else {
             return;
         };
         let mut request = open.request;
+        request.cut |= cut;
         request.outcome = outcome(open.status);
         request.duration_ms = Some(((timestamp - open.started).max(0.0) * 1000.0).round() as u64);
         self.retire(request);
@@ -623,7 +804,7 @@ impl RequestLog {
     pub fn will_be_sent(&mut self, event: RequestWillBeSent, now: Instant) {
         if let Some(redirect) = &event.redirect_response {
             let status = redirect.status;
-            self.close(&event.request_id, event.timestamp, |_| {
+            self.close(&event.request_id, event.timestamp, false, |_| {
                 Outcome::Redirected { status }
             });
         }
@@ -633,14 +814,16 @@ impl RequestLog {
         }
         let seq = self.next_seq;
         self.next_seq += 1;
+        let (url, cut) = clean(&cut_url(&event.request.url));
         let request = Request {
             method: event.request.method,
-            url: clean(&cut_url(&event.request.url)),
+            url,
             resource_type: event.resource_type.unwrap_or_else(|| "Other".into()),
             outcome: Outcome::Open,
             duration_ms: None,
             load,
             seq,
+            cut,
         };
         self.open.insert(
             event.request_id,
@@ -660,7 +843,7 @@ impl RequestLog {
     }
 
     pub fn loading_finished(&mut self, event: LoadingFinished) {
-        self.close(&event.request_id, event.timestamp, |status| {
+        self.close(&event.request_id, event.timestamp, false, |status| {
             Outcome::Finished { status }
         });
     }
@@ -671,10 +854,12 @@ impl RequestLog {
                 .cors_error_status
                 .map(|cors| format!("cors: {}", cors.cors_error))
         });
-        let error = clean(&event.error_text);
+        let (error, error_cut) = clean(&event.error_text);
         let blocked = blocked.map(|b| clean(&b));
+        let cut = error_cut || blocked.as_ref().is_some_and(|(_, cut)| *cut);
+        let blocked = blocked.map(|(b, _)| b);
         let canceled = event.canceled;
-        self.close(&event.request_id, event.timestamp, |status| {
+        self.close(&event.request_id, event.timestamp, cut, |status| {
             Outcome::Failed {
                 error,
                 canceled,
@@ -752,16 +937,19 @@ impl Diagnostics {
         level: Level,
         source: &str,
         text: &str,
-        location: Option<String>,
+        location: Option<(String, bool)>,
         timestamp: f64,
     ) {
+        let (text, text_cut) = clean(text);
+        let location_cut = location.as_ref().is_some_and(|(_, cut)| *cut);
         let entry = ConsoleEntry {
             level,
             source: source.to_string(),
-            text: clean(text),
-            location,
+            text,
+            location: location.map(|(at, _)| at),
             timestamp,
             load: self.requests.current_load(),
+            cut: text_cut || location_cut,
         };
         self.console.push(entry);
     }
@@ -1008,10 +1196,10 @@ mod tests {
     #[test]
     fn truncates_after_redacting() {
         let long = format!("password=x, {}", "word ".repeat(200));
-        let cleaned = clean(&long);
-        assert!(cleaned.starts_with("password=[redacted]"));
-        assert_eq!(cleaned.chars().count(), 500);
-        assert!(cleaned.ends_with('…'));
+        let shown = readable("hunter2", &console_entry(&clean(&long).0)).unwrap();
+        assert!(shown.text.starts_with("password=[redacted]"));
+        assert_eq!(shown.text.chars().count(), 500);
+        assert!(shown.text.ends_with('…'));
     }
 
     fn console_entry(text: &str) -> ConsoleEntry {
@@ -1022,7 +1210,226 @@ mod tests {
             location: None,
             timestamp: 0.0,
             load: None,
+            cut: false,
         }
+    }
+
+    fn logged(diagnostics: &mut Diagnostics, text: &str) -> ConsoleEntry {
+        diagnostics.console_api_called(parse(json!({
+            "type": "log", "args": [{ "type": "string", "value": text }],
+        })));
+        diagnostics.console.entries().last().unwrap().clone()
+    }
+
+    #[test]
+    fn a_password_straddling_the_display_cut_is_withheld() {
+        let mut diagnostics = Diagnostics::default();
+        let entry = logged(
+            &mut diagnostics,
+            &format!("{}hunter2pass", "x ".repeat(247)),
+        );
+        assert_eq!(readable("hunter2pass", &entry), None);
+        assert!(readable("other-pass", &entry).is_some());
+    }
+
+    #[test]
+    fn an_entry_cut_at_the_input_cap_ending_in_a_password_prefix_is_withheld() {
+        let mut diagnostics = Diagnostics::default();
+        let filler = format!("{} ", "x".repeat(MAX_INPUT - 4));
+        let entry = logged(&mut diagnostics, &format!("{filler}hunter2pass and more"));
+        assert!(entry.text.ends_with("hun"));
+        assert_eq!(readable("hunter2pass", &entry), None);
+        assert!(readable("zz", &entry).is_some());
+
+        let whole = logged(&mut diagnostics, &format!("{}hun", "x ".repeat(10)));
+        assert!(readable("hunter2pass", &whole).is_some());
+    }
+
+    #[test]
+    fn readable_truncates_to_500_characters() {
+        let entry = console_entry(&"word ".repeat(200));
+        let shown = readable("hunter2", &entry).unwrap();
+        assert_eq!(shown.text.chars().count(), 500);
+        assert_eq!(entry.text.chars().count(), 1000);
+    }
+
+    #[test]
+    fn redacts_double_stringified_json() {
+        assert_eq!(
+            redact(r#"{\"password\":\"hunter2\",\"user\":\"bob\"}"#),
+            r#"{\"password\":\"[redacted]\",\"user\":\"bob\"}"#
+        );
+        assert_eq!(
+            redact(r#"body: "{\"accessToken\":\"a \\\" b\"}""#),
+            r#"body: "{\"accessToken\":\"[redacted]\"}""#
+        );
+    }
+
+    #[test]
+    fn the_json_escaped_password_is_withheld() {
+        let entry = console_entry(r#"{"user":"bob","pw":"a\"b\\c"}"#);
+        assert!(withheld(r#"a"b\c"#, &entry));
+    }
+
+    #[test]
+    fn standard_base64_with_slashes_is_redacted() {
+        assert_eq!(
+            redact("AccountKey=Ab3+xYz/9QwErTy12UiOpAsDfGhJkLzXcVbNm0987654321abcdEFGH==;"),
+            "AccountKey=[redacted];"
+        );
+        assert_eq!(
+            redact("key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY set"),
+            "key [redacted] set"
+        );
+    }
+
+    #[test]
+    fn a_path_keeps_its_readable_segments() {
+        for text in [
+            "src/components/AuthenticationProvider.tsx",
+            "at src/components/AuthenticationProvider.tsx:12:5",
+            "node_modules/.vite/deps/chunk-ABC123.js",
+        ] {
+            assert_eq!(redact(text), text);
+        }
+        assert_eq!(
+            redact("GET api/sessions/aB3dE5fG7hI9jK1lM3nO5pQ7xx"),
+            "GET api/sessions/[redacted]"
+        );
+    }
+
+    #[test]
+    fn an_id_after_equals_stays_readable() {
+        for name in ["sessionId", "correlationId", "clientId"] {
+            let text = format!("{name}=3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+            assert_eq!(redact(&text), text);
+        }
+    }
+
+    #[test]
+    fn auth_schemes_need_a_capital_and_a_credential() {
+        for text in [
+            "This is a basic example",
+            "send a bearer token with it",
+            "Basic authentication failed",
+            "Bearer token missing",
+        ] {
+            assert_eq!(redact(text), text);
+        }
+        assert_eq!(redact("Basic dXNlcjpwYXNz"), "Basic [redacted]");
+        assert_eq!(
+            redact("Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln"),
+            "Bearer [redacted]"
+        );
+        assert_eq!(redact("Bearer 8f14e45fceea167a"), "Bearer [redacted]");
+    }
+
+    #[test]
+    fn empty_values_stay_readable() {
+        for text in [
+            "{account: null, accessToken: undefined, idToken: ''}",
+            r#"{"refreshToken": "", "password": null}"#,
+            "hasSecret: true, cookie: false",
+        ] {
+            assert_eq!(redact(text), text);
+        }
+        assert_eq!(
+            redact("{accessToken: abc, idToken: ''}"),
+            "{accessToken: [redacted], idToken: ''}"
+        );
+    }
+
+    #[test]
+    fn empty_properties_stay_readable_in_an_object_preview() {
+        let arg: RemoteObject = parse(json!({
+            "type": "object",
+            "preview": {
+                "type": "object",
+                "properties": [
+                    { "name": "account", "type": "object", "subtype": "null", "value": "null" },
+                    { "name": "accessToken", "type": "undefined" },
+                    { "name": "idToken", "type": "string", "value": "" },
+                    { "name": "hasPassword", "type": "boolean", "value": "false" },
+                    { "name": "refreshToken", "type": "string", "value": "abc" },
+                ],
+            },
+        }));
+        assert_eq!(
+            render_args(&[arg]),
+            "{account: null, accessToken: undefined, idToken: '', hasPassword: false, refreshToken: [redacted]}"
+        );
+    }
+
+    #[test]
+    fn compound_sensitive_names_are_redacted() {
+        for (input, expected) in [
+            ("newPassword=hunter2", "newPassword=[redacted]"),
+            ("confirmPassword: hunter2", "confirmPassword: [redacted]"),
+            ("x-api-key: k1", "x-api-key: [redacted]"),
+            (
+                "set-cookie: sid=1; Path=/",
+                "set-cookie: [redacted]; Path=/",
+            ),
+            ("old_passwd=x", "old_passwd=[redacted]"),
+            ("stripeApiKey=k", "stripeApiKey=[redacted]"),
+        ] {
+            assert_eq!(redact(input), expected, "{input}");
+        }
+        for name in ["newPassword", "x-api-key", "set-cookie", "STRIPE_API_KEY"] {
+            assert!(is_sensitive_name(name), "{name}");
+        }
+        for name in [
+            "errorCode",
+            "statusCode",
+            "error_code",
+            "isAuthenticated",
+            "authority",
+            "sessionId",
+        ] {
+            assert!(!is_sensitive_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn huge_strings_are_capped_as_they_are_parsed() {
+        let huge = "a".repeat(100_000);
+        let arg: RemoteObject = parse(json!({ "type": "string", "value": huge }));
+        assert_eq!(render_args(&[arg]).chars().count(), MAX_INPUT + 1);
+        let arg: RemoteObject = parse(json!({ "type": "function", "description": huge }));
+        assert_eq!(render_args(&[arg]).chars().count(), MAX_INPUT + 1);
+        let args: Vec<RemoteObject> = parse(json!([
+            { "type": "string", "value": huge },
+            { "type": "string", "value": huge },
+        ]));
+        assert_eq!(render_args(&args).chars().count(), MAX_INPUT + 1);
+        let short: RemoteObject = parse(json!({ "type": "string", "value": "é".repeat(10) }));
+        assert_eq!(render_args(&[short]), "é".repeat(10));
+    }
+
+    #[test]
+    fn a_data_url_is_cut_before_parsing() {
+        let url = format!("data:image/png;base64,{}", "iVBOR".repeat(10_000));
+        assert_eq!(cut_url(&url), "data:image/png;base64");
+        assert_eq!(cut_url("DATA:text/html,<p>hi</p>"), "DATA:text/html");
+        let mut log = main_log();
+        log.will_be_sent(typed_url("1", &url), Instant::now());
+        assert_eq!(
+            log.entries(Instant::now(), false)[0].url,
+            "data:image/png;base64"
+        );
+    }
+
+    #[test]
+    fn a_load_keeps_its_number() {
+        let now = Instant::now();
+        let mut log = main_log();
+        for loader in ["L1", "L2", "L3"] {
+            log.will_be_sent(sent(loader, loader, "MAIN", "http://a.test/", None), now);
+        }
+        log.will_be_sent(sent("4", "L2", "MAIN", "http://a.test/x.js", None), now);
+        assert_eq!(log.current_load(), Some(3));
+        let loads: Vec<Option<u32>> = log.entries(now, false).iter().map(|r| r.load).collect();
+        assert_eq!(loads, [Some(1), Some(2), Some(3), Some(2)]);
     }
 
     #[test]
@@ -1071,6 +1478,14 @@ mod tests {
             event["redirectResponse"] = json!({ "status": status, "url": "x", "headers": {} });
         }
         parse(event)
+    }
+
+    fn typed_url(id: &str, url: &str) -> RequestWillBeSent {
+        parse(json!({
+            "requestId": id, "loaderId": "L1", "frameId": "MAIN",
+            "request": { "url": url, "method": "GET" },
+            "timestamp": 1.0, "type": "Image",
+        }))
     }
 
     fn typed(id: &str, kind: &str) -> RequestWillBeSent {
