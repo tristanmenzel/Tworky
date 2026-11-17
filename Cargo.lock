@@ -4897,6 +4897,8 @@ dependencies = [
 name = "tworky-browser"
 version = "0.1.0"
 dependencies = [
+ "percent-encoding",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

@@ -94,16 +94,17 @@
     busy = false
   }
 
-  async function endSession() {
+  async function resetSession() {
     const ok = await confirmOverBrowser({
-      title: `Sign ${tab.account} out of every site?`,
-      message: 'Ends every session this browser holds for the account.',
-      confirmLabel: 'End session',
+      title: `Reset ${tab.account}'s browser session?`,
+      message:
+        'Signs the account out everywhere and clears all its browser data on this worker. Its tabs close; the next one starts fresh.',
+      confirmLabel: 'Reset session',
       danger: true,
     })
     if (!ok) return
     busy = true
-    await call(() => api.browserEndSession(tab.id))
+    await call(() => api.browserResetSession(tab.id))
     busy = false
   }
 </script>
@@ -164,8 +165,8 @@
       </button>
     {/if}
     {#if tab.account !== null}
-      <button disabled={busy} title="Clear this account's session cookies and reload" onclick={endSession}>
-        End session
+      <button disabled={busy} title="Sign this account out and clear its browser data on this worker" onclick={resetSession}>
+        Reset session
       </button>
     {/if}
   </div>
