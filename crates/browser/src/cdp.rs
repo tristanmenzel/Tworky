@@ -32,8 +32,6 @@ pub async fn evaluate(cdp: &impl Cdp, expression: &str) -> Result<Value, String>
     evaluated(result)
 }
 
-/// Runs `expression` in one execution context, such as an isolated world, and returns its value
-/// once the promise it returns settles, failing if it threw or rejected.
 pub async fn evaluate_awaiting(
     cdp: &impl Cdp,
     context: i64,

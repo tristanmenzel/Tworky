@@ -198,8 +198,7 @@ fn redact_prose(text: &str) -> String {
         .into_owned()
 }
 
-/// Pattern redaction of free text. URLs are cut to origin and path, and the token-shaped rule
-/// never looks inside them.
+/// URLs are cut to origin and path, and the token-shaped rule never looks inside them.
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut last = 0;
@@ -220,7 +219,7 @@ fn truncate(text: &mut String, max: usize) {
     }
 }
 
-/// Redacts the first 16,000 characters, and says whether there were more.
+/// Redacts the first `MAX_INPUT` characters, and says whether there were more.
 pub fn clean(text: &str) -> (String, bool) {
     match text.char_indices().nth(MAX_INPUT) {
         Some((at, _)) => (redact(&text[..at]), true),
@@ -228,10 +227,9 @@ pub fn clean(text: &str) -> (String, bool) {
     }
 }
 
-/// Implemented by what the diagnostics keep, so a reader can withhold an entry.
 pub trait Entry: Clone {
     fn texts(&self) -> Vec<&str>;
-    /// Whether any text was cut at the 16,000-character input cap.
+    /// Whether any text was cut at `MAX_INPUT`.
     fn cut(&self) -> bool;
     fn truncate_texts(&mut self, max: usize);
 }

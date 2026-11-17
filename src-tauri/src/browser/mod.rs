@@ -196,8 +196,7 @@ impl Browser {
         Ok(tab)
     }
 
-    /// Marks the profile as resetting and returns its saved name and open tabs, for the reset to
-    /// close.
+    /// Returns the profile's saved name, which can differ in case, and its open tabs.
     fn begin_reset(&self, profile: &str) -> CmdResult<(ResetGuard<'_>, String, Vec<Arc<Tab>>)> {
         let tabs = self.tabs.lock().unwrap();
         let saved = self.saved.lock().unwrap();

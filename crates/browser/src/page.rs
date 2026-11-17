@@ -208,7 +208,6 @@ impl<C: Cdp> Page<'_, C> {
         Ok(())
     }
 
-    /// Never fails: a part that can't be enabled is left off, with a note saying why.
     async fn enable_diagnostics(&self) {
         let off = |part, note: String| self.events.diagnostics().turn_off(part, note);
         match self.cdp.call("Page.getFrameTree", json!({})).await {
@@ -248,9 +247,8 @@ impl<C: Cdp> Page<'_, C> {
         }
     }
 
-    /// The names of the page's cookies, local and session storage keys and IndexedDB databases.
-    /// No values are read. Cookie names come first, from the browser, so a page that doesn't
-    /// answer still has them.
+    /// Names only, never values. Cookie names come from the browser first, so a page that
+    /// doesn't answer still has them.
     pub async fn list_storage(&self) -> Value {
         let url = self.events.state().url;
         let mut notes = Vec::new();

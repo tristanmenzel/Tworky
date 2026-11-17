@@ -422,12 +422,12 @@ pub async fn destroy(app: &AppHandle, id: u64) {
     .await;
 }
 
-/// Clears and deletes a profile's data. Its tabs must be closed first.
+/// Its tabs must be closed first.
 pub async fn delete_profile(app: &AppHandle, profile: &str) -> Result<(), String> {
     clear(app, profile, true).await
 }
 
-/// Clears a profile's data, keeping the profile. Its tabs must be closed first.
+/// Keeps the profile. Its tabs must be closed first.
 pub async fn clear_profile(app: &AppHandle, profile: &str) -> Result<(), String> {
     clear(app, profile, false).await
 }
