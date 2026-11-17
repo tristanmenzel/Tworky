@@ -81,9 +81,9 @@ pub struct Browser {
     resetting: Resetting,
 }
 
-/// Profiles whose session is being reset, lowercased as WebView2 ignores case in profile names.
-/// Opening a tab on one is refused under the `tabs` lock, so each tab of the profile is either
-/// closed by the reset or never opens.
+/// Profiles whose session is being reset, or that cleanup is deleting, lowercased as WebView2
+/// ignores case in profile names. Opening a tab on one is refused under the `tabs` lock, so each
+/// tab of the profile is either closed by the reset or never opens.
 #[derive(Default)]
 struct Resetting(Mutex<HashSet<String>>);
 
@@ -105,6 +105,15 @@ impl Resetting {
                 resetting: self,
                 profile,
             })
+    }
+
+    async fn wait_and_start(&self, profile: &str) -> ResetGuard<'_> {
+        loop {
+            if let Some(guard) = self.start(profile) {
+                return guard;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -376,20 +385,6 @@ fn profile_name(worker: &str, account: &str) -> String {
     valid_profile_name(format!("tw-{worker}-{account}"))
 }
 
-/// Which of the project's accounts now map to a tab's profile. The account may have been renamed
-/// or removed since the tab opened, and then none does; names that differ only in characters a
-/// profile name can't hold share one.
-pub(super) fn profile_accounts<'a>(
-    worker: &str,
-    profile: &str,
-    names: impl IntoIterator<Item = &'a str>,
-) -> Vec<&'a str> {
-    names
-        .into_iter()
-        .filter(|name| profile_name(worker, name).eq_ignore_ascii_case(profile))
-        .collect()
-}
-
 /// A fresh profile for one anonymous tab. The random part keeps a reused tab id from finding
 /// an old profile's cookies.
 fn anonymous_profile_name(worker: &str, id: u64) -> String {
@@ -588,7 +583,9 @@ pub async fn forget_worker(app: &AppHandle, worker: &str) {
         .filter(|(_, p)| p.worker == worker)
         .map(|(name, _)| name.clone())
         .collect();
+    let browser = app.state::<Browser>();
     for profile in profiles {
+        let _deleting = browser.resetting.wait_and_start(&profile).await;
         delete_profile(app, &profile).await;
     }
 }
@@ -1362,23 +1359,28 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_profile_resolves_to_its_account_until_it_is_renamed_or_removed() {
+    fn waiting_to_start_takes_the_profile_once_its_reset_ends() {
+        let resetting = Resetting::default();
         let profile = profile_name("w", "Tester 1");
-        assert_eq!(
-            profile_accounts("w", &profile, ["Admin", "Tester 1"]),
-            ["Tester 1"]
-        );
-        assert_eq!(
-            profile_accounts("w", &profile, ["Admin", "tester 1"]),
-            ["tester 1"]
-        );
-        assert!(profile_accounts("w", &profile, ["Admin", "Tester 2"]).is_empty());
-        assert!(profile_accounts("w", &profile, ["Admin"]).is_empty());
-        assert!(profile_accounts("other", &profile, ["Tester 1"]).is_empty());
-        assert_eq!(
-            profile_accounts("w", &profile, ["Tester 1", "Tester.1"]),
-            ["Tester 1", "Tester.1"]
-        );
+        drop(tauri::async_runtime::block_on(
+            resetting.wait_and_start(&profile),
+        ));
+
+        let reset = resetting.start(&profile).unwrap();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let guard = tauri::async_runtime::block_on(
+                    resetting.wait_and_start(&profile.to_uppercase()),
+                );
+                assert!(resetting.start(&profile).is_none());
+                drop(guard);
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!waiter.is_finished());
+            drop(reset);
+            waiter.join().unwrap();
+        });
+        assert!(!resetting.contains(&profile));
     }
 
     #[test]

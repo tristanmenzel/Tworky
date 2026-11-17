@@ -30,7 +30,7 @@ use tworky_core::config::{AccountConfig, Config, Paths, ServiceConfig};
 use tworky_core::ports::PortMap;
 use tworky_core::worker::{McpEndpoint, Workspace};
 
-use super::{Browser, Tab, host, page, profile_accounts};
+use super::{Browser, Tab, host, page, profile_name};
 
 const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 const MAX_WAIT: Duration = Duration::from_secs(25);
@@ -296,28 +296,21 @@ struct ReadNetworkArgs {
 
 const ACCOUNT_CHANGED: &str = "this tab's account was renamed or removed since the tab opened, so its entries can't be checked against the account's password; close the tab and open a new one as the account with open_tab, or ask the user to press the tab's Reset session button";
 
-const ACCOUNT_AMBIGUOUS: &str = "this tab's account was renamed or removed since the tab opened, and several accounts now share its browser profile, so its entries can't be checked against one password; close the tab and open a new one as the account with open_tab, or ask the user to press the tab's Reset session button";
-
-/// The account whose password a tab's entries are checked against: the tab's own account while
-/// it still exists on the tab's profile, else the one account now on that profile. Fails closed
-/// when there is none, or several.
+/// The tab's own account, while it still exists and still maps to the tab's profile. Fails
+/// closed otherwise, so entries are never checked against another account's password.
 fn password_owner<'a>(
     worker: &str,
     profile: &str,
     own: Option<&str>,
     names: impl IntoIterator<Item = &'a str>,
 ) -> Result<&'a str, String> {
-    let owners = profile_accounts(worker, profile, names);
-    if let Some(own) = own
-        && let Some(name) = owners.iter().find(|name| name.eq_ignore_ascii_case(own))
-    {
-        return Ok(name);
-    }
-    match owners[..] {
-        [only] => Ok(only),
-        [] => Err(ACCOUNT_CHANGED.to_string()),
-        _ => Err(ACCOUNT_AMBIGUOUS.to_string()),
-    }
+    own.and_then(|own| {
+        names
+            .into_iter()
+            .find(|name| name.eq_ignore_ascii_case(own))
+    })
+    .filter(|name| profile_name(worker, name).eq_ignore_ascii_case(profile))
+    .ok_or_else(|| ACCOUNT_CHANGED.to_string())
 }
 
 fn level_name(level: Level) -> &'static str {
@@ -1263,7 +1256,7 @@ impl TworkyMcp {
             })
             .await
             .map_err(|e| e.to_string())??;
-            super::reset_session(&self.app, &super::profile_name(&worker, &account)).await?;
+            super::reset_session(&self.app, &profile_name(&worker, &account)).await?;
             Ok(Reply::Json(json!({
                 "reset": account,
                 "note": "Tell the user that this account's tabs closed and it was signed out.",
@@ -1525,7 +1518,7 @@ mod tests {
 
     #[test]
     fn the_password_check_fails_closed_when_the_tab_account_is_gone() {
-        let profile = super::super::profile_name("w", "Tester 1");
+        let profile = profile_name("w", "Tester 1");
         assert_eq!(
             password_owner("w", &profile, Some("Tester 1"), ["Admin", "Tester 1"]),
             Ok("Tester 1")
@@ -1536,11 +1529,15 @@ mod tests {
                 Err(ACCOUNT_CHANGED.to_string())
             );
         }
+        assert_eq!(
+            password_owner("w", &profile, None, ["Tester 1"]),
+            Err(ACCOUNT_CHANGED.to_string())
+        );
     }
 
     #[test]
-    fn the_password_check_uses_the_tab_account_when_accounts_share_a_profile() {
-        let profile = super::super::profile_name("w", "QA.User");
+    fn the_password_check_uses_only_the_tab_account_when_accounts_share_a_profile() {
+        let profile = profile_name("w", "QA.User");
         let accounts = ["QA User", "QA.User"];
         assert_eq!(
             password_owner("w", &profile, Some("QA.User"), accounts),
@@ -1551,12 +1548,17 @@ mod tests {
             Ok("QA User")
         );
         assert_eq!(
-            password_owner("w", &profile, Some("QA_User"), accounts),
-            Err(ACCOUNT_AMBIGUOUS.to_string())
+            password_owner("w", &profile, Some("QA.User"), ["Admin", "QA User"]),
+            Err(ACCOUNT_CHANGED.to_string())
         );
+    }
+
+    #[test]
+    fn the_password_check_fails_closed_after_a_rename() {
+        let profile = profile_name("w", "Tester 1");
         assert_eq!(
-            password_owner("w", &profile, Some("QA_User"), ["Admin", "QA.User"]),
-            Ok("QA.User")
+            password_owner("w", &profile, Some("Tester 1"), ["Admin", "Tester One"]),
+            Err(ACCOUNT_CHANGED.to_string())
         );
     }
 

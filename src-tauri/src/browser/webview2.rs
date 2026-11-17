@@ -444,17 +444,22 @@ async fn clear(app: &AppHandle, profile: &str, delete: bool) -> Result<(), Strin
                 .and_then(|core| core.Profile())
                 .map_err(webview2_com::Error::from)
                 .and_then(|profile| {
-                    let clearable = profile.cast::<ICoreWebView2Profile2>()?;
-                    ClearBrowsingDataCompletedHandler::wait_for_async_operation(
-                        Box::new(move |handler| {
-                            clearable.ClearBrowsingDataAll(&handler).map_err(Into::into)
-                        }),
-                        Box::new(|cleared| cleared),
-                    )?;
+                    let cleared = profile
+                        .cast::<ICoreWebView2Profile2>()
+                        .map_err(webview2_com::Error::from)
+                        .and_then(|clearable| {
+                            ClearBrowsingDataCompletedHandler::wait_for_async_operation(
+                                Box::new(move |handler| {
+                                    clearable.ClearBrowsingDataAll(&handler).map_err(Into::into)
+                                }),
+                                Box::new(|cleared| cleared),
+                            )
+                        });
                     if delete && let Ok(deletable) = profile.cast::<ICoreWebView2Profile8>() {
-                        deletable.Delete()?;
+                        let deleted = deletable.Delete();
+                        return cleared.and(deleted.map_err(Into::into));
                     }
-                    Ok(())
+                    cleared
                 })
         };
         drop(view);
