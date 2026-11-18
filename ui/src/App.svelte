@@ -107,7 +107,7 @@
   let selectedProject = $state<string | null>(null)
   let memoryChanges = $state<ProjectMemoryChanges[]>([])
   let memoryEditing = $state(false)
-  const pendingMemory = $derived(memoryChanges.filter((p) => p.changes.length))
+  const pendingMemory = $derived(memoryChanges.filter((p) => p.changes.length || p.error))
   const pendingMemoryCount = $derived(pendingMemory.reduce((n, p) => n + p.changes.length, 0))
   const projectChangeCount = $derived(memoryChanges.find((p) => p.project === selectedProject)?.changes.length ?? 0)
   let addDialog = $state<'issue' | 'pull_request' | 'custom' | null>(null)
@@ -346,7 +346,8 @@
   }
 
   /** Shows the project's setup terminal, starting or resuming its session if needed. */
-  function openProjectSetup(name: string) {
+  async function openProjectSetup(name: string) {
+    if (!(await canSwitchProject(name))) return
     view = 'projects'
     selectedProject = name
     projectTab = 'setup'
@@ -428,14 +429,20 @@
     }
   }
 
+  async function canSwitchProject(name: string | null) {
+    if (name === selectedProject || !memoryEditing) return true
+    return ask({ title: 'Discard your unsaved memory edit?', confirmLabel: 'Discard', danger: true })
+  }
+
+  async function selectProject(name: string) {
+    if (await canSwitchProject(name)) selectedProject = name
+  }
+
   async function viewMemoryChanges() {
     const target = pendingMemory.some((p) => p.project === selectedProject)
       ? selectedProject
       : (pendingMemory[0]?.project ?? selectedProject)
-    if (target !== selectedProject && memoryEditing) {
-      const ok = await ask({ title: 'Discard your unsaved memory edit?', confirmLabel: 'Discard', danger: true })
-      if (!ok) return
-    }
+    if (!(await canSwitchProject(target))) return
     showView('projects')
     selectedProject = target
     projectTab = 'changes'
@@ -759,12 +766,17 @@
     </span>
   </header>
 
-  {#if pendingMemoryCount}
+  {#if pendingMemory.length}
     <div class="memory-bar" role="status">
       <span class="memory-dot"></span>
       <span class="memory-text"
-        ><b>{pendingMemoryCount} memory change{pendingMemoryCount === 1 ? '' : 's'}</b> waiting for your approval
-        <span class="muted">({pendingMemory.map((p) => `${p.project} ${p.changes.length}`).join(', ')})</span></span
+        >{#if pendingMemoryCount}<b>{pendingMemoryCount} memory change{pendingMemoryCount === 1 ? '' : 's'}</b> waiting
+          for your approval{:else}<b>Memory changes</b> couldn't be read{/if}
+        <span class="muted"
+          >({pendingMemory
+            .map((p) => (p.error ? `${p.project}: couldn't read changes` : `${p.project} ${p.changes.length}`))
+            .join(', ')})</span
+        ></span
       >
       <button class="primary" onclick={viewMemoryChanges}>View</button>
     </div>
@@ -837,7 +849,7 @@
               <button
                 class="project"
                 class:selected={selectedProject === p.name}
-                onclick={() => (selectedProject = p.name)}
+                onclick={() => selectProject(p.name)}
               >
                 <strong>{p.name}</strong>
                 {#if p.onboarding}<span class="setup-badge" title="Not set up yet">setup</span>{/if}

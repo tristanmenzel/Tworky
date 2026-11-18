@@ -24,11 +24,12 @@
   let refusedNotice = $state(false)
   let busy = $state(false)
   let loadSeq = 0
-  let opening = true
+  let firstLoad = true
 
   const selected = $derived((changes ?? []).filter((c) => checked[c.id]))
+  const selectable = $derived((changes ?? []).filter((c) => c.preview.status === 'ready' && !fresh[c.id]))
   const staleSelected = $derived(selected.some((c) => c.preview.status === 'stale'))
-  const allSelected = $derived(!!changes?.length && selected.length === changes.length)
+  const allSelected = $derived(!!selected.length && selectable.every((c) => checked[c.id]))
   const base = $derived.by(() => {
     for (const c of changes ?? []) if (c.preview.status === 'ready') return c.preview.base
     return null
@@ -41,8 +42,8 @@
       if (seq !== loadSeq) return
       const entry = all.find((p) => p.project === project)
       const list = entry?.changes ?? []
-      const initial = opening
-      opening = false
+      const initial = firstLoad && !entry?.error
+      if (initial) firstLoad = false
       const nextChecked: Record<string, boolean> = {}
       const nextFresh: Record<string, boolean> = {}
       const nextStatuses: typeof statuses = {}
@@ -53,7 +54,7 @@
           if (!initial) nextFresh[c.id] = true
         } else {
           nextChecked[c.id] = statuses[c.id] === 'ready' && status === 'stale' ? false : checked[c.id]
-          if (!initial && fresh[c.id]) nextFresh[c.id] = true
+          if (fresh[c.id]) nextFresh[c.id] = true
         }
         nextStatuses[c.id] = status
       }
@@ -68,10 +69,7 @@
   }
 
   $effect(() => {
-    if (visible) {
-      opening = true
-      untrack(load)
-    }
+    if (visible) untrack(load)
   })
 
   $effect(() => {
@@ -84,8 +82,7 @@
   })
 
   function selectAll(on: boolean) {
-    for (const c of changes ?? []) checked[c.id] = on
-    fresh = {}
+    for (const c of changes ?? []) checked[c.id] = on && c.preview.status === 'ready' && !fresh[c.id]
     refusedNotice = false
   }
 
@@ -165,6 +162,7 @@
           type="checkbox"
           checked={allSelected}
           indeterminate={!!selected.length && !allSelected}
+          disabled={!selected.length && !selectable.length}
           onchange={(e) => selectAll(e.currentTarget.checked)}
         />
         <span>{selected.length} of {changes.length} selected</span>
