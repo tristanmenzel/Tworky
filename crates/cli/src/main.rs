@@ -731,10 +731,15 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
             section,
             project,
         } => {
-            let path = ws.config.paths.memory_file(&project_name(&ws, &project)?);
+            let name = project_name(&ws, &project)?;
             let author = project.worker.as_deref().unwrap_or("you");
-            memory::add(&path, &section, &text, author)?;
-            println!("added to {} under {section}", path.display());
+            let id = memory::propose(
+                &ws.config.paths,
+                &name,
+                memory::ChangeKind::Add { section, text },
+                author,
+            )?;
+            println!("proposed add {id} for {name}");
         }
         MemoryCommand::Path(arg) => {
             println!(

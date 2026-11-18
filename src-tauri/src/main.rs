@@ -362,7 +362,9 @@ async fn save_memory(project: String, text: String) -> CmdResult<()> {
     blocking(move || {
         let ws = workspace()?;
         ws.config.project(&project).ok_or("no such project")?;
-        tworky_core::memory::save(&ws.config.paths.memory_file(&project), &text).map_err(err)
+        let path = ws.config.paths.memory_file(&project);
+        let base = tworky_core::memory::hash(&tworky_core::memory::read(&path).map_err(err)?);
+        tworky_core::memory::save(&path, &base, &text).map_err(err)
     })
     .await
 }
