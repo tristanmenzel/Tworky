@@ -106,6 +106,7 @@
   let createProfileFor = $state<{ worker: Worker; request: AccountRequest | null } | null>(null)
   let selectedProject = $state<string | null>(null)
   let memoryChanges = $state<ProjectMemoryChanges[]>([])
+  let memoryEditing = $state(false)
   const pendingMemory = $derived(memoryChanges.filter((p) => p.changes.length))
   const pendingMemoryCount = $derived(pendingMemory.reduce((n, p) => n + p.changes.length, 0))
   const projectChangeCount = $derived(memoryChanges.find((p) => p.project === selectedProject)?.changes.length ?? 0)
@@ -427,9 +428,16 @@
     }
   }
 
-  function viewMemoryChanges() {
+  async function viewMemoryChanges() {
+    const target = pendingMemory.some((p) => p.project === selectedProject)
+      ? selectedProject
+      : (pendingMemory[0]?.project ?? selectedProject)
+    if (target !== selectedProject && memoryEditing) {
+      const ok = await ask({ title: 'Discard your unsaved memory edit?', confirmLabel: 'Discard', danger: true })
+      if (!ok) return
+    }
     showView('projects')
-    selectedProject = pendingMemory[0]?.project ?? selectedProject
+    selectedProject = target
     projectTab = 'changes'
   }
 
@@ -1023,6 +1031,7 @@
                 project={project.name}
                 visible={view === 'projects' && projectTab === 'memory'}
                 onError={showError}
+                onEditingChange={(editing) => (memoryEditing = editing)}
               />
             {/key}
           {/if}

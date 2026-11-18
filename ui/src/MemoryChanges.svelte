@@ -18,8 +18,13 @@
 
   let changes = $state<PendingMemoryChange[] | null>(null)
   let checked = $state<Record<string, boolean>>({})
+  let fresh = $state<Record<string, boolean>>({})
+  let statuses: Record<string, PendingMemoryChange['preview']['status']> = {}
+  let loadError = $state<string | null>(null)
+  let refusedNotice = $state(false)
   let busy = $state(false)
   let loadSeq = 0
+  let opening = true
 
   const selected = $derived((changes ?? []).filter((c) => checked[c.id]))
   const staleSelected = $derived(selected.some((c) => c.preview.status === 'stale'))
@@ -34,10 +39,28 @@
     try {
       const all = await api.memoryChanges()
       if (seq !== loadSeq) return
-      const list = all.find((p) => p.project === project)?.changes ?? []
-      const next: Record<string, boolean> = {}
-      for (const c of list) next[c.id] = checked[c.id] ?? c.preview.status === 'ready'
-      checked = next
+      const entry = all.find((p) => p.project === project)
+      const list = entry?.changes ?? []
+      const initial = opening
+      opening = false
+      const nextChecked: Record<string, boolean> = {}
+      const nextFresh: Record<string, boolean> = {}
+      const nextStatuses: typeof statuses = {}
+      for (const c of list) {
+        const status = c.preview.status
+        if (!(c.id in checked)) {
+          nextChecked[c.id] = initial && status === 'ready'
+          if (!initial) nextFresh[c.id] = true
+        } else {
+          nextChecked[c.id] = statuses[c.id] === 'ready' && status === 'stale' ? false : checked[c.id]
+          if (!initial && fresh[c.id]) nextFresh[c.id] = true
+        }
+        nextStatuses[c.id] = status
+      }
+      checked = nextChecked
+      fresh = nextFresh
+      statuses = nextStatuses
+      loadError = entry?.error ?? null
       changes = list
     } catch (e) {
       onError(String(e))
@@ -45,7 +68,10 @@
   }
 
   $effect(() => {
-    if (visible) untrack(load)
+    if (visible) {
+      opening = true
+      untrack(load)
+    }
   })
 
   $effect(() => {
@@ -59,17 +85,31 @@
 
   function selectAll(on: boolean) {
     for (const c of changes ?? []) checked[c.id] = on
+    fresh = {}
+    refusedNotice = false
+  }
+
+  function ticked(id: string) {
+    delete fresh[id]
+    refusedNotice = false
   }
 
   async function act(run: () => Promise<void>) {
     busy = true
+    refusedNotice = false
+    let refused = false
     try {
       await run()
     } catch (e) {
-      if (!String(e).includes(MEMORY_CHANGED_SINCE_SHOWN)) onError(String(e))
+      if (String(e).includes(MEMORY_CHANGED_SINCE_SHOWN)) refused = true
+      else onError(String(e))
     } finally {
       busy = false
       await load()
+      if (refused) {
+        for (const id in checked) checked[id] = false
+        refusedNotice = true
+      }
     }
   }
 
@@ -112,7 +152,9 @@
   </header>
   <p class="muted small">Sessions on {project} proposed these. Nothing changes in the memory until you approve it.</p>
 
-  {#if !changes}
+  {#if loadError}
+    <p class="load-error" role="alert">Couldn't read the pending changes: {loadError}</p>
+  {:else if !changes}
     <p class="muted">Loading…</p>
   {:else if !changes.length}
     <p class="muted empty">No changes waiting. When a session proposes one, it shows up here.</p>
@@ -127,7 +169,11 @@
         />
         <span>{selected.length} of {changes.length} selected</span>
       </label>
-      {#if staleSelected}<span class="stale-msg">Untick stale changes to approve.</span>{/if}
+      {#if refusedNotice}
+        <span class="stale-msg" role="alert"
+          >The memory changed since these diffs were shown. Review them again, then approve.</span
+        >
+      {:else if staleSelected}<span class="stale-msg">Untick stale changes to approve.</span>{/if}
       <span class="spacer"></span>
       <button onclick={reject} disabled={busy || !selected.length}>Reject {selected.length || ''}</button>
       <button class="approve" onclick={approve} disabled={busy || !selected.length || staleSelected || !base}
@@ -141,8 +187,9 @@
         {@const sec = section(c)}
         <article class="card" class:stale={c.preview.status === 'stale'} class:off={!checked[c.id]}>
           <label class="card-head">
-            <input type="checkbox" bind:checked={checked[c.id]} />
+            <input type="checkbox" bind:checked={checked[c.id]} onchange={() => ticked(c.id)} />
             <span class="kind {kind}">{kind}</span>
+            {#if fresh[c.id]}<span class="new">New</span>{/if}
             <span>
               {#if sec}{VERB[kind]} <b>{sec}</b>{:else}{kind === 'edit' ? 'Edit' : 'Remove'}{/if}
             </span>
@@ -195,6 +242,9 @@
   }
   .empty {
     padding: 24px 0;
+  }
+  .load-error {
+    color: var(--bad);
   }
   .spacer {
     flex: 1;
@@ -274,6 +324,14 @@
     padding: 1px 7px;
     border-radius: 4px;
     border: 1px solid currentColor;
+  }
+  .new {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--accent);
+    color: var(--on-accent);
   }
   .kind.add {
     color: var(--ok);

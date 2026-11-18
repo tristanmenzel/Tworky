@@ -578,7 +578,16 @@ fn apply_edit(current: &str, old: &str, new: &str, change: &Change) -> Result<St
             &current[end..content_end]
         );
         let body = strip_attribution(&edited);
-        let body = body.strip_prefix('-').unwrap_or(body).trim();
+        let body = match body.strip_prefix("- ") {
+            Some(rest) => rest.trim(),
+            None if body
+                .strip_prefix('-')
+                .is_some_and(|rest| rest.trim().is_empty()) =>
+            {
+                ""
+            }
+            None => body.trim(),
+        };
         if body.is_empty() {
             bail!("that leaves the entry empty; use `tw memory remove` to delete it");
         }
@@ -941,6 +950,17 @@ mod tests {
     fn entry_edits_that_keep_only_the_dash_are_rejected() {
         assert!(error(SEED, &editing("old _(acme-1, 2026-01-01)_", "")).contains("remove"));
         assert!(error(SEED, &editing("old _(acme-1, 2026-01-01)_", " ")).contains("remove"));
+    }
+
+    #[test]
+    fn entry_edits_keep_a_leading_minus_in_the_new_text() {
+        assert_eq!(
+            apply(SEED, &editing("- old", "-6 is the floor")).unwrap(),
+            SEED.replace(
+                "- old _(acme-1, 2026-01-01)_",
+                "- -6 is the floor _(w2, 2026-02-02)_"
+            )
+        );
     }
 
     #[test]

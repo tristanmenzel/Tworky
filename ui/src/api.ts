@@ -410,6 +410,7 @@ export interface PendingMemoryChange {
 export interface ProjectMemoryChanges {
   project: string
   changes: PendingMemoryChange[]
+  error: string | null
 }
 
 export const MEMORY_CHANGED_SINCE_SHOWN = 'Memory changed since this diff was shown'

@@ -819,6 +819,9 @@ fn kind_name(kind: &tworky_core::memory::ChangeKind) -> &'static str {
 
 fn propose(ws: &Workspace, arg: &ProjectArg, kind: tworky_core::memory::ChangeKind) -> Result<()> {
     let name = project_name(ws, arg)?;
+    ws.config
+        .project(&name)
+        .with_context(|| format!("no project called {name}"))?;
     let author = match &arg.worker {
         Some(worker) => worker.clone(),
         None if std::env::var_os("TW_SETUP_SESSION").is_some() => format!("setup@{name}"),

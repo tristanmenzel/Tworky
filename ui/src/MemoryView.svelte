@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from 'svelte'
+  import { onDestroy, untrack } from 'svelte'
   import { api, MEMORY_CHANGED_SINCE_EDITING, type ProjectMemory } from './api'
   import Markdown from './Markdown.svelte'
 
@@ -7,9 +7,10 @@
     project: string
     visible: boolean
     onError: (message: string) => void
+    onEditingChange?: (editing: boolean) => void
   }
 
-  let { project, visible, onError }: Props = $props()
+  let { project, visible, onError, onEditingChange }: Props = $props()
 
   let memories = $state<ProjectMemory[]>([])
   let editing = $state(false)
@@ -31,6 +32,12 @@
   $effect(() => {
     if (visible) untrack(load)
   })
+
+  $effect(() => {
+    onEditingChange?.(editing)
+  })
+
+  onDestroy(() => onEditingChange?.(false))
 
   function edit() {
     draft = current?.text ?? ''

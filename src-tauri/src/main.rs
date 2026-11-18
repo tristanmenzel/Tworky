@@ -375,22 +375,29 @@ async fn save_memory(project: String, base: String, text: String) -> CmdResult<(
 struct ProjectMemoryChanges {
     project: String,
     changes: Vec<memory::PendingChange>,
+    error: Option<String>,
 }
 
 #[tauri::command]
 async fn list_memory_changes() -> CmdResult<Vec<ProjectMemoryChanges>> {
     blocking(|| {
         let ws = workspace()?;
-        ws.config
+        Ok(ws
+            .config
             .projects
             .iter()
             .map(|p| {
-                Ok(ProjectMemoryChanges {
+                let (changes, error) = match memory::pending(&ws.config.paths, &p.name) {
+                    Ok(changes) => (changes, None),
+                    Err(e) => (Vec::new(), Some(err(e))),
+                };
+                ProjectMemoryChanges {
                     project: p.name.clone(),
-                    changes: memory::pending(&ws.config.paths, &p.name).map_err(err)?,
-                })
+                    changes,
+                    error,
+                }
             })
-            .collect()
+            .collect())
     })
     .await
 }
@@ -1077,11 +1084,14 @@ const SILENT_IS_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
 fn watch_activity(app: AppHandle) {
     let Ok(paths) = Paths::resolve() else { return };
     let mut memory_changes = memory_change_names(&paths);
+    let mut memory_files = memory_file_stamps(&paths);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(750));
         let names = memory_change_names(&paths);
-        if names != memory_changes {
+        let stamps = memory_file_stamps(&paths);
+        if names != memory_changes || stamps != memory_files {
             memory_changes = names;
+            memory_files = stamps;
             let _ = app.emit("memory-changes", ());
         }
         let state = app.state::<AppState>();
@@ -1159,6 +1169,23 @@ fn memory_change_names(paths: &Paths) -> BTreeSet<String> {
         }
     }
     names
+}
+
+/// Each memory file's modified time and size, so an edit from anywhere refreshes open diffs.
+fn memory_file_stamps(paths: &Paths) -> BTreeMap<String, (Option<std::time::SystemTime>, u64)> {
+    let mut stamps = BTreeMap::new();
+    let Ok(files) = std::fs::read_dir(paths.config_dir.join("memory")) else {
+        return stamps;
+    };
+    for file in files.flatten() {
+        let name = file.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".md")
+            && let Ok(meta) = file.metadata()
+        {
+            stamps.insert(name, (meta.modified().ok(), meta.len()));
+        }
+    }
+    stamps
 }
 
 #[tauri::command]
