@@ -137,6 +137,14 @@ fn offered_tree(
     hits
 }
 
+fn first_clone_of_each(clones: &[(String, PathBuf)]) -> Vec<&(String, PathBuf)> {
+    let mut seen = HashSet::new();
+    clones
+        .iter()
+        .filter(|(nwo, _)| seen.insert(nwo.to_ascii_lowercase()))
+        .collect()
+}
+
 impl Workspace {
     fn is_covered(&self, name_with_owner: &str) -> bool {
         self.config.project_for_repo(name_with_owner).is_some()
@@ -146,8 +154,8 @@ impl Workspace {
     pub fn repo_candidates(&self, query: &str) -> RepoSearch {
         let needle = query.trim().to_ascii_lowercase();
         let clones = git::find_clones(&self.config.app.source_roots, CLONE_SEARCH_DEPTH);
-        let mut candidates: Vec<RepoCandidate> = clones
-            .iter()
+        let mut candidates: Vec<RepoCandidate> = first_clone_of_each(&clones)
+            .into_iter()
             .filter(|(nwo, _)| !self.is_covered(nwo))
             .filter(|(nwo, _)| nwo.to_ascii_lowercase().contains(&needle))
             .map(|(nwo, path)| RepoCandidate {
@@ -558,6 +566,20 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_a_repo_cloned_twice_once() {
+        let clones = vec![
+            ("acme/web".to_string(), PathBuf::from("a/web")),
+            ("Acme/Web".to_string(), PathBuf::from("b/web")),
+            ("acme/api".to_string(), PathBuf::from("a/api")),
+        ];
+        let paths: Vec<_> = first_clone_of_each(&clones)
+            .iter()
+            .map(|(_, p)| p.clone())
+            .collect();
+        assert_eq!(paths, [PathBuf::from("a/web"), PathBuf::from("a/api")]);
+    }
 
     #[test]
     fn random_names_avoid_taken_ones() {
