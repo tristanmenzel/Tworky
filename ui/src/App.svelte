@@ -30,6 +30,7 @@
   import NewProjectDialog from './NewProjectDialog.svelte'
   import ProjectDetail from './ProjectDetail.svelte'
   import Terminal from './Terminal.svelte'
+  import { redrawTerminal } from './terminals'
   import MemoryView from './MemoryView.svelte'
   import MemoryChanges from './MemoryChanges.svelte'
   import AccountsView from './AccountsView.svelte'
@@ -1097,6 +1098,9 @@
                 <button class="primary" onclick={() => openProjectSetup(name)}>Resume</button>
               {:else}
                 <button onclick={() => api.stop(id).catch((e) => showError(String(e)))}>Stop</button>
+                <button title="Repaint the terminal if its screen looks garbled (Ctrl+Shift+L)" onclick={() => redrawTerminal(id)}
+                  >Redraw</button
+                >
               {/if}
               <button onclick={() => newSetupConversation(name)}>New conversation</button>
               <button onclick={() => api.openProjectConfig(name).catch((e) => showError(String(e)))}>Open config</button>

@@ -4,6 +4,7 @@
   import { activityLabel, activityOf, confirmCleanup, sessionLabel } from './issue'
   import ActionMenu, { type MenuItem } from './ActionMenu.svelte'
   import WorkerDot from './WorkerDot.svelte'
+  import { redrawTerminal } from './terminals'
 
   interface Props {
     worker: Worker
@@ -81,6 +82,9 @@
         disabled={worker.busy}
         title="Stop Claude, everything it started and the worker's containers (kept, not removed)"
         onclick={() => act(onTerminate)}>Terminate</button
+      >
+      <button title="Repaint the terminal if its screen looks garbled (Ctrl+Shift+L)" onclick={() => redrawTerminal(worker.id)}
+        >Redraw</button
       >
     {:else}
       <span class="muted">Claude not running</span>
