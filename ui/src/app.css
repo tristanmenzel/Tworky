@@ -21,6 +21,9 @@
   --story: #2f6fde;
   --task: #1f8a4c;
   --term-bg: #15181d;
+  --add-bg: #e6f4ec;
+  --del-bg: #fbeaea;
+  --info-bg: #eaf1fc;
   --mono: 'Cascadia Code', 'Cascadia Mono', Consolas, monospace;
   color-scheme: light;
 }
@@ -48,6 +51,9 @@
     --story: #6d9cf2;
     --task: #4cc283;
     --term-bg: #0d0f12;
+    --add-bg: #173226;
+    --del-bg: #3a1d1f;
+    --info-bg: #1a2638;
     color-scheme: dark;
   }
 }

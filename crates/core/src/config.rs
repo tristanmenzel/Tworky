@@ -135,6 +135,10 @@ impl Paths {
         self.config_dir.join("memory").join(format!("{project}.md"))
     }
 
+    pub fn memory_changes_dir(&self, project: &str) -> PathBuf {
+        self.data_dir.join("memory-changes").join(project)
+    }
+
     pub fn state_db(&self) -> PathBuf {
         self.data_dir.join("state.db")
     }

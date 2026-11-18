@@ -123,6 +123,7 @@ impl Workspace {
         }
         let mut env = std::collections::BTreeMap::new();
         env.insert("TW_PROJECT".into(), name.to_string());
+        env.insert("TW_SETUP_SESSION".into(), "1".into());
         Ok(Launch {
             program: self.config.app.claude[0].clone(),
             args,
@@ -447,6 +448,7 @@ mod tests {
         let first = ws.launch_project_setup("portal").unwrap();
         assert!(first.cwd.join("CLAUDE.md").is_file());
         assert_eq!(first.env["TW_PROJECT"], "portal");
+        assert_eq!(first.env["TW_SETUP_SESSION"], "1");
         assert!(first.args.contains(&"--session-id".to_string()));
         assert_eq!(
             first.args.last().unwrap(),

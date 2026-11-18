@@ -5,7 +5,7 @@ mod keep_awake;
 mod pty;
 mod title;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -18,6 +18,7 @@ use tworky_core::existing::WorkSubject;
 use tworky_core::github;
 use tworky_core::hierarchy::IssueIndex;
 use tworky_core::items::{AddOutcome, Listed, ProjectChoice};
+use tworky_core::memory;
 use tworky_core::project_setup;
 use tworky_core::state::WorkerRecord;
 use tworky_core::worker::{PrSummary, Workspace};
@@ -335,6 +336,7 @@ struct ProjectMemory {
     project: String,
     path: String,
     text: String,
+    hash: String,
 }
 
 #[tauri::command]
@@ -346,9 +348,11 @@ async fn list_memories() -> CmdResult<Vec<ProjectMemory>> {
             .iter()
             .map(|p| {
                 let path = ws.config.paths.memory_file(&p.name);
+                let text = memory::read(&path).map_err(err)?;
                 Ok(ProjectMemory {
                     project: p.name.clone(),
-                    text: tworky_core::memory::read(&path).map_err(err)?,
+                    hash: memory::hash(&text),
+                    text,
                     path: path.display().to_string(),
                 })
             })
@@ -358,11 +362,62 @@ async fn list_memories() -> CmdResult<Vec<ProjectMemory>> {
 }
 
 #[tauri::command]
-async fn save_memory(project: String, text: String) -> CmdResult<()> {
+async fn save_memory(project: String, base: String, text: String) -> CmdResult<()> {
     blocking(move || {
         let ws = workspace()?;
         ws.config.project(&project).ok_or("no such project")?;
-        tworky_core::memory::save(&ws.config.paths.memory_file(&project), &text).map_err(err)
+        memory::save(&ws.config.paths.memory_file(&project), &base, &text).map_err(err)
+    })
+    .await
+}
+
+#[derive(Serialize)]
+struct ProjectMemoryChanges {
+    project: String,
+    changes: Vec<memory::PendingChange>,
+    error: Option<String>,
+}
+
+#[tauri::command]
+async fn list_memory_changes() -> CmdResult<Vec<ProjectMemoryChanges>> {
+    blocking(|| {
+        let ws = workspace()?;
+        Ok(ws
+            .config
+            .projects
+            .iter()
+            .map(|p| {
+                let (changes, error) = match memory::pending(&ws.config.paths, &p.name) {
+                    Ok(changes) => (changes, None),
+                    Err(e) => (Vec::new(), Some(err(e))),
+                };
+                ProjectMemoryChanges {
+                    project: p.name.clone(),
+                    changes,
+                    error,
+                }
+            })
+            .collect())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn approve_memory_changes(project: String, ids: Vec<String>, base: String) -> CmdResult<()> {
+    blocking(move || {
+        let ws = workspace()?;
+        ws.config.project(&project).ok_or("no such project")?;
+        memory::approve(&ws.config.paths, &project, &ids, &base).map_err(err)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn reject_memory_changes(project: String, ids: Vec<String>) -> CmdResult<()> {
+    blocking(move || {
+        let ws = workspace()?;
+        ws.config.project(&project).ok_or("no such project")?;
+        memory::reject(&ws.config.paths, &project, &ids).map_err(err)
     })
     .await
 }
@@ -1028,8 +1083,17 @@ const SILENT_IS_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
 /// while the app is in the background.
 fn watch_activity(app: AppHandle) {
     let Ok(paths) = Paths::resolve() else { return };
+    let mut memory_changes = memory_change_names(&paths);
+    let mut memory_files = memory_file_stamps(&paths);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(750));
+        let names = memory_change_names(&paths);
+        let stamps = memory_file_stamps(&paths);
+        if names != memory_changes || stamps != memory_files {
+            memory_changes = names;
+            memory_files = stamps;
+            let _ = app.emit("memory-changes", ());
+        }
         let state = app.state::<AppState>();
         let mut now = activity::read_all(&paths);
         for (id, session) in now.iter_mut() {
@@ -1085,6 +1149,42 @@ fn watch_activity(app: AppHandle) {
             let _ = window.request_user_attention(Some(kind));
         }
     }
+}
+
+fn memory_change_names(paths: &Paths) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let Ok(projects) = std::fs::read_dir(paths.data_dir.join("memory-changes")) else {
+        return names;
+    };
+    for project in projects.flatten() {
+        let Ok(files) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".json") {
+                names.insert(format!("{}/{name}", project.file_name().to_string_lossy()));
+            }
+        }
+    }
+    names
+}
+
+/// Each memory file's modified time and size, so an edit from anywhere refreshes open diffs.
+fn memory_file_stamps(paths: &Paths) -> BTreeMap<String, (Option<std::time::SystemTime>, u64)> {
+    let mut stamps = BTreeMap::new();
+    let Ok(files) = std::fs::read_dir(paths.config_dir.join("memory")) else {
+        return stamps;
+    };
+    for file in files.flatten() {
+        let name = file.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".md")
+            && let Ok(meta) = file.metadata()
+        {
+            stamps.insert(name, (meta.modified().ok(), meta.len()));
+        }
+    }
+    stamps
 }
 
 #[tauri::command]
@@ -1305,6 +1405,9 @@ fn main() {
             set_board_status,
             list_memories,
             save_memory,
+            list_memory_changes,
+            approve_memory_changes,
+            reject_memory_changes,
             list_projects,
             search_repos,
             list_items,
