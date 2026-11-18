@@ -63,6 +63,8 @@ pub struct Preview {
     pub hunk: Hunk,
     /// `hash` of the memory the hunk was built from.
     pub base: String,
+    /// The `## ` heading, without the `## `, that the change lands under.
+    pub section: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,25 +124,33 @@ pub fn propose(paths: &Paths, project: &str, kind: ChangeKind, author: &str) -> 
     let json = serde_json::to_vec_pretty(&change)?;
     loop {
         let id = new_id();
-        let file = dir.join(format!("{id}.json"));
-        let tmp = dir.join(format!("{id}.json.tmp"));
-        if file.exists() {
-            continue;
+        if write_new(&dir, &id, &json)? {
+            return Ok(id);
         }
-        let mut f = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e).with_context(|| format!("creating {}", tmp.display())),
-        };
-        f.write_all(&json)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, &file).with_context(|| format!("writing {}", file.display()))?;
-        return Ok(id);
+    }
+}
+
+/// Writes `<id>.json` atomically, never replacing an existing file. False when the id is taken.
+fn write_new(dir: &Path, id: &str, bytes: &[u8]) -> Result<bool> {
+    let file = dir.join(format!("{id}.json"));
+    let tmp = dir.join(format!("{id}.json.tmp"));
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("creating {}", tmp.display())),
+    };
+    let written = f.write_all(bytes).and_then(|()| f.sync_all());
+    drop(f);
+    let linked = written.and_then(|()| std::fs::hard_link(&tmp, &file));
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("writing {}", file.display())),
     }
 }
 
@@ -159,6 +169,13 @@ pub fn pending(paths: &Paths, project: &str) -> Result<Vec<PendingChange>> {
         let Some(id) = change_id(&path) else {
             continue;
         };
+        if !is_change_id(&id) {
+            eprintln!(
+                "memory changes: skipping {}: not a change id",
+                path.display()
+            );
+            continue;
+        }
         match read_change(&path) {
             Ok(change) => out.push(PendingChange {
                 preview: preview(&current, &change).into(),
@@ -256,6 +273,12 @@ pub fn save(path: &Path, base: &str, text: &str) -> Result<()> {
 pub fn apply(current: &str, change: &Change) -> Result<String> {
     match &change.kind {
         ChangeKind::Add { section, text } => {
+            if section.trim().is_empty() {
+                bail!("the section name is empty");
+            }
+            if section.contains(['\n', '\r']) {
+                bail!("the section name must be on one line");
+            }
             let text = one_line(text);
             let text = text.trim();
             if text.is_empty() {
@@ -271,9 +294,25 @@ pub fn apply(current: &str, change: &Change) -> Result<String> {
 /// Applies the change and returns the one region it touches, with context.
 pub fn preview(current: &str, change: &Change) -> Result<Preview> {
     let next = apply(current, change)?;
+    let section = match &change.kind {
+        ChangeKind::Add { section, .. } => Some(
+            find_section(current, section)
+                .map_or(section.trim(), |i| heading_name(split_lines(current)[i])),
+        ),
+        ChangeKind::Edit { .. } | ChangeKind::Remove { .. } => {
+            let old = split_lines(current);
+            let first_changed = common_prefix(&old, &split_lines(&next));
+            old[..first_changed]
+                .iter()
+                .rev()
+                .find(|l| is_heading(l))
+                .map(|l| heading_name(l))
+        }
+    };
     Ok(Preview {
         hunk: hunk(current, &next),
         base: hash(current),
+        section: section.map(String::from),
     })
 }
 
@@ -320,16 +359,30 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn with_restore(e: anyhow::Error, files: &[(PathBuf, Vec<u8>)]) -> anyhow::Error {
-    for (file, bytes) in files {
-        if let Err(r) = write_atomic(file, bytes) {
-            return e.context(format!("restoring {} also failed: {r:#}", file.display()));
-        }
+    let failures: Vec<String> = files
+        .iter()
+        .filter_map(|(file, bytes)| {
+            write_atomic(file, bytes)
+                .err()
+                .map(|r| format!("{}: {r:#}", file.display()))
+        })
+        .collect();
+    if failures.is_empty() {
+        e
+    } else {
+        e.context(format!(
+            "restoring change files also failed: {}",
+            failures.join("; ")
+        ))
     }
-    e
+}
+
+fn is_change_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 fn change_file(dir: &Path, id: &str) -> Result<PathBuf> {
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    if !is_change_id(id) {
         bail!("not a change id: {id}");
     }
     Ok(dir.join(format!("{id}.json")))
@@ -382,6 +435,17 @@ fn is_heading(line: &str) -> bool {
     line.starts_with("## ")
 }
 
+fn heading_name(line: &str) -> &str {
+    content(line)[3..].trim()
+}
+
+fn find_section(current: &str, section: &str) -> Option<usize> {
+    split_lines(current).iter().position(|l| {
+        let l = content(l);
+        is_heading(l) && heading_name(l).eq_ignore_ascii_case(section.trim())
+    })
+}
+
 fn line_ending(text: &str) -> &'static str {
     let (mut crlf, mut lf) = (0, 0);
     for line in split_lines(text) {
@@ -421,10 +485,7 @@ fn is_entry(line: &str) -> bool {
 fn insert_entry(current: &str, section: &str, entry: &str) -> String {
     let ending = line_ending(current);
     let mut lines: Vec<String> = split_lines(current).into_iter().map(String::from).collect();
-    let heading = lines.iter().position(|l| {
-        let l = content(l);
-        is_heading(l) && l[3..].trim().eq_ignore_ascii_case(section.trim())
-    });
+    let heading = find_section(current, section);
     let mut new = Vec::new();
     let after = match heading {
         Some(start) => {
@@ -491,9 +552,15 @@ fn apply_edit(current: &str, old: &str, new: &str, change: &Change) -> Result<St
     if old.trim().is_empty() {
         bail!("the text to replace is empty");
     }
-    let new = match new.strip_suffix('\n') {
-        Some(n) => n.strip_suffix('\r').unwrap_or(n),
-        None => new,
+    let new = if !old.ends_with('\n') {
+        match new.strip_suffix('\n') {
+            Some(n) => n.strip_suffix('\r').unwrap_or(n).to_string(),
+            None => new.to_string(),
+        }
+    } else if new.is_empty() || new.ends_with('\n') {
+        new.to_string()
+    } else {
+        format!("{new}\n")
     };
     let ending = line_ending(current);
     let old = with_ending(old, ending);
@@ -507,11 +574,11 @@ fn apply_edit(current: &str, old: &str, new: &str, change: &Change) -> Result<St
         let edited = format!(
             "{}{}{}",
             &current[line_start..at],
-            one_line(new),
+            one_line(&new),
             &current[end..content_end]
         );
         let body = strip_attribution(&edited);
-        let body = body.strip_prefix("- ").unwrap_or(body).trim();
+        let body = body.strip_prefix('-').unwrap_or(body).trim();
         if body.is_empty() {
             bail!("that leaves the entry empty; use `tw memory remove` to delete it");
         }
@@ -525,7 +592,7 @@ fn apply_edit(current: &str, old: &str, new: &str, change: &Change) -> Result<St
     let next = format!(
         "{}{}{}",
         &current[..at],
-        with_ending(new, ending),
+        with_ending(&new, ending),
         &current[end..]
     );
     if next == current {
@@ -554,16 +621,24 @@ fn apply_remove(current: &str, text: &str) -> Result<String> {
     Ok(lines.concat())
 }
 
+/// Lines are compared without their endings, so a last line that only gains one stays context.
+fn common_prefix(old: &[&str], new: &[&str]) -> usize {
+    old.iter()
+        .zip(new)
+        .take_while(|(a, b)| content(a) == content(b))
+        .count()
+}
+
 fn hunk(before: &str, after: &str) -> Hunk {
     let old = split_lines(before);
     let new = split_lines(after);
-    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let prefix = common_prefix(&old, &new);
     let suffix = old
         .iter()
         .rev()
         .zip(new.iter().rev())
         .take(old.len().min(new.len()) - prefix)
-        .take_while(|(a, b)| a == b)
+        .take_while(|(a, b)| content(a) == content(b))
         .count();
     let deleted = &old[prefix..old.len() - suffix];
     let added = &new[prefix..new.len() - suffix];
@@ -863,6 +938,43 @@ mod tests {
     }
 
     #[test]
+    fn entry_edits_that_keep_only_the_dash_are_rejected() {
+        assert!(error(SEED, &editing("old _(acme-1, 2026-01-01)_", "")).contains("remove"));
+        assert!(error(SEED, &editing("old _(acme-1, 2026-01-01)_", " ")).contains("remove"));
+    }
+
+    #[test]
+    fn literal_edits_keep_a_line_ending_that_old_ends_with() {
+        let text = "Intro\nline one\nline two\n## Next\n";
+        assert_eq!(
+            apply(text, &editing("line one\nline two\n", "line 1\nline 2\n")).unwrap(),
+            "Intro\nline 1\nline 2\n## Next\n"
+        );
+        assert_eq!(
+            apply(text, &editing("line one\nline two\n", "line 1\nline 2")).unwrap(),
+            "Intro\nline 1\nline 2\n## Next\n"
+        );
+        let crlf = "Intro\r\nline one\r\n## Next\r\n";
+        assert_eq!(
+            apply(crlf, &editing("line one\n", "line 1")).unwrap(),
+            "Intro\r\nline 1\r\n## Next\r\n"
+        );
+    }
+
+    #[test]
+    fn add_rejects_a_blank_or_multi_line_section() {
+        assert_eq!(error(SEED, &adding(" ", "x")), "the section name is empty");
+        assert_eq!(
+            error(SEED, &adding("A\nB", "x")),
+            "the section name must be on one line"
+        );
+        assert_eq!(
+            error(SEED, &adding("A\r", "x")),
+            "the section name must be on one line"
+        );
+    }
+
+    #[test]
     fn edits_match_text_starting_with_a_multibyte_character() {
         let text = "## Learned\n\n- Projects ›› Memory › tab _(a, b)_\n";
         assert_eq!(
@@ -987,6 +1099,43 @@ mod tests {
     }
 
     #[test]
+    fn preview_keeps_an_unterminated_last_line_as_context() {
+        let p = preview("## Learned\n\n- x _(a, b)_", &adding("Learned", "y")).unwrap();
+        assert_eq!(
+            lines(&p.hunk),
+            [
+                " ## Learned",
+                " ",
+                " - x _(a, b)_",
+                "+- y _(w2, 2026-02-02)_"
+            ]
+        );
+    }
+
+    #[test]
+    fn preview_names_the_section_the_change_lands_under() {
+        let section = |current: &str, change: &Change| preview(current, change).unwrap().section;
+        assert_eq!(
+            section(SEED, &adding("learned", "x")).as_deref(),
+            Some("Learned")
+        );
+        assert_eq!(section(SEED, &adding(" New ", "x")).as_deref(), Some("New"));
+        assert_eq!(
+            section(SEED, &editing("old", "new")).as_deref(),
+            Some("Learned")
+        );
+        assert_eq!(
+            section(SEED, &removing("Subtasks.")).as_deref(),
+            Some("Starting a story")
+        );
+        assert_eq!(
+            section(SEED, &editing("Clone it.", "Clone.")).as_deref(),
+            Some("Test database")
+        );
+        assert_eq!(section(SEED, &editing("# Acme", "# Corp")), None);
+    }
+
+    #[test]
     fn pending_previews_serialise_as_tagged_results() {
         let ready: PreviewResult = preview("", &adding("L", "x")).into();
         let json = serde_json::to_value(&ready).unwrap();
@@ -1029,6 +1178,10 @@ mod tests {
         assert_eq!(memory(&paths), SEED);
         std::fs::write(paths.memory_changes_dir("p").join("x.json.tmp"), "{").unwrap();
         std::fs::write(paths.memory_changes_dir("p").join("0-bad.json"), "{").unwrap();
+        let valid = serde_json::to_vec(&adding("Learned", "x")).unwrap();
+        for name in ["x (1).json", "a.b.json"] {
+            std::fs::write(paths.memory_changes_dir("p").join(name), &valid).unwrap();
+        }
         let list = pending(&paths, "p").unwrap();
         let mut expected = [a, b];
         expected.sort();
@@ -1055,6 +1208,39 @@ mod tests {
             "w",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn writing_a_change_never_replaces_one_with_the_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("1-aaaa.json"), "first").unwrap();
+        assert!(!write_new(dir.path(), "1-aaaa", b"second").unwrap());
+        assert!(write_new(dir.path(), "1-bbbb", b"third").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("1-aaaa.json")).unwrap(),
+            "first"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["1-aaaa.json", "1-bbbb.json"]);
+    }
+
+    #[test]
+    fn restore_attempts_every_file_and_names_each_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let files = [
+            (missing.join("a.json"), b"a".to_vec()),
+            (dir.path().join("b.json"), b"b".to_vec()),
+            (missing.join("c.json"), b"c".to_vec()),
+        ];
+        let err = format!("{:#}", with_restore(anyhow::anyhow!("boom"), &files));
+        assert!(err.contains("a.json") && err.contains("c.json"), "{err}");
+        assert!(err.ends_with("boom"), "{err}");
+        assert_eq!(std::fs::read(dir.path().join("b.json")).unwrap(), b"b");
     }
 
     #[test]
