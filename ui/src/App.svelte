@@ -15,6 +15,7 @@
     type AccountRequest,
     type Job,
     type LocalStatus,
+    type ProjectMemoryChanges,
     type ProjectSummary,
     type Worker,
   } from './api'
@@ -30,6 +31,7 @@
   import ProjectDetail from './ProjectDetail.svelte'
   import Terminal from './Terminal.svelte'
   import MemoryView from './MemoryView.svelte'
+  import MemoryChanges from './MemoryChanges.svelte'
   import AccountsView from './AccountsView.svelte'
   import LocalWork from './LocalWork.svelte'
   import WorkerToolbar from './WorkerToolbar.svelte'
@@ -78,7 +80,7 @@
   let flashId = $state<string | null>(null)
   let itemTab = $state<string>('overview')
   let workersTab = $state<string>('list')
-  let projectTab = $state<'overview' | 'setup' | 'memory' | 'accounts'>('overview')
+  let projectTab = $state<'overview' | 'setup' | 'memory' | 'changes' | 'accounts'>('overview')
   /** Projects whose setup terminal is mounted. */
   let setupOpen = $state<string[]>([])
   let newProjectOpen = $state(false)
@@ -105,6 +107,11 @@
   let anonymousFor = $state<Worker | null>(null)
   let createProfileFor = $state<{ worker: Worker; request: AccountRequest | null } | null>(null)
   let selectedProject = $state<string | null>(null)
+  let memoryChanges = $state<ProjectMemoryChanges[]>([])
+  let memoryEditing = $state(false)
+  const pendingMemory = $derived(memoryChanges.filter((p) => p.changes.length || p.error))
+  const pendingMemoryCount = $derived(pendingMemory.reduce((n, p) => n + p.changes.length, 0))
+  const projectChangeCount = $derived(memoryChanges.find((p) => p.project === selectedProject)?.changes.length ?? 0)
   let addDialog = $state<'issue' | 'pull_request' | 'custom' | null>(null)
   let flashTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -341,7 +348,8 @@
   }
 
   /** Shows the project's setup terminal, starting or resuming its session if needed. */
-  function openProjectSetup(name: string) {
+  async function openProjectSetup(name: string) {
+    if (!(await canSwitchProject(name))) return
     view = 'projects'
     selectedProject = name
     projectTab = 'setup'
@@ -413,6 +421,33 @@
   function showView(v: View) {
     view = v
     if (v === 'projects') loadProjects()
+  }
+
+  async function loadMemoryChanges() {
+    try {
+      memoryChanges = await api.memoryChanges()
+    } catch (e) {
+      showError(String(e))
+    }
+  }
+
+  async function canSwitchProject(name: string | null) {
+    if (name === selectedProject || !memoryEditing) return true
+    return ask({ title: 'Discard your unsaved memory edit?', confirmLabel: 'Discard', danger: true })
+  }
+
+  async function selectProject(name: string) {
+    if (await canSwitchProject(name)) selectedProject = name
+  }
+
+  async function viewMemoryChanges() {
+    const target = pendingMemory.some((p) => p.project === selectedProject)
+      ? selectedProject
+      : (pendingMemory[0]?.project ?? selectedProject)
+    if (!(await canSwitchProject(target))) return
+    showView('projects')
+    selectedProject = target
+    projectTab = 'changes'
   }
 
   const allWorkersKey = $derived(workers.map((w) => w.id).join(' '))
@@ -610,6 +645,7 @@
     loadItems()
     loadProjects()
     loadJobs()
+    loadMemoryChanges()
     api.browserTabs().then((tabs) => (browserTabs = tabs), showError)
     const timer = setInterval(refreshIssuesIfDue, DUE_CHECK_MS)
     document.addEventListener('visibilitychange', refreshIssuesIfDue)
@@ -646,6 +682,7 @@
       listen<BrowserTabView[]>('browser-tabs-changed', (e) => {
         browserTabs = e.payload
       }),
+      listen('memory-changes', loadMemoryChanges),
     ]
     return () => {
       clearInterval(timer)
@@ -731,6 +768,22 @@
     </span>
   </header>
 
+  {#if pendingMemory.length}
+    <div class="memory-bar" role="status">
+      <span class="memory-dot"></span>
+      <span class="memory-text"
+        >{#if pendingMemoryCount}<b>{pendingMemoryCount} memory change{pendingMemoryCount === 1 ? '' : 's'}</b> waiting
+          for your approval{:else}<b>Memory changes</b> couldn't be read{/if}
+        <span class="muted"
+          >({pendingMemory
+            .map((p) => (p.error ? `${p.project}: couldn't read changes` : `${p.project} ${p.changes.length}`))
+            .join(', ')})</span
+        ></span
+      >
+      <button class="primary" onclick={viewMemoryChanges}>View</button>
+    </div>
+  {/if}
+
   {#if error}
     <div class="error-bar" role="alert">
       <pre>{error}</pre>
@@ -798,7 +851,7 @@
               <button
                 class="project"
                 class:selected={selectedProject === p.name}
-                onclick={() => (selectedProject = p.name)}
+                onclick={() => selectProject(p.name)}
               >
                 <strong>{p.name}</strong>
                 {#if p.onboarding}<span class="setup-badge" title="Not set up yet">setup</span>{/if}
@@ -845,6 +898,9 @@
           <button class:active={projectTab === 'overview'} onclick={() => (projectTab = 'overview')}>Overview</button>
           <button class:active={projectTab === 'setup'} onclick={() => (projectTab = 'setup')}>Setup</button>
           <button class:active={projectTab === 'memory'} onclick={() => (projectTab = 'memory')}>Memory</button>
+          <button class:active={projectTab === 'changes'} onclick={() => (projectTab = 'changes')}
+            >Changes{projectChangeCount ? ` (${projectChangeCount})` : ''}</button
+          >
           <button class:active={projectTab === 'accounts'} onclick={() => (projectTab = 'accounts')}>Accounts</button>
         {/if}
       </nav>
@@ -988,6 +1044,19 @@
               <MemoryView
                 project={project.name}
                 visible={view === 'projects' && projectTab === 'memory'}
+                onError={showError}
+                onEditingChange={(editing) => (memoryEditing = editing)}
+              />
+            {/key}
+          {/if}
+        </div>
+
+        <div class="overview" class:hidden={view !== 'projects' || projectTab !== 'changes'}>
+          {#if project}
+            {#key project.name}
+              <MemoryChanges
+                project={project.name}
+                visible={view === 'projects' && projectTab === 'changes'}
                 onError={showError}
               />
             {/key}
@@ -1429,6 +1498,27 @@
   .empty {
     padding: 48px;
     text-align: center;
+  }
+  .memory-bar {
+    flex: none;
+    background: var(--info-bg);
+    border-bottom: 1px solid var(--accent);
+    padding: 7px 12px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .memory-dot {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+  .memory-text {
+    flex: 1;
+    min-width: 0;
   }
   .error-bar {
     flex: none;
