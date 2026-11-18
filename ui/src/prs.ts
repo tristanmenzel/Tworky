@@ -27,6 +27,11 @@ export function withoutPr(b: BranchWork): BranchWithoutPr | null {
   return 'waiting'
 }
 
+/** True when there's a PR (open, merged or closed) or a pushed branch waiting for one. */
+export function hasPrContent(work: BranchWork[]): boolean {
+  return work.some((b) => b.pull_requests.length > 0 || (withoutPr(b) === 'waiting' && b.remote))
+}
+
 function prName(b: BranchWork, pr: PrDetail): string {
   return `PR ${b.repo}#${pr.number} "${pr.title}" (branch ${pr.head})`
 }

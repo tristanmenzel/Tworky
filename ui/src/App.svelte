@@ -33,6 +33,7 @@
   import AccountsView from './AccountsView.svelte'
   import LocalWork from './LocalWork.svelte'
   import WorkerToolbar from './WorkerToolbar.svelte'
+  import WorkerSidebar from './WorkerSidebar.svelte'
   import WorkerDot from './WorkerDot.svelte'
   import BrowserTab from './BrowserTab.svelte'
   import HandoverPanel from './HandoverPanel.svelte'
@@ -88,6 +89,7 @@
   let refreshKey = $state(0)
   let issuesRefreshedAt = Date.now()
   let issuesRefreshed = $state(0)
+  let paneWidths = $state<Record<string, number>>({})
   const liveSessionCount = $derived(workers.filter((w) => w.session_alive && !exited[w.id]).length)
   let logs = $state<Record<string, string[]>>({})
   let jobs = $state<Record<string, Job[]>>({})
@@ -1056,8 +1058,27 @@
                 <div class="term-requests">{@render accountRequests(w)}</div>
               {/if}
             {/if}
-            <div class="term-host">
-              <Terminal workerId={id} visible={terminalVisible(id)} generation={generations[id] ?? 0} onError={showError} />
+            <div class="term-row" bind:clientWidth={paneWidths[id]}>
+              <div class="term-host">
+                <Terminal
+                  workerId={id}
+                  visible={terminalVisible(id)}
+                  generation={generations[id] ?? 0}
+                  onError={showError}
+                />
+              </div>
+              {#if w}
+                <WorkerSidebar
+                  worker={w}
+                  {workers}
+                  {exited}
+                  {issuesRefreshed}
+                  visible={terminalVisible(id)}
+                  paneWidth={paneWidths[id] ?? 0}
+                  onOpenWorker={openTerminal}
+                  onError={showError}
+                />
+              {/if}
             </div>
           </div>
         {/each}
@@ -1370,6 +1391,14 @@
     position: relative;
     flex: 1;
     min-height: 0;
+  }
+  .term-row {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+  }
+  .term-row .term-host {
+    min-width: 0;
   }
   .worker-list {
     padding: 16px 24px 32px;
