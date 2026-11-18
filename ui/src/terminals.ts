@@ -16,9 +16,10 @@ export function registerTerminal(id: string, paster: Paster): () => void {
 
 /**
  * Waits up to `timeoutMs` for the terminal to attach and Claude to take input; false if it doesn't.
- * Doesn't submit, and focuses the terminal after pasting.
+ * Doesn't submit. Focuses the terminal after pasting, unless focus has moved since the call (into a dialog, say).
  */
 export async function pasteIntoSession(id: string, text: string, timeoutMs = 2000): Promise<boolean> {
+  const focused = document.activeElement
   const deadline = Date.now() + timeoutMs
   while (!pasters.get(id)?.ready()) {
     if (Date.now() >= deadline) return false
@@ -26,6 +27,6 @@ export async function pasteIntoSession(id: string, text: string, timeoutMs = 200
   }
   const paster = pasters.get(id)!
   paster.paste(text)
-  paster.focus()
+  if (document.activeElement === focused || document.activeElement === document.body) paster.focus()
   return true
 }

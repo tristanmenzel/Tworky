@@ -24,6 +24,7 @@
   type SectionId = (typeof SECTIONS)[number]['id']
 
   const NARROW_PANE = 900
+  const SHOW_RELOAD_MS = 30_000
   const LEFT_WORKING: Activity[] = ['idle', 'uat', 'account']
 
   const workerId = untrack(() => worker.id)
@@ -88,6 +89,10 @@
     void loader.load(subject, fetch)
   }
 
+  function isDue(): boolean {
+    return !loader.loading && (loader.checkedAt === null || Date.now() - loader.checkedAt >= SHOW_RELOAD_MS)
+  }
+
   function requestLoad() {
     if (visible) load(false)
     else stale = true
@@ -102,7 +107,7 @@
   let lastVisible = untrack(() => visible)
   $effect(() => {
     const shown = visible
-    if (shown && (!lastVisible || stale)) untrack(() => load(false))
+    if (shown && (stale || (!lastVisible && untrack(isDue)))) untrack(() => load(false))
     lastVisible = shown
   })
 
