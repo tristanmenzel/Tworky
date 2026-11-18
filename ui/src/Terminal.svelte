@@ -25,6 +25,7 @@
   const paster = {
     paste: (text: string) => term?.paste(text),
     ready: () => !!term?.modes.bracketedPasteMode,
+    focus: () => term?.focus(),
   }
 
   function css(name: string): string {

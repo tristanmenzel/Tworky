@@ -20,9 +20,25 @@
     onRefresh: (fetch: boolean) => void
     onOpenWorker: (worker: Worker) => void
     onError: (message: string) => void
+    /** For the terminal sidebar: no header or empty states, no quiet branches, and a narrow layout. */
+    compact?: boolean
+    /** When set, Ask Claude buttons appear only for this worker. */
+    ownWorker?: string
   }
 
-  let { work, loading, checkedAt, subject, workers, exited, onRefresh, onOpenWorker, onError }: Props = $props()
+  let {
+    work,
+    loading,
+    checkedAt,
+    subject,
+    workers,
+    exited,
+    onRefresh,
+    onOpenWorker,
+    onError,
+    compact = false,
+    ownWorker,
+  }: Props = $props()
 
   let now = $state(Date.now())
   onMount(() => {
@@ -46,7 +62,7 @@
     }),
   )
   const waiting = $derived(withoutPrs.filter((w) => w.state === 'waiting').map((w) => w.b))
-  const quietBranches = $derived(withoutPrs.filter((w) => w.state !== 'waiting'))
+  const quietBranches = $derived(compact ? [] : withoutPrs.filter((w) => w.state !== 'waiting'))
   const finished = $derived(
     (work ?? []).flatMap((b) => b.pull_requests.filter((pr) => pr.state !== 'OPEN').map((pr) => ({ b, pr }))),
   )
@@ -63,7 +79,8 @@
   }
 
   function askTarget(b: BranchWork): Worker | null {
-    return (inProject(b) && b.worker && workerById.get(b.worker)) || null
+    if (!inProject(b) || !b.worker || (ownWorker && b.worker !== ownWorker)) return null
+    return workerById.get(b.worker) ?? null
   }
 
   async function ask(w: Worker, prompt: string) {
@@ -132,31 +149,35 @@
   {/if}
 {/snippet}
 
-<section class="prs">
-  <div class="head">
-    <h2>Pull requests &amp; branches</h2>
-    {#if checkedAt !== null}<span class="muted checked">checked {ago(checkedAt)}</span>{/if}
-    <span class="spacer"></span>
-    <button class="small" disabled={loading} title="Fetch the repos and refresh" onclick={() => onRefresh(true)}
-      >{loading ? 'Loading…' : 'Refresh'}</button
-    >
-  </div>
+<section class="prs" class:compact>
+  {#if !compact}
+    <div class="head">
+      <h2>Pull requests &amp; branches</h2>
+      {#if checkedAt !== null}<span class="muted checked">checked {ago(checkedAt)}</span>{/if}
+      <span class="spacer"></span>
+      <button class="small" disabled={loading} title="Fetch the repos and refresh" onclick={() => onRefresh(true)}
+        >{loading ? 'Loading…' : 'Refresh'}</button
+      >
+    </div>
+  {/if}
 
   {#if work === null}
-    <p class="muted empty-line">Looking for branches and PRs…</p>
+    {#if !compact}<p class="muted empty-line">Looking for branches and PRs…</p>{/if}
   {:else if work.length === 0}
-    <div class="panel empty">
-      <strong>No pull requests or branches yet</strong>
-      <div class="muted">
-        {#if subject.kind === 'issue'}
-          PRs linked to this issue or its subtasks, and branches named after them or checked out in their workers, show up
-          here.
-        {:else}
-          This item's pull request and the branches in its worker's worktrees show up here.
-        {/if}
-        A branch Claude pushes appears as <span class="warn">Waiting for PR</span>.
+    {#if !compact}
+      <div class="panel empty">
+        <strong>No pull requests or branches yet</strong>
+        <div class="muted">
+          {#if subject.kind === 'issue'}
+            PRs linked to this issue or its subtasks, and branches named after them or checked out in their workers,
+            show up here.
+          {:else}
+            This item's pull request and the branches in its worker's worktrees show up here.
+          {/if}
+          A branch Claude pushes appears as <span class="warn">Waiting for PR</span>.
+        </div>
       </div>
-    </div>
+    {/if}
   {:else}
     {#each open as b (b.repo + '/' + b.branch)}
       {@const pr = b.pull_requests[0]}
@@ -463,5 +484,37 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .compact .card {
+    padding: 9px 10px;
+    gap: 6px;
+  }
+  .compact .card.waiting {
+    padding: 8px 10px;
+    gap: 6px 8px;
+  }
+  .compact .top {
+    flex-wrap: nowrap;
+    gap: 8px;
+  }
+  .compact .main {
+    flex: 1 1 0;
+  }
+  .compact .waiting .main {
+    flex-basis: 100%;
+  }
+  .compact .title {
+    font-size: 13px;
+    line-height: 1.3;
+    text-align: left;
+  }
+  .compact .pills .pill {
+    white-space: normal;
+  }
+  .compact summary {
+    padding: 6px 10px;
+  }
+  .compact .folded {
+    padding: 0 10px 8px;
   }
 </style>
