@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte'
-  import { api, type ProjectMemory } from './api'
+  import { api, MEMORY_CHANGED_SINCE_EDITING, type ProjectMemory } from './api'
   import Markdown from './Markdown.svelte'
 
   interface Props {
@@ -14,6 +14,8 @@
   let memories = $state<ProjectMemory[]>([])
   let editing = $state(false)
   let draft = $state('')
+  let base = ''
+  let refused = $state(false)
   let saving = $state(false)
 
   const current = $derived(memories.find((m) => m.project === project))
@@ -32,18 +34,31 @@
 
   function edit() {
     draft = current?.text ?? ''
+    base = current?.hash ?? ''
+    refused = false
     editing = true
+  }
+
+  function cancel() {
+    editing = false
+    refused = false
+  }
+
+  async function reload() {
+    cancel()
+    await load()
   }
 
   async function save() {
     if (!current) return
     saving = true
     try {
-      await api.saveMemory(current.project, draft)
+      await api.saveMemory(current.project, base, draft)
       editing = false
       await load()
     } catch (e) {
-      onError(String(e))
+      if (String(e).includes(MEMORY_CHANGED_SINCE_EDITING)) refused = true
+      else onError(String(e))
     } finally {
       saving = false
     }
@@ -55,7 +70,7 @@
     <h1>Shared memory</h1>
     <span class="spacer"></span>
     {#if editing}
-      <button onclick={() => (editing = false)} disabled={saving}>Cancel</button>
+      <button onclick={cancel} disabled={saving}>Cancel</button>
       <button class="primary" onclick={save} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
     {:else if current}
       <button onclick={load}>Reload</button>
@@ -65,11 +80,20 @@
 
   {#if current}
     <p class="muted small">
-      Every Claude working on {current.project} sees this when its session starts or resumes, and proposes new facts
-      for you to approve. Stored in <code>{current.path}</code>.
+      Every Claude working on {current.project} sees this when its session starts or resumes, and proposes changes
+      for you to approve in the Changes tab. Stored in <code>{current.path}</code>.
       {#if current.text.length > 8192}<span class="warn">Over 8 KB: sessions may see it truncated, so trim it.</span>{/if}
     </p>
     {#if editing}
+      {#if refused}
+        <div class="refused" role="alert">
+          <span
+            >The memory changed since you started editing, probably from a change you approved. Your draft is still
+            below. Copy anything you need, then reload.</span
+          >
+          <button onclick={reload}>Reload</button>
+        </div>
+      {/if}
       <textarea bind:value={draft} spellcheck="false"></textarea>
     {:else}
       <section class="body">
@@ -115,6 +139,21 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px 16px;
+  }
+  .refused {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    border: 1px solid var(--warn);
+    border-radius: 8px;
+    background: var(--panel);
+  }
+  .refused span {
+    flex: 1;
+    min-width: 0;
+    color: var(--warn);
   }
   textarea {
     flex: 1;

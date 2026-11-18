@@ -380,7 +380,40 @@ export interface ProjectMemory {
   project: string
   path: string
   text: string
+  hash: string
 }
+
+export type MemoryChangeKind =
+  | { kind: 'add'; section: string; text: string }
+  | { kind: 'edit'; old: string; new: string }
+  | { kind: 'remove'; text: string }
+
+export type MemoryChange = MemoryChangeKind & { author: string; date: string }
+
+export interface HunkLine {
+  tag: 'ctx' | 'del' | 'add'
+  text: string
+  /** Byte offsets into the UTF-8 encoding of `text`. */
+  changed: { start: number; end: number } | null
+}
+
+export type MemoryPreview =
+  | { status: 'ready'; hunk: { lines: HunkLine[] }; base: string; section: string | null }
+  | { status: 'stale'; reason: string }
+
+export interface PendingMemoryChange {
+  id: string
+  change: MemoryChange
+  preview: MemoryPreview
+}
+
+export interface ProjectMemoryChanges {
+  project: string
+  changes: PendingMemoryChange[]
+}
+
+export const MEMORY_CHANGED_SINCE_SHOWN = 'Memory changed since this diff was shown'
+export const MEMORY_CHANGED_SINCE_EDITING = 'Memory changed since you started editing'
 
 export type UpdateStatus =
   | { kind: 'latest' }
@@ -466,7 +499,11 @@ export const api = {
   linkItem: (name: string, issueUrl: string) => invoke<void>('link_item', { name, issueUrl }),
   removeItem: (name: string) => invoke<void>('remove_item', { name }),
   memories: () => invoke<ProjectMemory[]>('list_memories'),
-  saveMemory: (project: string, text: string) => invoke<void>('save_memory', { project, text }),
+  saveMemory: (project: string, base: string, text: string) => invoke<void>('save_memory', { project, base, text }),
+  memoryChanges: () => invoke<ProjectMemoryChanges[]>('list_memory_changes'),
+  approveMemoryChanges: (project: string, ids: string[], base: string) =>
+    invoke<void>('approve_memory_changes', { project, ids, base }),
+  rejectMemoryChanges: (project: string, ids: string[]) => invoke<void>('reject_memory_changes', { project, ids }),
   existingWork: (subject: WorkSubject, refresh: boolean) =>
     invoke<BranchWork[]>('existing_work', { subject, refresh }),
   deleteBranch: (subject: WorkSubject, repo: string, branch: string) =>
