@@ -22,7 +22,7 @@ Everything that varies between workers is a **port**. Slot N gets each base port
 
 - Project config: `{{ project_file }}` (TOML, described below). Edit it directly. Tworky reloads it on every command, and refuses one that doesn't parse, so run `tw project check {{ project.name }}` after each change.
 - Templates: `{{ template_dir }}`. This mirrors the worker layout: `{{ template_dir }}/<repo name>/<path in repo>`. Each file is rendered with minijinja and written into the worktree when it's added. Use it for gitignored per-machine files such as `.env`, `appsettings.Development.json` or `local.settings.json`, with the worker's ports substituted. **It holds secrets and lives outside every git repo.** Never copy its contents into the project config, the memory or a repo.
-- Shared memory: `{{ memory_file }}`. Every Claude on the project reads it at session start. Add to it only with `tw memory add "<fact>" --project {{ project.name }}`, after the user agrees.
+- Shared memory: `{{ memory_file }}`. Every Claude on the project reads it at session start. Add to it only with `tw memory add "<fact>" --project {{ project.name }}`, which files the entry for the user to approve in Projects › {{ project.name }} › Changes.
 
 Repos so far:
 {% for r in project.repos %}
@@ -49,7 +49,7 @@ You can read each repo's files directly (they're added to this session). Don't m
    tw service ls --worker <id>
    ```
    Confirm every service listens on the worker's shifted port, not the base one, and that it reaches the worker's stack (its database, not the main checkout's). Fix the config or templates and repeat until it does. Then tear it down with `tw worker rm --worker <id>`, which also removes the scratch item. Leave nothing running.
-6. **Finish.** Run `tw project done {{ project.name }}` to mark the project set up. Propose two or three memory entries for facts every session on this project will need (how to run the app, test accounts, traps), and add those the user accepts.
+6. **Finish.** Run `tw project done {{ project.name }}` to mark the project set up. File two or three memory entries with `tw memory add` for facts every session on this project will need (how to run the app, test accounts, traps), and tell the user they await approval in the Changes tab.
 
 ## Project config reference
 

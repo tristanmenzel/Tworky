@@ -69,7 +69,8 @@ pub(crate) fn session_settings(
         "Tworky shared memory for project {project}, kept by every Claude working on it \
          (latest: tw memory show). Propose additions rarely: only a fact that cost real time, applies to \
          most {project} work, cannot be found quickly in the repo, and is not better fixed in the repo or \
-         reported as a Tworky problem."
+         reported as a Tworky problem. When an entry proves wrong or outdated, file a fix with tw memory \
+         edit or remove; don't reword correct entries. Changes apply once the user approves them in Tworky."
     ));
     let mut hooks = vec![serde_json::json!({
         "type": "command",
@@ -1262,10 +1263,17 @@ pub fn worker_claude_md(
              Tworky note at session start explains.\n  \
                - A repo quirk goes in that repo's CLAUDE.md, `.gitignore` or config, as part of your PR.\n  \
                - Anything about this one issue stays in your summary.\n\
-             - When a fact does pass, propose it to the user in one or two lines: what to do, and what goes \
-             wrong otherwise. Only after the user agrees, save it with `tw memory add \"<fact>\"` (add \
-             `--section <name>` to file it under a heading other than Learned).\n\
-             - The memory file is `{2}`. Don't edit it directly; use `tw memory add`.\n",
+             - When a fact does pass, file it with `tw memory add \"<fact>\"`, saying what to do and what goes \
+             wrong otherwise (add `--section <name>` to file it under a heading other than Learned). Tell the \
+             user in one line that it awaits their approval in Tworky.\n\
+             - When an entry turned out wrong, outdated or misleading in this session, file a fix with \
+             `tw memory edit --old '<text>' --new '<text>'` or `tw memory remove '<text>'`, and say so in one \
+             line.\n  \
+               - Give `--old` a distinctive part of the entry, in single quotes, avoiding quotes, backticks \
+             and `$`.\n  \
+               - Send new text that holds quotes, backticks or `$` through `--new-file -` on stdin.\n  \
+               - Don't merge or reword entries that are still correct.\n\
+             - The memory file is `{2}`. Don't edit it directly; use `tw memory`.\n",
             project.name,
             w.compose_project,
             memory.display()
@@ -2022,6 +2030,9 @@ start_url = "http://localhost:5173/home"
         assert!(md.contains(
             "\n  - A bug or friction in Tworky or `tw` itself goes to the user first, then `tw issue`"
         ));
+        assert!(md.contains("awaits their approval in Tworky"));
+        assert!(md.contains("`tw memory edit --old"));
+        assert!(!md.contains("Only after the user agrees"));
         assert!(md.contains(&memory.display().to_string()));
         assert!(md.contains(&format!("except with `-p {}`", w.compose_project)));
         assert!(md.contains("Story #318: Header layout"));

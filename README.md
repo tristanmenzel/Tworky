@@ -9,7 +9,7 @@ You keep a work list of GitHub issues, pull requests and custom tasks. **Begin s
 - check out the repos it needs as git worktrees on the work's branch, with config files such as `.env` pointing at the worker's ports
 - start the worker's own database and other backing services, and run dependency installs and migrations
 - run the project's dev servers and tests on the worker's ports
-- open and comment on PRs, add subtasks, and add facts to the project's shared memory with your approval
+- open and comment on PRs, add subtasks, and propose additions and corrections to the project's shared memory, each applied once you approve it in Tworky
 
 Because every worker has shifted ports and its own compose project, any number of them can run side by side with the main checkout. The app shows each session's state (working, waiting for you, idle, ready for testing), the worker's worktrees, services and containers, and the branches and PRs for the work. On Windows, browser tabs signed in as the project's test accounts open beside the terminal, and Claude can drive them to test its change and hand it over to you. **Clean up** stops everything and removes the worktrees, branches and folder once the PRs are merged.
 
@@ -84,7 +84,7 @@ You can also make a project directly with **+** under **Projects**, or write the
 3. Follow progress from the item's **Overview**: local work (worktrees, services, containers) on one side, branches and PRs on the other. A dot on each item shows whether its session is working, waiting for you or idle.
 4. When the PRs are merged, choose **Clean up** from the **Clean up** menu, or **Clean up and remove item** to also take the item off the work list.
 
-Each project has shared **memory** (Projects › Memory): facts every session on the project reads when it starts, such as how to run the app or a known trap. Sessions propose additions and add them only after you agree.
+Each project has shared **memory** (Projects › Memory): facts every session on the project reads when it starts, such as how to run the app or a known trap. Sessions propose additions and corrections, and you approve or reject each one in Projects › Changes, where it shows as a diff. A banner shows when changes are waiting.
 
 ## Configuration
 
