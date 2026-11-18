@@ -1188,6 +1188,11 @@ fn memory_file_stamps(paths: &Paths) -> BTreeMap<String, (Option<std::time::Syst
 }
 
 #[tauri::command]
+fn windows_build() -> Option<u32> {
+    pty::windows_build()
+}
+
+#[tauri::command]
 fn resize_session(state: State<'_, AppState>, id: String, cols: u16, rows: u16) -> CmdResult<()> {
     state
         .sessions
@@ -1436,6 +1441,7 @@ fn main() {
             open_session,
             write_session,
             resize_session,
+            windows_build,
             stop_session,
             new_conversation,
             open_worker_dir,

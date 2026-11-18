@@ -1,3 +1,9 @@
+<script lang="ts" module>
+  import { api as moduleApi } from './api'
+
+  const windowsBuild = moduleApi.windowsBuild().catch(() => null)
+</script>
+
 <script lang="ts">
   import { onMount } from 'svelte'
   import { Channel } from '@tauri-apps/api/core'
@@ -109,6 +115,9 @@
     if (!term) return
     unregister?.()
     unregister = undefined
+    const build = await windowsBuild
+    if (!term) return
+    if (build) term.options.windowsPty = { backend: 'conpty', buildNumber: build }
     term.reset()
     const channel = new Channel<string>()
     channel.onmessage = (data) => term?.write(data)

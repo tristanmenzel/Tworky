@@ -530,6 +530,7 @@ export const api = {
     invoke<void>('open_session', { id, cols, rows, onOutput }),
   write: (id: string, data: string) => invoke<void>('write_session', { id, data }),
   resize: (id: string, cols: number, rows: number) => invoke<void>('resize_session', { id, cols, rows }),
+  windowsBuild: () => invoke<number | null>('windows_build'),
   stop: (id: string) => invoke<void>('stop_session', { id }),
   newConversation: (id: string) => invoke<void>('new_conversation', { id }),
   openDir: (id: string, repo?: string) => invoke<void>('open_worker_dir', { id, repo }),
