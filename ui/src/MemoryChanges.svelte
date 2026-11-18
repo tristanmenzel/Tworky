@@ -157,7 +157,7 @@
   {:else if !changes}
     <p class="muted">Loading…</p>
   {:else if !changes.length}
-    <p class="muted empty">No changes waiting. When a session proposes one, it shows up here.</p>
+    <p class="muted empty">No changes waiting.</p>
   {:else}
     <div class="actionbar">
       <label class="selall">

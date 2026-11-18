@@ -110,8 +110,6 @@ pub fn hash(text: &str) -> String {
     format!("{h:016x}")
 }
 
-/// Files a change for the user to approve, after checking it applies to the current memory.
-/// Returns the change's id.
 pub fn propose(paths: &Paths, project: &str, kind: ChangeKind, author: &str) -> Result<String> {
     let change = Change {
         kind,
@@ -241,7 +239,6 @@ pub fn approve(paths: &Paths, project: &str, ids: &[String], base: &str) -> Resu
     )
 }
 
-/// Deletes the selected change files, skipping any already gone.
 pub fn reject(paths: &Paths, project: &str, ids: &[String]) -> Result<()> {
     let dir = paths.memory_changes_dir(project);
     let files = ids
@@ -260,7 +257,6 @@ pub fn reject(paths: &Paths, project: &str, ids: &[String]) -> Result<()> {
     })
 }
 
-/// Replaces the memory, unless it changed since `base` was taken.
 pub fn save(path: &Path, base: &str, text: &str) -> Result<()> {
     locked(path, |current| {
         if hash(current) != base {
@@ -291,7 +287,6 @@ pub fn apply(current: &str, change: &Change) -> Result<String> {
     }
 }
 
-/// Applies the change and returns the one region it touches, with context.
 pub fn preview(current: &str, change: &Change) -> Result<Preview> {
     let next = apply(current, change)?;
     let section = match &change.kind {
@@ -417,7 +412,6 @@ fn one_line(text: &str) -> String {
     text.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
-/// Lines with their endings, so joining them gives back the exact text.
 fn split_lines(text: &str) -> Vec<&str> {
     text.split_inclusive('\n').collect()
 }
@@ -684,7 +678,6 @@ fn hunk(before: &str, after: &str) -> Hunk {
     Hunk { lines }
 }
 
-/// The middle of `line` left once the prefix and suffix it shares with `other` are cut.
 fn changed_span(line: &str, other: &str) -> Option<Span> {
     if line == other {
         return None;

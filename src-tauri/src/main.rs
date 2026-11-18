@@ -1151,7 +1151,6 @@ fn watch_activity(app: AppHandle) {
     }
 }
 
-/// The `<project>/<id>.json` names of every pending memory change, without reading them.
 fn memory_change_names(paths: &Paths) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let Ok(projects) = std::fs::read_dir(paths.data_dir.join("memory-changes")) else {
