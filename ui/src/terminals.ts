@@ -1,17 +1,22 @@
-interface Paster {
+interface TerminalHandle {
   paste: (text: string) => void
   /** True once the program in the terminal reads input, which Claude Code signals by enabling bracketed paste. */
   ready: () => boolean
   focus: () => void
+  redraw: () => void
 }
 
-const pasters = new Map<string, Paster>()
+const handles = new Map<string, TerminalHandle>()
 
-export function registerTerminal(id: string, paster: Paster): () => void {
-  pasters.set(id, paster)
+export function registerTerminal(id: string, handle: TerminalHandle): () => void {
+  handles.set(id, handle)
   return () => {
-    if (pasters.get(id) === paster) pasters.delete(id)
+    if (handles.get(id) === handle) handles.delete(id)
   }
+}
+
+export function redrawTerminal(id: string) {
+  handles.get(id)?.redraw()
 }
 
 /**
@@ -21,12 +26,12 @@ export function registerTerminal(id: string, paster: Paster): () => void {
 export async function pasteIntoSession(id: string, text: string, timeoutMs = 2000): Promise<boolean> {
   const focused = document.activeElement
   const deadline = Date.now() + timeoutMs
-  while (!pasters.get(id)?.ready()) {
+  while (!handles.get(id)?.ready()) {
     if (Date.now() >= deadline) return false
     await new Promise((resolve) => setTimeout(resolve, 50))
   }
-  const paster = pasters.get(id)!
-  paster.paste(text)
-  if (document.activeElement === focused || document.activeElement === document.body) paster.focus()
+  const handle = handles.get(id)!
+  handle.paste(text)
+  if (document.activeElement === focused || document.activeElement === document.body) handle.focus()
   return true
 }

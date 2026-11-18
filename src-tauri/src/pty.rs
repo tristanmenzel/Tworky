@@ -382,9 +382,48 @@ fn trim_front(s: &mut String, limit: usize) {
     s.drain(..cut);
 }
 
+/// The Windows build the pty runs on, which tells xterm.js how ConPTY behaves on resize. None elsewhere.
+#[cfg(windows)]
+pub fn windows_build() -> Option<u32> {
+    use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+    use windows::core::w;
+
+    let mut buf = [0u16; 32];
+    let mut len = std::mem::size_of_val(&buf) as u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"),
+            w!("CurrentBuildNumber"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut len),
+        )
+    }
+    .ok()
+    .ok()?;
+    let chars = &buf[..(len as usize / 2)];
+    String::from_utf16_lossy(chars)
+        .trim_end_matches(char::from(0))
+        .parse()
+        .ok()
+}
+
+#[cfg(not(windows))]
+pub fn windows_build() -> Option<u32> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_the_windows_build() {
+        assert!(windows_build().is_some_and(|b| b >= 10240));
+    }
 
     #[test]
     fn the_tick_board_follows_only_the_current_generation() {

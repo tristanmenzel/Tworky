@@ -1,3 +1,9 @@
+<script lang="ts" module>
+  import { api as moduleApi } from './api'
+
+  const windowsBuild = moduleApi.windowsBuild().catch(() => null)
+</script>
+
 <script lang="ts">
   import { onMount } from 'svelte'
   import { Channel } from '@tauri-apps/api/core'
@@ -22,10 +28,11 @@
   let fit: FitAddon | undefined
   let unregister: (() => void) | undefined
 
-  const paster = {
+  const handle = {
     paste: (text: string) => term?.paste(text),
     ready: () => !!term?.modes.bracketedPasteMode,
     focus: () => term?.focus(),
+    redraw,
   }
 
   function css(name: string): string {
@@ -38,6 +45,21 @@
     api.resize(workerId, term.cols, term.rows).catch(() => {})
   }
 
+  /**
+   * ConPTY sends only the cells that changed in its own buffer, so once xterm's screen drifts from it, the program
+   * repainting doesn't help. Changing the pty's size makes ConPTY repaint the whole screen, and Claude Code redraw.
+   */
+  function redraw() {
+    if (!term) return
+    const { cols, rows } = term
+    term.refresh(0, rows - 1)
+    api
+      .resize(workerId, Math.max(cols - 1, 1), rows)
+      .then(() => api.resize(workerId, cols, rows))
+      .catch(() => {})
+    term.focus()
+  }
+
   const isMac = navigator.userAgent.includes('Mac')
   const isWindows = navigator.userAgent.includes('Windows')
 
@@ -47,6 +69,13 @@
    * Shift+Enter sends Ctrl+J, which Claude Code reads as a newline in every terminal.
    */
   function customKeys(e: KeyboardEvent): boolean {
+    if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === 'KeyL') {
+      if (e.type === 'keydown') {
+        e.preventDefault()
+        redraw()
+      }
+      return false
+    }
     if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing) {
       if (e.type === 'keydown') {
         e.preventDefault()
@@ -86,13 +115,16 @@
     if (!term) return
     unregister?.()
     unregister = undefined
+    const build = await windowsBuild
+    if (!term) return
+    if (build) term.options.windowsPty = { backend: 'conpty', buildNumber: build }
     term.reset()
     const channel = new Channel<string>()
     channel.onmessage = (data) => term?.write(data)
     try {
       fit?.fit()
       await api.openSession(workerId, term.cols, term.rows, channel)
-      if (term) unregister = registerTerminal(workerId, paster)
+      if (term) unregister = registerTerminal(workerId, handle)
     } catch (e) {
       onError(String(e))
     }
