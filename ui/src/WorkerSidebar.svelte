@@ -46,7 +46,7 @@
   }
 
   let collapsed = $state(readFlag(collapsedKey) ?? false)
-  const hadContent = readFlag(hadContentKey) ?? false
+  let hadContent = $state(readFlag(hadContentKey) ?? false)
   let openedWhileNarrow = $state(false)
   let section = $state<SectionId>('prs')
   let loadError = $state<string | null>(null)
@@ -99,8 +99,11 @@
     untrack(requestLoad)
   })
 
+  let lastVisible = untrack(() => visible)
   $effect(() => {
-    if (visible && stale) untrack(() => load(false))
+    const shown = visible
+    if (shown && (!lastVisible || stale)) untrack(() => load(false))
+    lastVisible = shown
   })
 
   let lastActivity = untrack(() => worker.activity)
@@ -111,7 +114,10 @@
   })
 
   $effect(() => {
-    if (loader.work) writeFlag(hadContentKey, hasPrContent(loader.work))
+    if (!loader.work) return
+    const has = hasPrContent(loader.work)
+    hadContent = has
+    writeFlag(hadContentKey, has)
   })
 
   $effect(() => {
