@@ -49,7 +49,7 @@ You can read each repo's files directly (they're added to this session). Don't m
    tw service ls --worker <id>
    ```
    Confirm every service listens on the worker's shifted port, not the base one, and that it reaches the worker's stack (its database, not the main checkout's). Fix the config or templates and repeat until it does. Then tear it down with `tw worker rm --worker <id>`, which also removes the scratch item. Leave nothing running.
-6. **Finish.** Run `tw project done {{ project.name }}` to mark the project set up. File two or three memory entries with `tw memory add` for facts every session on this project will need (how to run the app, test accounts, traps), and tell the user they await approval in the Changes tab.
+6. **Finish.** Run `tw project done {{ project.name }}` to mark the project set up. File two or three memory entries with `tw memory add "<fact>"` for facts every session on this project will need (how to run the app, test accounts, traps), and tell the user they await approval in the Changes tab.
 
 ## Project config reference
 

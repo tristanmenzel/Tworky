@@ -217,8 +217,9 @@ enum AccountsCommand {
 #[derive(Subcommand)]
 enum MemoryCommand {
     Show(ProjectArg),
-    /// Append a fact, attributed to this worker and dated
+    /// Propose a fact, attributed to this session and dated. It lands once approved in Tworky.
     Add {
+        #[arg(allow_hyphen_values = true)]
         text: String,
         /// Heading to file it under
         #[arg(long, short, default_value = tworky_core::memory::DEFAULT_SECTION)]
@@ -226,6 +227,32 @@ enum MemoryCommand {
         #[command(flatten)]
         project: ProjectArg,
     },
+    /// Propose replacing text that occurs exactly once. An edited entry is restamped.
+    /// It lands once approved in Tworky.
+    #[command(group = clap::ArgGroup::new("replacement").required(true).args(["new", "new_file"]))]
+    Edit {
+        /// Text to replace; must occur exactly once in the memory
+        #[arg(long, allow_hyphen_values = true)]
+        old: String,
+        /// Replacement text
+        #[arg(long, allow_hyphen_values = true)]
+        new: Option<String>,
+        /// Read the replacement from a file, or from stdin with `-`
+        #[arg(long)]
+        new_file: Option<String>,
+        #[command(flatten)]
+        project: ProjectArg,
+    },
+    /// Propose deleting the line holding this text, which must occur exactly once.
+    /// It lands once approved in Tworky.
+    Remove {
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+        #[command(flatten)]
+        project: ProjectArg,
+    },
+    /// List the changes waiting for approval in Tworky
+    Changes(ProjectArg),
     Path(ProjectArg),
 }
 
@@ -730,16 +757,43 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
             text,
             section,
             project,
+        } => propose(&ws, &project, memory::ChangeKind::Add { section, text })?,
+        MemoryCommand::Edit {
+            old,
+            new,
+            new_file,
+            project,
         } => {
-            let name = project_name(&ws, &project)?;
-            let author = project.worker.as_deref().unwrap_or("you");
-            let id = memory::propose(
-                &ws.config.paths,
-                &name,
-                memory::ChangeKind::Add { section, text },
-                author,
-            )?;
-            println!("proposed add {id} for {name}");
+            let new = match (new, new_file) {
+                (Some(new), _) => new,
+                (None, Some(path)) => read_text_file(&path)?,
+                (None, None) => unreachable!("clap requires --new or --new-file"),
+            };
+            propose(&ws, &project, memory::ChangeKind::Edit { old, new })?
+        }
+        MemoryCommand::Remove { text, project } => {
+            propose(&ws, &project, memory::ChangeKind::Remove { text })?
+        }
+        MemoryCommand::Changes(arg) => {
+            let name = project_name(&ws, &arg)?;
+            let changes = memory::pending(&ws.config.paths, &name)?;
+            if changes.is_empty() {
+                eprintln!("no pending changes for {name}");
+            }
+            for c in changes {
+                let text = match &c.change.kind {
+                    memory::ChangeKind::Add { text, .. } | memory::ChangeKind::Remove { text } => {
+                        text
+                    }
+                    memory::ChangeKind::Edit { new, .. } => new,
+                };
+                let first = text.lines().next().unwrap_or("");
+                let kind = kind_name(&c.change.kind);
+                println!("{}  {kind:<6}  {}  {first}", c.id, c.change.author);
+                if let memory::PreviewResult::Stale { reason } = &c.preview {
+                    println!("    stale: {reason}");
+                }
+            }
         }
         MemoryCommand::Path(arg) => {
             println!(
@@ -754,20 +808,45 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
     Ok(())
 }
 
+fn kind_name(kind: &tworky_core::memory::ChangeKind) -> &'static str {
+    use tworky_core::memory::ChangeKind;
+    match kind {
+        ChangeKind::Add { .. } => "add",
+        ChangeKind::Edit { .. } => "edit",
+        ChangeKind::Remove { .. } => "remove",
+    }
+}
+
+fn propose(ws: &Workspace, arg: &ProjectArg, kind: tworky_core::memory::ChangeKind) -> Result<()> {
+    let name = project_name(ws, arg)?;
+    let author = match &arg.worker {
+        Some(worker) => worker.clone(),
+        None if std::env::var_os("TW_SETUP_SESSION").is_some() => format!("setup@{name}"),
+        None => "you".to_string(),
+    };
+    let kind_name = kind_name(&kind);
+    let id = tworky_core::memory::propose(&ws.config.paths, &name, kind, &author)?;
+    println!(
+        "proposed {kind_name} {id} for {name}; it applies once approved in Tworky (Projects › {name} › Changes)"
+    );
+    Ok(())
+}
+
 fn read_body(args: &BodyArgs) -> Result<String> {
     match (&args.body, args.body_file.as_deref()) {
         (Some(body), _) => Ok(body.clone()),
-        (None, Some("-")) => {
-            let mut text = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
-                .context("reading body from stdin")?;
-            Ok(text)
-        }
-        (None, Some(path)) => {
-            std::fs::read_to_string(path).with_context(|| format!("reading {path}"))
-        }
+        (None, Some(path)) => read_text_file(path),
         (None, None) => Ok(String::new()),
     }
+}
+
+fn read_text_file(path: &str) -> Result<String> {
+    if path == "-" {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).context("reading stdin")?;
+        return Ok(text);
+    }
+    std::fs::read_to_string(path).with_context(|| format!("reading {path}"))
 }
 
 fn issue(cmd: IssueCommand) -> Result<()> {
