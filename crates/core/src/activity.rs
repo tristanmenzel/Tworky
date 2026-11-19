@@ -42,7 +42,6 @@ pub struct Handover {
     pub tabs: Vec<u64>,
 }
 
-/// Which Graft skill the session last ran, recorded by `tw session-phase --from-hook`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -60,7 +59,6 @@ fn skill_phase(skill: &str) -> Option<Phase> {
     }
 }
 
-/// The phase a Claude Code hook's input implies, if any.
 pub fn phase_from_hook(input: &serde_json::Value) -> Option<Phase> {
     let text = |pointer: &str| input.pointer(pointer).and_then(serde_json::Value::as_str);
     match text("/hook_event_name")? {

@@ -482,7 +482,6 @@ pub fn verdict(b: &BranchWork) -> Option<Verdict> {
     b.pull_requests.first().and_then(pr_verdict)
 }
 
-/// `None` unless the PR is open.
 pub fn pr_verdict(pr: &PrDetail) -> Option<Verdict> {
     if !pr.is_open() {
         return None;

@@ -203,7 +203,6 @@ export const STAGE_INFO: Record<CardStage, { label: string; step: number; tone: 
 
 export const STAGE_STEPS = 7
 
-/** The least advanced stage of the card's workers; `needs_attention` beats everything. */
 export function cardStage(workers: Worker[], stages: Record<string, WorkerStage>): CardStage | null {
   let least: CardStage | null = null
   for (const w of workers) {

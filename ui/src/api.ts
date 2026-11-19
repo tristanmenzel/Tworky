@@ -55,7 +55,6 @@ export type WorkerStatus = 'creating' | 'ready' | 'failed' | 'cleaning'
  */
 export type Activity = 'working' | 'idle' | 'waiting' | 'uat' | 'account'
 
-/** The Graft skill a worker's session last ran, recorded by its hooks. Kept after the session ends. */
 export type Phase = 'researching' | 'planning' | 'building'
 
 export interface Handover {
