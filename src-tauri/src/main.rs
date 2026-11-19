@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tworky_core::activity::{self, AccountRequest, Activity, Handover, Session};
+use tworky_core::activity::{self, AccountRequest, Activity, Handover, Phase, Session};
 use tworky_core::config::Paths;
 use tworky_core::existing::WorkSubject;
 use tworky_core::github;
@@ -146,6 +146,7 @@ struct WorkerView {
     activity: Option<Activity>,
     handover: Option<Handover>,
     account_requests: Vec<AccountRequest>,
+    phase: Option<Phase>,
 }
 
 #[derive(Clone, Serialize)]
@@ -244,6 +245,11 @@ async fn delete_branch(
         .map_err(err)
     })
     .await
+}
+
+#[tauri::command]
+async fn worker_stages() -> CmdResult<BTreeMap<String, tworky_core::stage::WorkerStage>> {
+    blocking(|| tworky_core::stage::worker_stages(&workspace()?).map_err(err)).await
 }
 
 #[tauri::command]
@@ -444,6 +450,7 @@ async fn list_workers(app: AppHandle) -> CmdResult<Vec<WorkerView>> {
                     account_requests: session
                         .map(|s| s.account_requests.clone())
                         .unwrap_or_default(),
+                    phase: session.and_then(|s| s.phase),
                     session_alive,
                     busy: busy.contains(&record.id),
                     record,
@@ -999,6 +1006,7 @@ struct ActivityEvent {
     activity: Option<Activity>,
     handover: Option<Handover>,
     account_requests: Vec<AccountRequest>,
+    phase: Option<Phase>,
 }
 
 #[tauri::command]
@@ -1142,6 +1150,7 @@ fn watch_activity(app: AppHandle) {
                     activity: is.map(|s| s.activity),
                     handover: is.and_then(|s| s.handover.clone()),
                     account_requests: is.map(|s| s.account_requests.clone()).unwrap_or_default(),
+                    phase: is.and_then(|s| s.phase),
                 },
             );
             let generation = |live: &HashMap<String, pty::Live>| live.get(id).map(|l| l.generation);
@@ -1448,6 +1457,7 @@ fn main() {
             remove_item,
             existing_work,
             delete_branch,
+            worker_stages,
             list_workers,
             worker_log,
             list_jobs,

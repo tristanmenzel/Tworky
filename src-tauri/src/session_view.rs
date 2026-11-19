@@ -1,6 +1,6 @@
 //! How `watch_activity` shows a session's activity record, and when a change flashes the taskbar.
 
-use tworky_core::activity::{AccountRequest, Activity, Handover, Session};
+use tworky_core::activity::{AccountRequest, Activity, Handover, Phase, Session};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flash {
@@ -21,8 +21,20 @@ pub fn settle(session: &mut Session, live: bool, stale: bool) -> bool {
 }
 
 /// What the UI is sent, which a beat alone doesn't change.
-pub fn shown(s: &Session) -> (Activity, Option<&Handover>, &[AccountRequest]) {
-    (s.activity, s.handover.as_ref(), &s.account_requests)
+pub fn shown(
+    s: &Session,
+) -> (
+    Activity,
+    Option<&Handover>,
+    &[AccountRequest],
+    Option<Phase>,
+) {
+    (
+        s.activity,
+        s.handover.as_ref(),
+        &s.account_requests,
+        s.phase,
+    )
 }
 
 /// A launch resets a stale record just before its spawn, so only a change seen across two polls of
@@ -57,6 +69,7 @@ mod tests {
             recorded,
             background,
             beat: 0,
+            phase: None,
         }
     }
 

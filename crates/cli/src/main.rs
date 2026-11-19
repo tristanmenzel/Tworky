@@ -79,6 +79,15 @@ enum Command {
         #[arg(long)]
         session_start: bool,
     },
+    /// Record the Graft phase (researching, planning or building) a hook's input implies. Run by
+    /// session hooks.
+    SessionPhase {
+        /// Read the hook's JSON input from stdin. Input that implies no phase changes nothing.
+        #[arg(long)]
+        from_hook: bool,
+        #[arg(long = "worker", short = 'w', env = "TW_WORKER_ID")]
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -445,6 +454,19 @@ fn main() -> Result<()> {
             };
             let change = session_change(activity, flags, hook_input().as_ref());
             apply_session_change(&Paths::resolve()?, &id, change)
+        }
+        Command::SessionPhase { from_hook, id } => {
+            anyhow::ensure!(from_hook, "pass --from-hook with the hook's input on stdin");
+            let Ok(input) = std::io::read_to_string(std::io::stdin()) else {
+                return Ok(());
+            };
+            let Ok(input) = serde_json::from_str(&input) else {
+                return Ok(());
+            };
+            match tworky_core::activity::phase_from_hook(&input) {
+                Some(phase) => tworky_core::activity::set_phase(&Paths::resolve()?, &id, phase),
+                None => Ok(()),
+            }
         }
         Command::Worker(cmd) => worker(cmd),
         Command::Worktree(cmd) => worktree(cmd),

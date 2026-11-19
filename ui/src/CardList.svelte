@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Activity, Card, Issue, Item, Worker } from './api'
-  import { boardStatusName, boardTone, cardComplete, shownBoards, typeClass } from './issue'
+  import { cardComplete, STAGE_INFO, STAGE_STEPS, typeClass, type CardStage } from './issue'
   import WorkerDot from './WorkerDot.svelte'
 
   interface Props {
@@ -12,6 +12,7 @@
     workers: Map<string, Worker>
     itemWorkers: Map<string, Worker>
     activityByCard: Map<string, Activity>
+    stageByCard: Map<string, CardStage>
     selectedId: string | null
     flashId: string | null
     onSelect: (id: string) => void
@@ -26,6 +27,7 @@
     workers,
     itemWorkers,
     activityByCard,
+    stageByCard,
     selectedId,
     flashId,
     onSelect,
@@ -36,16 +38,18 @@
   }
 
   const statusBoard = (i: Issue) => statusBoards[projects[i.id]]
-
-  function statuses(i: Issue): string[] {
-    return shownBoards(i, statusBoard(i)).flatMap((b) => boardStatusName(b) ?? [])
-  }
 </script>
 
-{#snippet status(i: Issue)}
-  {#each statuses(i) as name, n (n)}
-    <span class="board {boardTone(name)}">{name}</span>
-  {/each}
+{#snippet stage(s: CardStage)}
+  {@const info = STAGE_INFO[s]}
+  <span class="stage tone-{info.tone}" title="Stage {info.step} of {STAGE_STEPS}: {info.label}">
+    <span class="track" aria-hidden="true">
+      {#each { length: STAGE_STEPS } as _, n (n)}
+        <span class="step" class:filled={n < info.step}></span>
+      {/each}
+    </span>
+    {info.label}
+  </span>
 {/snippet}
 
 {#snippet attention(activity: Activity | null)}
@@ -68,6 +72,7 @@
     {#each items as item (item.name)}
       {@const iw = itemWorkers.get(item.name)}
       {@const activity = activityByCard.get(`item:${item.name}`) ?? null}
+      {@const itemStage = stageByCard.get(`item:${item.name}`)}
       <li>
         <button
           class="card {activity ?? ''}"
@@ -86,8 +91,11 @@
             {/if}
           </div>
           <div class="title">{item.title}</div>
-          {#if iw || activity}
+          {#if itemStage || iw || activity}
             <div class="foot">
+              <span class="meta">
+                {#if itemStage}{@render stage(itemStage)}{/if}
+              </span>
               {@render attention(activity)}
               <WorkerDot worker={iw} {activity} title={iw?.id} />
             </div>
@@ -101,6 +109,7 @@
     {@const rootWorker = workers.get(card.id)}
     {@const complete = cardComplete(card, issues, statusBoard)}
     {@const activity = activityByCard.get(card.id) ?? null}
+    {@const cardStage = stageByCard.get(card.id)}
     {#if root}
       {#if i === 0 || repoName(cards[i - 1].id) !== root.repo}
         <li class="group muted">{root.repo}</li>
@@ -120,13 +129,13 @@
             <span class="num">#{root.number}</span>
           </div>
           <div class="title">{root.title}</div>
-          {#if complete || statuses(root).length || rootWorker || activity}
+          {#if complete || cardStage || rootWorker || activity}
             <div class="foot">
               <span class="meta">
                 {#if complete}
                   <span class="board done">✓ Done</span>
-                {:else}
-                  {@render status(root)}
+                {:else if cardStage}
+                  {@render stage(cardStage)}
                 {/if}
               </span>
               {@render attention(activity)}
@@ -272,9 +281,6 @@
     white-space: nowrap;
     min-width: 0;
   }
-  .meta .board + .board {
-    margin-left: 4px;
-  }
   .num {
     flex: none;
     font-family: var(--mono);
@@ -292,10 +298,46 @@
     color: var(--muted);
     white-space: nowrap;
   }
-  .board.doing {
-    color: var(--warn);
-  }
   .board.done {
     color: var(--ok);
+  }
+  .stage {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--stage);
+    --stage: var(--muted);
+  }
+  .track {
+    display: inline-flex;
+    gap: 2px;
+  }
+  .step {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    box-sizing: border-box;
+    border: 1px solid var(--border);
+  }
+  .step.filled {
+    background: var(--stage);
+    border-color: var(--stage);
+  }
+  .tone-epic {
+    --stage: var(--epic);
+  }
+  .tone-accent {
+    --stage: var(--accent);
+  }
+  .tone-warn {
+    --stage: var(--warn);
+  }
+  .tone-bad {
+    --stage: var(--bad);
+  }
+  .tone-ok {
+    --stage: var(--ok);
   }
 </style>

@@ -241,6 +241,7 @@ mod tests {
             recorded,
             background,
             beat: 0,
+            phase: None,
         }
     }
 

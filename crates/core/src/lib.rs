@@ -20,6 +20,7 @@ pub mod pulls;
 pub mod services;
 pub mod settings;
 pub mod stack;
+pub mod stage;
 pub mod state;
 pub mod template;
 pub mod update;
