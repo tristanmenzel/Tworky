@@ -62,14 +62,32 @@ pub struct BackgroundTask {
 /// Shells and monitors are left out because dev servers and watchers run indefinitely.
 const COUNTED_KINDS: [&str; 3] = ["subagent", "workflow", "teammate"];
 
-/// The running tasks of the counted kinds in a Stop or StopFailure hook's input, or `None` when it
-/// has no `background_tasks` list. Entries of another kind or status are skipped.
+const TERMINAL_STATUSES: [&str; 6] = [
+    "completed",
+    "failed",
+    "killed",
+    "stopped",
+    "cancelled",
+    "canceled",
+];
+
+fn in_flight(task: &serde_json::Value) -> bool {
+    task["status"].as_str().is_none_or(|status| {
+        !TERMINAL_STATUSES
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(status))
+    })
+}
+
+/// The in-flight tasks of the counted kinds in a Stop or StopFailure hook's input, or `None` when it
+/// has no `background_tasks` list. The hooks docs list no status values, so any status but a known
+/// terminal one counts, as does a missing one. Entries of another kind are skipped.
 pub fn background_from_hook(input: &serde_json::Value) -> Option<Vec<BackgroundTask>> {
     let tasks = input.get("background_tasks")?.as_array()?;
     Some(
         tasks
             .iter()
-            .filter(|t| t["status"] == "running")
+            .filter(|t| in_flight(t))
             .filter_map(|t| {
                 let kind = t["type"].as_str()?;
                 COUNTED_KINDS.contains(&kind).then(|| BackgroundTask {
@@ -215,12 +233,18 @@ pub fn new_conversation(paths: &Paths, worker: &str) -> Result<()> {
     })
 }
 
-/// Rewrites the record unchanged, so it reads as fresh. Makes no record when there is none.
+/// A subagent finished a tool call. Rewrites the record so it reads as fresh, and ends a `Waiting`,
+/// since the call proves its dialog was answered (by mouse, which doesn't count as typing).
+/// `Idle` and `Working` stay as they are. Makes no record when there is none.
 pub fn touch(paths: &Paths, worker: &str) -> Result<()> {
     if read(paths, worker).is_none() {
         return Ok(());
     }
-    update(paths, worker, |_| {})
+    update(paths, worker, |r| {
+        if r.activity == Activity::Waiting {
+            r.activity = Activity::Working;
+        }
+    })
 }
 
 pub fn hand_over(paths: &Paths, worker: &str, handover: Handover) -> Result<()> {
@@ -513,6 +537,13 @@ mod tests {
             "background_tasks": [
                 { "id": "a1", "type": "subagent", "status": "running", "description": "d" },
                 { "id": "a2", "type": "subagent", "status": "completed" },
+                { "id": "a3", "type": "subagent", "status": "pending" },
+                { "id": "a4", "type": "subagent" },
+                { "id": "a5", "type": "subagent", "status": "Failed" },
+                { "id": "a6", "type": "subagent", "status": "killed" },
+                { "id": "a7", "type": "subagent", "status": "stopped" },
+                { "id": "a8", "type": "subagent", "status": "cancelled" },
+                { "id": "a9", "type": "subagent", "status": "CANCELED" },
                 { "id": "w1", "type": "workflow", "status": "running" },
                 { "id": "t1", "type": "teammate", "status": "running" },
                 { "id": "s1", "type": "shell", "status": "running" },
@@ -531,11 +562,13 @@ mod tests {
     }
 
     #[test]
-    fn only_running_tasks_of_counted_kinds_are_background_work() {
+    fn unfinished_tasks_of_counted_kinds_are_background_work() {
         assert_eq!(
             background_from_hook(&stop_input()),
             Some(vec![
                 task("a1", "subagent"),
+                task("a3", "subagent"),
+                task("a4", "subagent"),
                 task("w1", "workflow"),
                 task("t1", "teammate")
             ])
@@ -655,6 +688,21 @@ mod tests {
         assert_eq!(requested(&paths, "acme-1"), ["Admin"]);
         record(&paths, "acme-1", Activity::Idle).unwrap();
         assert_eq!(activity(&paths, "acme-1"), Some(Activity::Account));
+    }
+
+    #[test]
+    fn touch_ends_waiting_and_leaves_idle_and_working_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = paths(home.path());
+        for (before, after) in [
+            (Activity::Waiting, Activity::Working),
+            (Activity::Working, Activity::Working),
+            (Activity::Idle, Activity::Idle),
+        ] {
+            record(&paths, "acme-1", before).unwrap();
+            touch(&paths, "acme-1").unwrap();
+            assert_eq!(activity(&paths, "acme-1"), Some(after), "from {before:?}");
+        }
     }
 
     #[test]
