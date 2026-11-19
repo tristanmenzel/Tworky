@@ -408,7 +408,10 @@
     min-width: 0;
   }
   .title-line {
-    overflow-wrap: anywhere;
+    overflow-wrap: break-word;
+  }
+  .repo-link {
+    white-space: nowrap;
   }
   .title,
   .repo-link {
