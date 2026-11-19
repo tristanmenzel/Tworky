@@ -13,11 +13,13 @@
     type BrowserTabView,
     type Handover,
     type AccountRequest,
+    type Phase,
     type Job,
     type LocalStatus,
     type ProjectMemoryChanges,
     type ProjectSummary,
     type Worker,
+    type WorkerStage,
   } from './api'
   import ActionMenu from './ActionMenu.svelte'
   import AddIssueDialog from './AddIssueDialog.svelte'
@@ -54,16 +56,20 @@
     activityLabel,
     activityOf,
     activityRank,
+    cardStage,
     formatBytes,
     jobLabel,
     ownsItem,
     serviceUrl,
     subjectLabel,
     subjectUrl,
+    type CardStage,
   } from './issue'
 
   const DUE_CHECK_MS = 30_000
   const JOBS_POLL_MS = 10_000
+  const STAGES_DEBOUNCE_MS = 10_000
+  const STAGES_MIN_GAP_MS = 60_000
   const ITEM_PREFIX = 'item:'
 
   interface JobTab {
@@ -77,6 +83,12 @@
   let view = $state<View>('items')
   let payload = $state<IssuesPayload | null>(null)
   let workers = $state<Worker[]>([])
+  let workerStages = $state<Record<string, WorkerStage>>({})
+  let stagesTimer: ReturnType<typeof setTimeout> | undefined
+  let stagesRequest = 0
+  let stagesApplied = 0
+  let stagesPending = false
+  let stagesDebouncedAt = 0
   let selectedId = $state<string | null>(null)
   let flashId = $state<string | null>(null)
   let itemTab = $state<string>('overview')
@@ -148,6 +160,19 @@
       const card = workItemOf(w)
       const activity = activityOf(w)
       if (card && activity && activityRank(activity) > activityRank(m.get(card) ?? null)) m.set(card, activity)
+    }
+    return m
+  })
+  const stageByCard = $derived.by(() => {
+    const byCard = new Map<string, Worker[]>()
+    for (const w of workers) {
+      const card = workItemOf(w)
+      if (card) byCard.set(card, [...(byCard.get(card) ?? []), w])
+    }
+    const m = new Map<string, CardStage>()
+    for (const [card, ws] of byCard) {
+      const stage = cardStage(ws, workerStages)
+      if (stage) m.set(card, stage)
     }
     return m
   })
@@ -223,7 +248,44 @@
     error = message
   }
 
+  async function loadWorkerStages() {
+    const request = ++stagesRequest
+    try {
+      const loaded = await api.workerStages()
+      if (request <= stagesApplied) return
+      stagesApplied = request
+      const merged = { ...loaded }
+      for (const w of workers) if (!(w.id in merged) && workerStages[w.id]) merged[w.id] = workerStages[w.id]
+      workerStages = merged
+    } catch (e) {
+      console.error('Loading worker stages failed', e)
+    }
+  }
+
+  function loadWorkerStagesSoon() {
+    if (stagesTimer !== undefined || stagesPending) return
+    const delay = Math.max(STAGES_DEBOUNCE_MS, stagesDebouncedAt + STAGES_MIN_GAP_MS - Date.now())
+    stagesTimer = setTimeout(() => {
+      stagesTimer = undefined
+      runPendingStagesLoad()
+    }, delay)
+  }
+
+  function runPendingStagesLoad() {
+    stagesPending = document.hidden
+    if (stagesPending) return
+    stagesDebouncedAt = Date.now()
+    loadWorkerStages()
+  }
+
+  function onVisibilityChange() {
+    refreshIssuesIfDue()
+    if (!document.hidden && stagesPending) runPendingStagesLoad()
+  }
+
   async function loadIssues(refresh: boolean) {
+    stagesPending = false
+    loadWorkerStages()
     loading = true
     if (refresh) issuesRefreshedAt = Date.now()
     try {
@@ -649,7 +711,7 @@
     loadMemoryChanges()
     api.browserTabs().then((tabs) => (browserTabs = tabs), showError)
     const timer = setInterval(refreshIssuesIfDue, DUE_CHECK_MS)
-    document.addEventListener('visibilitychange', refreshIssuesIfDue)
+    document.addEventListener('visibilitychange', onVisibilityChange)
     const jobsTimer = setInterval(() => {
       if (document.hidden) return
       loadJobs()
@@ -665,14 +727,22 @@
         logs[e.payload.id] ??= []
         logs[e.payload.id].push(e.payload.line)
       }),
-      listen<{ id: string; activity: Activity | null; handover: Handover | null; account_requests: AccountRequest[] }>(
+      listen<{
+        id: string
+        activity: Activity | null
+        handover: Handover | null
+        account_requests: AccountRequest[]
+        phase: Phase | null
+      }>(
         'session-activity',
         (e) => {
           const w = workerById(e.payload.id)
           if (w) {
+            if (w.activity === 'working' && e.payload.activity !== 'working') loadWorkerStagesSoon()
             w.activity = e.payload.activity
             w.handover = e.payload.handover
             w.account_requests = e.payload.account_requests
+            w.phase = e.payload.phase
           }
         },
       ),
@@ -688,7 +758,8 @@
     return () => {
       clearInterval(timer)
       clearInterval(jobsTimer)
-      document.removeEventListener('visibilitychange', refreshIssuesIfDue)
+      clearTimeout(stagesTimer)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
       unlisten.forEach((p) => p.then((f) => f()))
     }
   })
@@ -828,6 +899,7 @@
               workers={workersByIssue}
               itemWorkers={workersByItem}
               {activityByCard}
+              {stageByCard}
               {selectedId}
               {flashId}
               onSelect={select}
