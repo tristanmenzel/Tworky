@@ -1276,7 +1276,16 @@ fn service(cmd: ServiceCommand) -> Result<()> {
         ServiceCommand::Ls(WorkerArg { id }) => {
             let services = ws.services(&id)?;
             if services.is_empty() {
-                println!("no services; add [[services]] to the project config");
+                let w = ws.state.get(&id)?.context("worker not found")?;
+                let project = ws
+                    .config
+                    .project(&w.project)
+                    .context("project not configured")?;
+                if tworky_core::services::suggest_services(project) {
+                    println!("{}", tworky_core::services::NO_SERVICES_NOTE);
+                } else {
+                    println!("no services defined");
+                }
             }
             for s in services {
                 let state = match s.state {

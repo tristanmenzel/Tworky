@@ -32,10 +32,16 @@ pub struct Running {
 type Record = BTreeMap<String, Running>;
 
 /// Shown to Claude when a project has no `[[services]]`.
-pub const NO_SERVICES_NOTE: &str = "This project defines no services, so Tworky can't start its \
-dev servers, and a dev server you start yourself won't show to the user as a service they can \
-start or stop. Ask the user to add [[services]] to the project in its project setup session \
-(Projects > Setup).";
+pub const NO_SERVICES_NOTE: &str = "This project defines no services. If it has dev servers, ask \
+the user to add [[services]] to the project in its project setup session (Projects > Setup), so \
+Tworky can start them and the user can start or stop them. Projects without dev servers, such as \
+a CLI or library, need none.";
+
+/// Whether to show `NO_SERVICES_NOTE`. A dev server needs a port, so a set-up project with no
+/// `[ports]` has none to declare.
+pub fn suggest_services(project: &ProjectConfig) -> bool {
+    project.services.is_empty() && (!project.ports.is_empty() || project.onboarding)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ServiceStatus {
@@ -524,6 +530,22 @@ mod tests {
         assert_eq!(url_port("http://[::1]:4100/x"), Some(4100));
         assert_eq!(url_port("https://example.com:5273/"), None);
         assert_eq!(url_port("http://localhost/"), None);
+    }
+
+    #[test]
+    fn suggests_services_only_where_dev_servers_may_be_missing() {
+        let project = |extra: &str| -> ProjectConfig {
+            toml::from_str(&format!(
+                "name = \"acme\"\nrepos = []\n{extra}\n[match]\nowner = \"acme\"\n"
+            ))
+            .unwrap()
+        };
+        assert!(suggest_services(&project("[ports]\nweb = 5173")));
+        assert!(suggest_services(&project("onboarding = true")));
+        assert!(!suggest_services(&project("")));
+        assert!(!suggest_services(&project(
+            "[ports]\nweb = 5173\n[[services]]\nname = \"app\"\nport = \"web\"\nrun = \"npm run dev\""
+        )));
     }
 
     #[test]

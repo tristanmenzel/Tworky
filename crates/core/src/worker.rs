@@ -620,7 +620,7 @@ impl Workspace {
         w.stopped = false;
         self.state.save(&w)?;
         log("✓ setup complete");
-        if project.services.is_empty() {
+        if crate::services::suggest_services(&project) {
             log(&format!("note: {}", crate::services::NO_SERVICES_NOTE));
         }
         Ok(())
