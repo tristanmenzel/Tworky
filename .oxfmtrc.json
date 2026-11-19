@@ -1,0 +1,25 @@
+{
+  "printWidth": 120,
+  "tabWidth": 2,
+  "useTabs": false,
+  "semi": false,
+  "singleQuote": true,
+  "trailingComma": "all",
+  "arrowParens": "always",
+  "endOfLine": "lf",
+  "sortPackageJson": false,
+  "svelte": true,
+  "ignorePatterns": [
+    "package-lock.json",
+    "src-tauri/gen/**",
+    "dist/**",
+    "target/**",
+    "node_modules/**",
+    "**/*.md",
+    "**/*.yml",
+    "**/*.yaml",
+    "**/*.toml",
+    "**/*.hbs",
+    ".claude/**"
+  ]
+}

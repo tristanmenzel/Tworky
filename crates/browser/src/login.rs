@@ -74,13 +74,17 @@ pub fn can_fill_email(account: &Account, url: &Url, fields: &[LoginField]) -> bo
         && !account.allows(url)
 }
 
+fn finder_calling(args: &str) -> String {
+    format!("(() => {{\n{FINDER_SOURCE}\nreturn tworkyLogin({args})\n}})()")
+}
+
 pub fn detect_script() -> String {
-    format!("({FINDER_SOURCE}\n)(\"detect\")")
+    finder_calling("\"detect\"")
 }
 
 pub fn fill_script(username: Option<&str>, password: Option<&str>, submit: bool) -> String {
     let payload = json!({ "username": username, "password": password, "submit": submit });
-    format!("({FINDER_SOURCE}\n)(\"fill\", {payload})")
+    finder_calling(&format!("\"fill\", {payload}"))
 }
 
 /// Runs the detector in every new top-level document from now on, and in the current one.
@@ -122,9 +126,58 @@ mod tests {
     }
 
     fn payload(script: &str) -> serde_json::Value {
-        let start = script.rfind("(\"fill\", ").unwrap() + "(\"fill\", ".len();
-        let json = script[start..].strip_suffix(')').unwrap();
-        serde_json::from_str(json).unwrap()
+        let call = "tworkyLogin(\"fill\", ";
+        let script = script.strip_suffix(")\n})()").unwrap();
+        let start = script.rfind(call).unwrap() + call.len();
+        serde_json::from_str(&script[start..]).unwrap()
+    }
+
+    fn parse_with_node(script: &str) -> Option<Result<(), String>> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        match Command::new("node").arg("--version").output() {
+            Ok(out) if out.status.success() => {}
+            _ => {
+                println!("skipped: node can't be run");
+                return None;
+            }
+        }
+        let mut child = Command::new("node")
+            .args([
+                "-e",
+                "new (require('vm').Script)(require('fs').readFileSync(0,'utf8'))",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("SyntaxError") {
+            return Some(Err(stderr.into_owned()));
+        }
+        if !out.status.success() {
+            println!("skipped: node failed without a SyntaxError: {stderr}");
+            return None;
+        }
+        Some(Ok(()))
+    }
+
+    #[test]
+    fn the_wrapped_scripts_parse_as_classic_scripts() {
+        for script in [detect_script(), fill_script(Some("tom"), Some("pw"), true)] {
+            if let Some(Err(error)) = parse_with_node(&script) {
+                panic!("{error}");
+            }
+        }
     }
 
     #[tokio::test]
