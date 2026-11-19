@@ -1101,9 +1101,11 @@ fn watch_activity(app: AppHandle) {
             let _ = app.emit("memory-changes", ());
         }
         let state = app.state::<AppState>();
+        // Liveness first: a launch between the two reads would otherwise pair its new generation
+        // with the record from before its reset, and the reset would flash on the next poll.
+        let live = state.sessions.live_sessions();
         let mut now = activity::read_all(&paths);
         let polled = std::time::Instant::now();
-        let live = state.sessions.live_sessions();
         freshness.poll(now.iter().map(|(id, s)| (id.as_str(), s.beat)), polled);
         let mut quietly_idle = HashSet::new();
         for (id, session) in now.iter_mut() {
@@ -1142,10 +1144,8 @@ fn watch_activity(app: AppHandle) {
                     account_requests: is.map(|s| s.account_requests.clone()).unwrap_or_default(),
                 },
             );
-            // A launch resets a stale record just before its spawn, so only a change seen across
-            // two polls of the same spawn flashes.
             let generation = |live: &HashMap<String, pty::Live>| live.get(id).map(|l| l.generation);
-            if generation(&live).is_none() || generation(&live) != generation(&live_before) {
+            if !session_view::same_spawn(generation(&live_before), generation(&live)) {
                 continue;
             }
             match session_view::flash(

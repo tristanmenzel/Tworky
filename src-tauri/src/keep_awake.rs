@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn an_app_write_does_not_keep_a_session_busy() {
+    fn changes_without_a_beat_do_not_refresh_a_session() {
         let mut handed_over = session(Activity::Idle, true);
         handed_over.activity = Activity::Uat;
         handed_over.handover = Some(Handover {

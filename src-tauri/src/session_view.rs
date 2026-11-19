@@ -25,6 +25,12 @@ pub fn shown(s: &Session) -> (Activity, Option<&Handover>, &[AccountRequest]) {
     (s.activity, s.handover.as_ref(), &s.account_requests)
 }
 
+/// A launch resets a stale record just before its spawn, so only a change seen across two polls of
+/// the same live spawn may flash.
+pub fn same_spawn(before: Option<u64>, now: Option<u64>) -> bool {
+    now.is_some() && now == before
+}
+
 pub fn flash(was: Option<Activity>, is: Option<Activity>, quietly_idle: bool) -> Option<Flash> {
     match (was, is) {
         (_, Some(Activity::Waiting)) => Some(Flash::Urgent),
@@ -104,5 +110,38 @@ mod tests {
             flash(Some(Activity::Working), Some(Activity::Waiting), false),
             Some(Flash::Urgent)
         );
+    }
+
+    #[test]
+    fn entering_account_is_urgent_once() {
+        for was in [None, Some(Activity::Idle), Some(Activity::Working)] {
+            assert_eq!(
+                flash(was, Some(Activity::Account), false),
+                Some(Flash::Urgent)
+            );
+        }
+        assert_eq!(
+            flash(Some(Activity::Account), Some(Activity::Account), false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_handover_after_work_or_idle_is_gentle() {
+        for was in [Activity::Working, Activity::Idle] {
+            assert_eq!(
+                flash(Some(was), Some(Activity::Uat), false),
+                Some(Flash::Gentle)
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_same_live_spawn_may_flash() {
+        assert!(same_spawn(Some(3), Some(3)));
+        assert!(!same_spawn(None, Some(3)));
+        assert!(!same_spawn(Some(2), Some(3)));
+        assert!(!same_spawn(Some(3), None));
+        assert!(!same_spawn(None, None));
     }
 }
