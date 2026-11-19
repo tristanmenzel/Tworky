@@ -4,9 +4,7 @@
   let cancelEl = $state<HTMLButtonElement>()
 
   const request = $derived(confirmation.request)
-  const warningLines = $derived(
-    request?.warning?.message === undefined ? [] : [request.warning.message].flat(),
-  )
+  const warningLines = $derived(request?.warning?.message === undefined ? [] : [request.warning.message].flat())
 
   $effect(() => {
     if (request) cancelEl?.focus()

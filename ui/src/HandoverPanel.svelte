@@ -14,9 +14,7 @@
 
   let checked = $state<boolean[]>([])
 
-  const handoverTabs = $derived(
-    handover.tabs.flatMap((id) => tabs.filter((t) => t.id === id)),
-  )
+  const handoverTabs = $derived(handover.tabs.flatMap((id) => tabs.filter((t) => t.id === id)))
 
   async function dismiss() {
     try {

@@ -20,7 +20,12 @@
   let timer: ReturnType<typeof setTimeout> | undefined
   let seq = 0
 
-  const suggested = $derived(picked[0]?.split('/')[1]?.toLowerCase().replace(/[^a-z0-9_-]/g, '-') ?? '')
+  const suggested = $derived(
+    picked[0]
+      ?.split('/')[1]
+      ?.toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '-') ?? '',
+  )
   const projectName = $derived((name ?? suggested).trim())
 
   onMount(runSearch)

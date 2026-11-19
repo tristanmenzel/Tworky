@@ -45,7 +45,11 @@
     </div>
     <div class="actions">
       <button class:primary={project.onboarding} onclick={onOpenSetup}>
-        {project.onboarding ? 'Set up with Claude' : project.setup_started ? 'Reopen setup session' : 'Adjust with Claude'}
+        {project.onboarding
+          ? 'Set up with Claude'
+          : project.setup_started
+            ? 'Reopen setup session'
+            : 'Adjust with Claude'}
       </button>
       <button onclick={openConfig}>Open config</button>
     </div>
@@ -55,8 +59,8 @@
     <section class="box onboarding">
       <strong>Not set up yet.</strong>
       <span class="muted">
-        Tworky made this project with just its repos. A setup session asks about the rest of the project, reads its
-        docs and configures ports, the stack, hooks and services, then tests them on a scratch item.
+        Tworky made this project with just its repos. A setup session asks about the rest of the project, reads its docs
+        and configures ports, the stack, hooks and services, then tests them on a scratch item.
       </span>
     </section>
   {/if}
@@ -64,13 +68,21 @@
   <section class="box">
     <h2>Matching</h2>
     <dl>
-      {#if project.match.owner}<dt>Owner</dt><dd><code>{project.match.owner}</code></dd>{/if}
+      {#if project.match.owner}<dt>Owner</dt>
+        <dd><code>{project.match.owner}</code></dd>{/if}
       {#if project.match.repos.length}
-        <dt>Repos</dt><dd>{#each project.match.repos as r (r)}<code>{r}</code> {/each}</dd>
+        <dt>Repos</dt>
+        <dd>
+          {#each project.match.repos as r (r)}<code>{r}</code>
+          {/each}
+        </dd>
       {/if}
-      {#if project.status_board != null}<dt>Status board</dt><dd>#{project.status_board}</dd>{/if}
-      {#if project.subtask_types.length}<dt>Subtask types</dt><dd>{project.subtask_types.join(', ')}</dd>{/if}
-      {#if project.context_types.length}<dt>Context types</dt><dd>{project.context_types.join(', ')}</dd>{/if}
+      {#if project.status_board != null}<dt>Status board</dt>
+        <dd>#{project.status_board}</dd>{/if}
+      {#if project.subtask_types.length}<dt>Subtask types</dt>
+        <dd>{project.subtask_types.join(', ')}</dd>{/if}
+      {#if project.context_types.length}<dt>Context types</dt>
+        <dd>{project.context_types.join(', ')}</dd>{/if}
     </dl>
   </section>
 
@@ -89,14 +101,18 @@
   <section class="box">
     <h2>Workers</h2>
     <dl>
-      <dt>Branch</dt><dd><code>{project.branch}</code></dd>
-      <dt>Session folder</dt><dd><code>{project.session_cwd}</code></dd>
+      <dt>Branch</dt>
+      <dd><code>{project.branch}</code></dd>
+      <dt>Session folder</dt>
+      <dd><code>{project.session_cwd}</code></dd>
       {#if project.stack}
         <dt>Stack</dt>
         <dd>
           <code>{project.stack.compose_dir}</code>
-          {#if project.stack.compose_files.length}<span class="muted">{project.stack.compose_files.join(', ')}</span>{/if}
-          {#if project.stack.profiles.length}<span class="muted">profiles {project.stack.profiles.join(', ')}</span>{/if}
+          {#if project.stack.compose_files.length}<span class="muted">{project.stack.compose_files.join(', ')}</span
+            >{/if}
+          {#if project.stack.profiles.length}<span class="muted">profiles {project.stack.profiles.join(', ')}</span
+            >{/if}
         </dd>
       {/if}
     </dl>
@@ -129,7 +145,11 @@
       <table>
         <tbody>
           {#each hooks as h, i (i)}
-            <tr><td class="muted">{h.kind}</td><td class="nowrap"><code>{h.cwd}</code></td><td><code class="pre">{commandText(h.run)}</code></td></tr>
+            <tr
+              ><td class="muted">{h.kind}</td><td class="nowrap"><code>{h.cwd}</code></td><td
+                ><code class="pre">{commandText(h.run)}</code></td
+              ></tr
+            >
           {/each}
         </tbody>
       </table>
@@ -148,7 +168,9 @@
       <p class="muted">No workers.</p>
     {/each}
     {#if items.length}
-      <p class="muted small">{items.length} item{items.length === 1 ? '' : 's'}: {items.map((i) => i.name).join(', ')}</p>
+      <p class="muted small">
+        {items.length} item{items.length === 1 ? '' : 's'}: {items.map((i) => i.name).join(', ')}
+      </p>
     {/if}
   </section>
 

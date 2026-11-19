@@ -75,7 +75,9 @@
     if (!local.stack) return null
     if (!containers.length) return 'stack not created'
     if (!runningContainers.length) return 'stack stopped'
-    return runningContainers.length === containers.length ? 'stack up' : `stack ${runningContainers.length} of ${containers.length} up`
+    return runningContainers.length === containers.length
+      ? 'stack up'
+      : `stack ${runningContainers.length} of ${containers.length} up`
   })
 
   const sessionDetails = $derived(
@@ -292,8 +294,10 @@
             </div>
             <span></span>
             <span class="muted">{plural(runningContainers.length, 'container')}</span>
-            <button class="small" disabled={stopping.stack} onclick={() => stop('stack', () => api.stopStack(worker.id))}
-              >Stop</button
+            <button
+              class="small"
+              disabled={stopping.stack}
+              onclick={() => stop('stack', () => api.stopStack(worker.id))}>Stop</button
             >
           {/if}
           {#if local?.stack_error}

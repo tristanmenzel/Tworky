@@ -187,9 +187,7 @@
   })
 
   const hasTab = (w: Worker) => w.session_alive || terminals.includes(w.id)
-  const selectedWorkerIds = $derived(
-    workers.filter((w) => selectedId && workItemOf(w) === selectedId).map((w) => w.id),
-  )
+  const selectedWorkerIds = $derived(workers.filter((w) => selectedId && workItemOf(w) === selectedId).map((w) => w.id))
   const selectedWorkersKey = $derived(selectedWorkerIds.join(' '))
   const itemTerminals = $derived(workers.filter((w) => selectedId && workItemOf(w) === selectedId && hasTab(w)))
   const strayTerminals = $derived(workers.filter((w) => !workItemOf(w) && hasTab(w)))
@@ -320,7 +318,11 @@
 
   async function reloadWorkList(withIssues: boolean) {
     await Promise.all([withIssues && loadIssues(false), loadItems()])
-    if (selectedId && !cards.some((c) => c.id === selectedId) && !otherItems.some((i) => ITEM_PREFIX + i.name === selectedId))
+    if (
+      selectedId &&
+      !cards.some((c) => c.id === selectedId) &&
+      !otherItems.some((i) => ITEM_PREFIX + i.name === selectedId)
+    )
       selectedId = null
   }
 
@@ -733,19 +735,16 @@
         handover: Handover | null
         account_requests: AccountRequest[]
         phase: Phase | null
-      }>(
-        'session-activity',
-        (e) => {
-          const w = workerById(e.payload.id)
-          if (w) {
-            if (w.activity === 'working' && e.payload.activity !== 'working') loadWorkerStagesSoon()
-            w.activity = e.payload.activity
-            w.handover = e.payload.handover
-            w.account_requests = e.payload.account_requests
-            w.phase = e.payload.phase
-          }
-        },
-      ),
+      }>('session-activity', (e) => {
+        const w = workerById(e.payload.id)
+        if (w) {
+          if (w.activity === 'working' && e.payload.activity !== 'working') loadWorkerStagesSoon()
+          w.activity = e.payload.activity
+          w.handover = e.payload.handover
+          w.account_requests = e.payload.account_requests
+          w.phase = e.payload.phase
+        }
+      }),
       listen<string>('session-exited', (e) => {
         exited[e.payload] = true
         if (e.payload.startsWith('setup@')) loadProjects()
@@ -844,8 +843,8 @@
     <div class="memory-bar" role="status">
       <span class="memory-dot"></span>
       <span class="memory-text"
-        >{#if pendingMemoryCount}<b>{pendingMemoryCount} memory change{pendingMemoryCount === 1 ? '' : 's'}</b> waiting
-          for your approval{:else}<b>Memory changes</b> couldn't be read{/if}
+        >{#if pendingMemoryCount}<b>{pendingMemoryCount} memory change{pendingMemoryCount === 1 ? '' : 's'}</b> waiting for
+          your approval{:else}<b>Memory changes</b> couldn't be read{/if}
         <span class="muted"
           >({pendingMemory
             .map((p) => (p.error ? `${p.project}: couldn't read changes` : `${p.project} ${p.changes.length}`))
@@ -884,8 +883,7 @@
               refreshKey++
               loadIssues(true)
             }}
-            title="Refresh from GitHub"
-            >{loading ? '…' : '↻'}</button
+            title="Refresh from GitHub">{loading ? '…' : '↻'}</button
           >
         </div>
         <div class="list">
@@ -921,11 +919,7 @@
           {#each projects as p (p.name)}
             {@const n = workers.filter((w) => w.project === p.name).length}
             <li>
-              <button
-                class="project"
-                class:selected={selectedProject === p.name}
-                onclick={() => selectProject(p.name)}
-              >
+              <button class="project" class:selected={selectedProject === p.name} onclick={() => selectProject(p.name)}>
                 <strong>{p.name}</strong>
                 {#if p.onboarding}<span class="setup-badge" title="Not set up yet">setup</span>{/if}
                 <span class="muted">{p.repos.map((r) => r.name).join(', ')}</span>
@@ -1170,15 +1164,22 @@
                 <button class="primary" onclick={() => openProjectSetup(name)}>Resume</button>
               {:else}
                 <button onclick={() => api.stop(id).catch((e) => showError(String(e)))}>Stop</button>
-                <button title="Repaint the terminal if its screen looks garbled (Ctrl+Shift+L)" onclick={() => redrawTerminal(id)}
-                  >Redraw</button
+                <button
+                  title="Repaint the terminal if its screen looks garbled (Ctrl+Shift+L)"
+                  onclick={() => redrawTerminal(id)}>Redraw</button
                 >
               {/if}
               <button onclick={() => newSetupConversation(name)}>New conversation</button>
-              <button onclick={() => api.openProjectConfig(name).catch((e) => showError(String(e)))}>Open config</button>
+              <button onclick={() => api.openProjectConfig(name).catch((e) => showError(String(e)))}>Open config</button
+              >
             </div>
             <div class="term-host">
-              <Terminal workerId={id} visible={terminalVisible(id)} generation={generations[id] ?? 0} onError={showError} />
+              <Terminal
+                workerId={id}
+                visible={terminalVisible(id)}
+                generation={generations[id] ?? 0}
+                onError={showError}
+              />
             </div>
           </div>
         {/each}

@@ -17,11 +17,9 @@ if (process.env.TAURI_ENV_TARGET_TRIPLE === 'universal-apple-darwin') {
     execFileSync('cargo', ['build', '--release', '-p', 'tw', '--target', target], { cwd: root, stdio: 'inherit' })
   }
   mkdirSync(release, { recursive: true })
-  execFileSync(
-    'lipo',
-    ['-create', '-output', `${release}tw`, ...targets.map((t) => `${root}target/${t}/release/tw`)],
-    { stdio: 'inherit' },
-  )
+  execFileSync('lipo', ['-create', '-output', `${release}tw`, ...targets.map((t) => `${root}target/${t}/release/tw`)], {
+    stdio: 'inherit',
+  })
   console.log(`wrote a universal ${release}tw`)
 } else {
   execFileSync('cargo', ['build', '--release', '-p', 'tw'], { cwd: root, stdio: 'inherit' })

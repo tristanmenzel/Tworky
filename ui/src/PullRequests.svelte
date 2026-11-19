@@ -117,7 +117,9 @@
   }
 
   async function remove(b: BranchWork) {
-    const where = [b.remote ? `origin/${b.branch} on GitHub` : null, b.local ? 'the local branch' : null].filter(Boolean)
+    const where = [b.remote ? `origin/${b.branch} on GitHub` : null, b.local ? 'the local branch' : null].filter(
+      Boolean,
+    )
     const wasMerged = b.pull_requests.some((p) => p.state === 'MERGED')
     const risks = [
       !wasMerged && b.ahead ? `${b.ahead} commit(s) aren’t on the base branch and no merged PR contains them.` : null,
@@ -236,7 +238,9 @@
           {#if hasConflicts(pr)}<span class="pill bad">Conflicts with {pr.base}</span>{/if}
           {#if pr.merge_state === 'BEHIND'}<span class="pill warn">Behind {pr.base}</span>{/if}
           {#if pr.unresolved_threads}
-            <span class="pill warn">{pr.unresolved_threads} unresolved thread{pr.unresolved_threads === 1 ? '' : 's'}</span>
+            <span class="pill warn"
+              >{pr.unresolved_threads} unresolved thread{pr.unresolved_threads === 1 ? '' : 's'}</span
+            >
           {/if}
           {#if pr.approved_by.length}<span class="pill ok">Approved · {pr.approved_by.join(', ')}</span>{/if}
           {#if pr.review_requests && !pr.approved_by.length}

@@ -156,7 +156,12 @@
       </button>
     {/if}
     {#if needsPassword}
-      <button class="chip" disabled={busy} title="Store a password for {tab.account}, then fill the form" onclick={() => (settingPassword = true)}>
+      <button
+        class="chip"
+        disabled={busy}
+        title="Store a password for {tab.account}, then fill the form"
+        onclick={() => (settingPassword = true)}
+      >
         Set password
       </button>
     {:else if tab.can_sign_in}
@@ -165,7 +170,11 @@
       </button>
     {/if}
     {#if tab.account !== null}
-      <button disabled={busy} title="Sign this account out and clear its browser data on this worker" onclick={resetSession}>
+      <button
+        disabled={busy}
+        title="Sign this account out and clear its browser data on this worker"
+        onclick={resetSession}
+      >
         Reset session
       </button>
     {/if}

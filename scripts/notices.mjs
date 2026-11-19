@@ -54,7 +54,9 @@ const npmPackages = {
   ...(await checkLicenses({ development: true, includePackages: bundledDevDependencies.join(';') })),
 }
 
-const missing = bundledDevDependencies.filter((name) => !Object.keys(npmPackages).some((id) => id.startsWith(`${name}@`)))
+const missing = bundledDevDependencies.filter(
+  (name) => !Object.keys(npmPackages).some((id) => id.startsWith(`${name}@`)),
+)
 if (missing.length) throw new Error(`bundled devDependencies not found in node_modules: ${missing.join(', ')}`)
 
 const unknown = Object.entries(npmPackages).filter(([, info]) => /unknown|\*/i.test(String(info.licenses)))
@@ -105,7 +107,9 @@ const normalised = `${notices
 
 const placeholder = normalised.match(/<year>|<copyright holders>|<owner>/)
 if (placeholder)
-  throw new Error(`a licence text still has the template placeholder ${placeholder[0]}; clarify its crate in about.toml`)
+  throw new Error(
+    `a licence text still has the template placeholder ${placeholder[0]}; clarify its crate in about.toml`,
+  )
 
 writeFileSync(join(root, 'THIRD-PARTY-NOTICES.txt'), normalised)
 console.log('wrote THIRD-PARTY-NOTICES.txt')

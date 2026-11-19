@@ -58,7 +58,13 @@
   {#if open}
     <div class="popup" role="menu" style:left="{pos.left}px" style:top="{pos.top}px">
       {#each jobs as j (j.tab)}
-        <button role="menuitemradio" aria-checked={j.tab === current} class:current={j.tab === current} title={j.command} onclick={() => choose(j.tab)}>
+        <button
+          role="menuitemradio"
+          aria-checked={j.tab === current}
+          class:current={j.tab === current}
+          title={j.command}
+          onclick={() => choose(j.tab)}
+        >
           <span class="check">{j.tab === current ? '✓' : ''}</span>
           <span class="name">{jobLabel(j.command)}</span>
           <span class="muted mem">{formatBytes(j.memory_bytes)}</span>

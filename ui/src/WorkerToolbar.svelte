@@ -20,8 +20,18 @@
     onError: (message: string) => void
   }
 
-  let { worker, accounts, services, ownsItem, onResume, onTerminate, onOpenBrowser, onOpenAnonymous, onCreateProfile, onError }: Props =
-    $props()
+  let {
+    worker,
+    accounts,
+    services,
+    ownsItem,
+    onResume,
+    onTerminate,
+    onOpenBrowser,
+    onOpenAnonymous,
+    onCreateProfile,
+    onError,
+  }: Props = $props()
 
   const noService = $derived(services ? false : 'The project has no service with a port')
 
@@ -83,8 +93,9 @@
         title="Stop Claude, everything it started and the worker's containers (kept, not removed)"
         onclick={() => act(onTerminate)}>Terminate</button
       >
-      <button title="Repaint the terminal if its screen looks garbled (Ctrl+Shift+L)" onclick={() => redrawTerminal(worker.id)}
-        >Redraw</button
+      <button
+        title="Repaint the terminal if its screen looks garbled (Ctrl+Shift+L)"
+        onclick={() => redrawTerminal(worker.id)}>Redraw</button
       >
     {:else}
       <span class="muted">Claude not running</span>

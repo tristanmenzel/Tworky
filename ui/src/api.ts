@@ -207,13 +207,7 @@ export type Verdict = 'needs_attention' | 'draft' | 'ready' | 'in_review'
 
 export type WorkSubject = { kind: 'issue'; id: string } | { kind: 'item'; name: string }
 
-export type Stage =
-  | 'building'
-  | 'pr_draft'
-  | 'in_review'
-  | 'needs_attention'
-  | 'ready'
-  | 'merged'
+export type Stage = 'building' | 'pr_draft' | 'in_review' | 'needs_attention' | 'ready' | 'merged'
 
 export interface WorkerStage {
   stage: Stage | null
@@ -294,7 +288,10 @@ export interface PrHit {
   item: string | null
 }
 
-export type ProjectChoice = { kind: 'infer' } | { kind: 'existing'; name: string } | { kind: 'new'; name: string | null }
+export type ProjectChoice =
+  | { kind: 'infer' }
+  | { kind: 'existing'; name: string }
+  | { kind: 'new'; name: string | null }
 
 export type AddOutcome =
   | { outcome: 'added'; item: Item; new_project: string | null }
@@ -521,8 +518,7 @@ export const api = {
   approveMemoryChanges: (project: string, ids: string[], base: string) =>
     invoke<void>('approve_memory_changes', { project, ids, base }),
   rejectMemoryChanges: (project: string, ids: string[]) => invoke<void>('reject_memory_changes', { project, ids }),
-  existingWork: (subject: WorkSubject, refresh: boolean) =>
-    invoke<BranchWork[]>('existing_work', { subject, refresh }),
+  existingWork: (subject: WorkSubject, refresh: boolean) => invoke<BranchWork[]>('existing_work', { subject, refresh }),
   deleteBranch: (subject: WorkSubject, repo: string, branch: string) =>
     invoke<string[]>('delete_branch', { subject, repo, branch }),
   workerStages: () => invoke<Record<string, WorkerStage>>('worker_stages'),
@@ -537,8 +533,7 @@ export const api = {
   jobOutput: (path: string, offset: number | null) => invoke<OutputChunk>('job_output', { path, offset }),
   begin: (issueId: string) => invoke<Worker>('begin_session', { issueId }),
   assign: (issueId: string) => invoke<IssuesPayload>('assign_to_me', { issueId }),
-  setIssueState: (issueId: string, state: IssueState) =>
-    invoke<IssuesPayload>('set_issue_state', { issueId, state }),
+  setIssueState: (issueId: string, state: IssueState) => invoke<IssuesPayload>('set_issue_state', { issueId, state }),
   setBoardStatus: (issueId: string, projectId: string, optionId: string) =>
     invoke<IssuesPayload>('set_board_status', { issueId, projectId, optionId }),
   cleanup: (id: string, removeItem = false) => invoke<void>('cleanup_worker', { id, removeItem }),
