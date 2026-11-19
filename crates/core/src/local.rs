@@ -22,6 +22,7 @@ pub struct LocalStatus {
     /// `None` when the project has no stack or docker isn't installed.
     pub stack: Option<Vec<ContainerStatus>>,
     pub stack_error: Option<String>,
+    pub docker_down: bool,
     pub listeners: Vec<PortListener>,
 }
 
@@ -86,13 +87,13 @@ impl Workspace {
             Some(_) => self.services(id)?,
             None => vec![],
         };
-        let (stack, stack_error) = stack_containers(&w, project);
+        let stack = stack_containers(&w, project);
         let listeners = match project {
             Some(project) => listeners(
                 &w,
                 project,
-                stack.as_deref().unwrap_or_default(),
-                stack_error.is_some(),
+                stack.containers.as_deref().unwrap_or_default(),
+                stack.error.is_some(),
             )
             .unwrap_or_default(),
             None => vec![],
@@ -100,8 +101,9 @@ impl Workspace {
         Ok(LocalStatus {
             worktrees,
             services,
-            stack,
-            stack_error,
+            stack: stack.containers,
+            stack_error: stack.error,
+            docker_down: stack.docker_down,
             listeners,
         })
     }
@@ -110,29 +112,44 @@ impl Workspace {
     pub fn port_listeners(&self, id: &str) -> Result<Vec<PortListener>> {
         let w = self.worker(id)?;
         let project = self.project_of(&w)?;
-        let (stack, stack_error) = stack_containers(&w, Some(project));
+        let stack = stack_containers(&w, Some(project));
         listeners(
             &w,
             project,
-            stack.as_deref().unwrap_or_default(),
-            stack_error.is_some(),
+            stack.containers.as_deref().unwrap_or_default(),
+            stack.error.is_some(),
         )
     }
 }
 
-fn stack_containers(
-    w: &WorkerRecord,
-    project: Option<&ProjectConfig>,
-) -> (Option<Vec<ContainerStatus>>, Option<String>) {
+struct StackView {
+    containers: Option<Vec<ContainerStatus>>,
+    error: Option<String>,
+    docker_down: bool,
+}
+
+fn stack_containers(w: &WorkerRecord, project: Option<&ProjectConfig>) -> StackView {
+    let view = |containers, error, docker_down| StackView {
+        containers,
+        error,
+        docker_down,
+    };
     match project.and_then(|p| p.stack.as_ref()) {
-        None => (None, None),
+        None => view(None, None, false),
         Some(_) => match Compose::by_name(&w.compose_project).ps(PS_TIMEOUT) {
-            Ok(containers) => (
+            Ok(containers) => view(
                 Some(containers.into_iter().map(ContainerStatus::from).collect()),
                 None,
+                false,
             ),
-            Err(e) if stack::docker_missing(&e) => (None, None),
-            Err(e) => (None, Some(format!("{e:#}"))),
+            Err(e) if stack::docker_missing(&e) => view(None, None, false),
+            // A probe after a timeout would make the poll wait out a second timeout.
+            Err(e) if !process::timed_out(&e) && !stack::daemon_reachable(PS_TIMEOUT) => view(
+                None,
+                Some(format!("{} {e:#}", stack::DOCKER_UNREACHABLE)),
+                true,
+            ),
+            Err(e) => view(None, Some(format!("{e:#}")), false),
         },
     }
 }

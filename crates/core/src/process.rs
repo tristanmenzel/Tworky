@@ -96,7 +96,30 @@ pub fn output(mut cmd: Command, label: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// On timeout, stops the command's whole process tree.
+#[derive(Debug)]
+pub struct TimedOut {
+    label: String,
+    after: Duration,
+}
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` timed out after {}s",
+            self.label,
+            self.after.as_secs_f32()
+        )
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+pub fn timed_out(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<TimedOut>())
+}
+
+/// On timeout, stops the command's whole process tree and fails with [`TimedOut`].
 pub fn output_timeout(mut cmd: Command, label: &str, timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     let program = cmd.get_program().to_string_lossy().into_owned();
@@ -147,7 +170,11 @@ pub fn output_timeout(mut cmd: Command, label: &str, timeout: Duration) -> Resul
             let _ = stop_tree(child.id(), &program, &mut |_| {});
             let _ = child.kill();
             let _ = child.wait();
-            bail!("`{label}` timed out after {}s", timeout.as_secs_f32());
+            return Err(TimedOut {
+                label: label.to_string(),
+                after: timeout,
+            }
+            .into());
         }
     }
     let (stdout, stderr) = (stdout.unwrap_or_default(), stderr.unwrap_or_default());
@@ -1398,6 +1425,8 @@ mod tests {
         let started = Instant::now();
         let e = output_timeout(slow, "slow", Duration::from_millis(500)).unwrap_err();
         assert!(e.to_string().contains("timed out"), "{e:#}");
+        assert!(timed_out(&e));
+        assert!(timed_out(&e.context("wrapped")));
         assert!(started.elapsed() < Duration::from_secs(120));
 
         let (program, args): (&str, &[&str]) = if cfg!(windows) {
@@ -1409,6 +1438,16 @@ mod tests {
         quick.args(args);
         let out = output_timeout(quick, "quick", Duration::from_secs(10)).unwrap();
         assert_eq!(out.trim(), "hi");
+
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/c", "exit 3"])
+        } else {
+            ("sh", &["-c", "exit 3"])
+        };
+        let mut failing = command(program);
+        failing.args(args);
+        let e = output_timeout(failing, "failing", Duration::from_secs(10)).unwrap_err();
+        assert!(!timed_out(&e), "{e:#}");
     }
 
     #[test]

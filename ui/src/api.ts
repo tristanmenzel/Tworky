@@ -117,6 +117,7 @@ export interface LocalStatus {
   services: ServiceStatus[]
   stack: ContainerStatus[] | null
   stack_error: string | null
+  docker_down: boolean
   listeners: PortListener[]
 }
 
