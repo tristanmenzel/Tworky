@@ -133,16 +133,28 @@ impl Compose {
         process::stream(cmd, &label, log)
     }
 
-    pub fn up(&self, log: &mut dyn FnMut(&str)) -> Result<()> {
-        self.stream(&["up", "-d", "--wait"], log)
+    pub fn up(&self, unreachable_hint: &str, log: &mut dyn FnMut(&str)) -> Result<()> {
+        with_docker_hint(
+            self.stream(&["up", "-d", "--wait"], log),
+            unreachable_hint,
+            || daemon_reachable(PROBE_TIMEOUT),
+        )
     }
 
     pub fn stop(&self, log: &mut dyn FnMut(&str)) -> Result<()> {
-        unless_docker_missing(self.stream(&["stop"], log), log)
+        let result = with_docker_hint(self.stream(&["stop"], log), DOCKER_UNREACHABLE, || {
+            daemon_reachable(PROBE_TIMEOUT)
+        });
+        unless_docker_missing(result, log)
     }
 
     pub fn down(&self, log: &mut dyn FnMut(&str)) -> Result<()> {
-        unless_docker_missing(self.stream(&["down", "-v", "--remove-orphans"], log), log)
+        let result = with_docker_hint(
+            self.stream(&["down", "-v", "--remove-orphans"], log),
+            DOCKER_UNREACHABLE,
+            || daemon_reachable(PROBE_TIMEOUT),
+        );
+        unless_docker_missing(result, log)
     }
 
     pub fn ps(&self, timeout: Duration) -> Result<Vec<ServiceStatus>> {
@@ -188,6 +200,29 @@ fn unless_docker_missing(result: Result<()>, log: &mut dyn FnMut(&str)) -> Resul
     }
 }
 
+pub const DOCKER_UNREACHABLE: &str = "Docker doesn't seem to be running or reachable. Is Docker Desktop (or the Docker service) started?";
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub fn daemon_reachable(timeout: Duration) -> bool {
+    let mut cmd = process::command("docker");
+    cmd.args(["version", "--format", "{{.Server.Version}}"]);
+    process::output_timeout(cmd, "docker version", timeout).is_ok()
+}
+
+/// Docker's own error doesn't reliably say the daemon is down, so a failure other than a missing
+/// docker asks the daemon directly and, if it doesn't answer, adds `hint`.
+fn with_docker_hint<T>(
+    result: Result<T>,
+    hint: &str,
+    reachable: impl FnOnce() -> bool,
+) -> Result<T> {
+    match result {
+        Err(e) if !docker_missing(&e) && !reachable() => Err(e.context(hint.to_string())),
+        r => r,
+    }
+}
+
 pub(crate) fn docker_missing(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
@@ -227,6 +262,28 @@ mod tests {
 
         let failed: Result<()> = Err(anyhow::anyhow!("`docker compose down` failed (exit 1)"));
         assert!(unless_docker_missing(failed, &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn hints_at_docker_only_when_a_command_fails_and_the_daemon_is_unreachable() {
+        let probe_panics = || -> bool { panic!("probed after a success") };
+        assert!(with_docker_hint(Ok(()), "hint", probe_panics).is_ok());
+
+        let missing = process::stream(
+            process::command("tworky-no-such-program"),
+            "tworky-no-such-program",
+            &mut |_| {},
+        );
+        let e = with_docker_hint(missing, "hint", || false).unwrap_err();
+        assert!(docker_missing(&e));
+        assert!(!format!("{e:#}").contains("hint"));
+
+        let failed = || -> Result<()> { Err(anyhow::anyhow!("`docker compose up` failed")) };
+        let e = with_docker_hint(failed(), "hint", || false).unwrap_err();
+        assert_eq!(format!("{e:#}"), "hint: `docker compose up` failed");
+
+        let e = with_docker_hint(failed(), "hint", || true).unwrap_err();
+        assert_eq!(format!("{e:#}"), "`docker compose up` failed");
     }
 
     #[test]

@@ -70,6 +70,7 @@
 
   const stackText = $derived.by(() => {
     if (!local) return null
+    if (local.docker_down) return "Docker isn't reachable"
     if (local.stack_error) return 'stack status unknown'
     if (!local.stack) return null
     if (!containers.length) return 'stack not created'

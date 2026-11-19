@@ -606,7 +606,11 @@ impl Workspace {
                 "▸ stack: docker compose -p {} up",
                 w.compose_project
             ));
-            Compose::new(&w.compose_project, &w.dir, stack_cfg).up(log)?;
+            let hint = format!(
+                "{} Then run `tw worker setup` again.",
+                stack::DOCKER_UNREACHABLE
+            );
+            Compose::new(&w.compose_project, &w.dir, stack_cfg).up(&hint, log)?;
         }
 
         for hook in &project.hooks.setup {
