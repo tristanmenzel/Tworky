@@ -458,7 +458,7 @@ fn main() -> Result<()> {
     }
 }
 
-/// The hook's JSON input. A terminal means a person ran the command, so there is none to wait for.
+/// A terminal on stdin means a person ran the command, and reading it would block.
 fn hook_input() -> Option<serde_json::Value> {
     use std::io::{IsTerminal, Read};
     let mut stdin = std::io::stdin();

@@ -14,8 +14,8 @@ pub struct Freshness {
 }
 
 impl Freshness {
-    /// `beats` are the records' `Session::beat`s. A record missing from a poll keeps its time, so a
-    /// poll that misses files can't pass for a write when they reappear.
+    /// A record missing from a poll keeps its time, so a poll that misses files can't pass for a
+    /// write when they reappear.
     pub fn poll<'a>(&mut self, beats: impl IntoIterator<Item = (&'a str, u64)>, now: Instant) {
         for (id, beat) in beats {
             match self.seen.get_mut(id) {
@@ -28,7 +28,6 @@ impl Freshness {
         }
     }
 
-    /// A record never seen counts as stale.
     pub fn is_stale(&self, id: &str, now: Instant) -> bool {
         self.seen
             .get(id)

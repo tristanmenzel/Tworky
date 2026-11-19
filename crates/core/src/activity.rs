@@ -78,9 +78,8 @@ fn in_flight(task: &serde_json::Value) -> bool {
     })
 }
 
-/// The in-flight tasks of the counted kinds in a Stop or StopFailure hook's input, or `None` when it
-/// has no `background_tasks` list. The hooks docs list no status values, so any status but a known
-/// terminal one counts, as does a missing one. Entries of another kind are skipped.
+/// `None` when the input has no `background_tasks` list. The hooks docs list no status values, so
+/// any status but a known terminal one, or none, counts as in flight.
 pub fn background_from_hook(input: &serde_json::Value) -> Option<Vec<BackgroundTask>> {
     let tasks = input.get("background_tasks")?.as_array()?;
     Some(

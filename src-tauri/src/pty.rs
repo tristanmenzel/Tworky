@@ -36,7 +36,6 @@ pub struct Live {
 }
 
 impl Live {
-    /// How long the session has written nothing to its terminal, if it ever has.
     pub fn silent_for(&self, now: Instant) -> Option<Duration> {
         self.last_output.map(|at| now.saturating_duration_since(at))
     }
@@ -252,7 +251,6 @@ impl Sessions {
             .collect()
     }
 
-    /// The live sessions, read without waiting on the pty lock.
     pub fn live_sessions(&self) -> HashMap<String, Live> {
         self.liveness.snapshot()
     }
