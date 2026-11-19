@@ -84,6 +84,7 @@
   let workers = $state<Worker[]>([])
   let workerStages = $state<Record<string, WorkerStage>>({})
   let stagesTimer: ReturnType<typeof setTimeout> | undefined
+  let stagesRequest = 0
   let selectedId = $state<string | null>(null)
   let flashId = $state<string | null>(null)
   let itemTab = $state<string>('overview')
@@ -244,16 +245,24 @@
   }
 
   async function loadWorkerStages() {
+    const request = ++stagesRequest
     try {
-      workerStages = await api.workerStages()
+      const loaded = await api.workerStages()
+      if (request !== stagesRequest) return
+      const merged = { ...loaded }
+      for (const w of workers) if (!(w.id in merged) && workerStages[w.id]) merged[w.id] = workerStages[w.id]
+      workerStages = merged
     } catch (e) {
       console.error('Loading worker stages failed', e)
     }
   }
 
   function loadWorkerStagesSoon() {
-    clearTimeout(stagesTimer)
-    stagesTimer = setTimeout(loadWorkerStages, STAGES_DEBOUNCE_MS)
+    if (stagesTimer !== undefined) return
+    stagesTimer = setTimeout(() => {
+      stagesTimer = undefined
+      loadWorkerStages()
+    }, STAGES_DEBOUNCE_MS)
   }
 
   async function loadIssues(refresh: boolean) {

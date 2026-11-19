@@ -65,6 +65,83 @@ struct Target {
     pr_number: Option<u64>,
 }
 
+fn lookup_branch(checked_out: Option<String>, recorded: &str, base: &str) -> String {
+    let base_branch = base.split_once('/').map_or(base, |(_, b)| b);
+    checked_out
+        .filter(|b| b != base_branch)
+        .unwrap_or_else(|| recorded.to_string())
+}
+
+#[derive(Default)]
+struct Lookups {
+    by_head: BTreeMap<(String, String), Vec<PrDetail>>,
+    by_number: BTreeMap<(String, u64), Option<PrDetail>>,
+    failed_repos: BTreeSet<String>,
+    failed_numbers: BTreeSet<(String, u64)>,
+}
+
+impl Lookups {
+    /// None when a lookup this target needs failed.
+    fn prs(&self, t: &Target) -> Option<Vec<PrDetail>> {
+        let Some(nwo) = &t.name_with_owner else {
+            return Some(Vec::new());
+        };
+        match t.pr_number {
+            Some(number) => {
+                let key = (nwo.clone(), number);
+                if self.failed_numbers.contains(&key) {
+                    return None;
+                }
+                Some(
+                    self.by_number
+                        .get(&key)
+                        .cloned()
+                        .flatten()
+                        .into_iter()
+                        .collect(),
+                )
+            }
+            None => {
+                if self.failed_repos.contains(nwo) {
+                    return None;
+                }
+                Some(
+                    self.by_head
+                        .get(&(nwo.clone(), t.branch.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            }
+        }
+    }
+}
+
+/// `repos` pairs a worker with one repo's stage, or with None when that stage is unknown. A worker
+/// with any unknown repo is left out.
+fn by_worker(
+    workers: impl IntoIterator<Item = String>,
+    repos: impl IntoIterator<Item = (String, Option<Option<Stage>>)>,
+) -> BTreeMap<String, WorkerStage> {
+    let mut stages: BTreeMap<String, Option<Vec<Stage>>> =
+        workers.into_iter().map(|w| (w, Some(Vec::new()))).collect();
+    for (worker, stage) in repos {
+        let entry = stages.entry(worker).or_insert_with(|| Some(Vec::new()));
+        match stage {
+            None => *entry = None,
+            Some(stage) => {
+                if let Some(known) = entry {
+                    known.extend(stage);
+                }
+            }
+        }
+    }
+    stages
+        .into_iter()
+        .filter_map(|(id, s)| s.map(|s| (id, WorkerStage { stage: combine(s) })))
+        .collect()
+}
+
+/// Leaves out workers whose stage is unknown because a GitHub lookup failed.
 pub fn worker_stages(ws: &Workspace) -> Result<BTreeMap<String, WorkerStage>> {
     let workers: Vec<_> = ws
         .state
@@ -95,8 +172,11 @@ pub fn worker_stages(ws: &Workspace) -> Result<BTreeMap<String, WorkerStage>> {
                 worker: w.id.clone(),
                 source: repo.source.clone(),
                 base: repo.base.clone(),
-                branch: local::checked_out(&w.dir.join(&t.repo))
-                    .unwrap_or_else(|| t.branch.clone()),
+                branch: lookup_branch(
+                    local::checked_out(&w.dir.join(&t.repo)),
+                    &t.branch,
+                    &repo.base,
+                ),
                 name_with_owner,
                 pr_number,
             });
@@ -109,68 +189,49 @@ pub fn worker_stages(ws: &Workspace) -> Result<BTreeMap<String, WorkerStage>> {
             by_repo.entry(nwo).or_default().insert(&t.branch);
         }
     }
-    let mut by_head: BTreeMap<(String, String), Vec<PrDetail>> = BTreeMap::new();
-    let mut failed: BTreeSet<&str> = BTreeSet::new();
+    let mut lookups = Lookups::default();
     for (nwo, branches) in &by_repo {
-        let lookups: Vec<(String, String)> = branches
+        let batch: Vec<(String, String)> = branches
             .iter()
             .map(|b| (nwo.to_string(), b.to_string()))
             .collect();
-        match pulls::prs_for_branches(&lookups) {
-            Ok(found) => by_head.extend(found),
+        match pulls::prs_for_branches(&batch) {
+            Ok(found) => lookups.by_head.extend(found),
             Err(e) => {
                 eprintln!("worker stages: looking up PRs in {nwo}: {e:#}");
-                failed.insert(nwo);
+                lookups.failed_repos.insert(nwo.to_string());
             }
         }
     }
 
-    let mut by_number: BTreeMap<(&str, u64), Option<PrDetail>> = BTreeMap::new();
     for t in &targets {
         let (Some(nwo), Some(number)) = (&t.name_with_owner, t.pr_number) else {
             continue;
         };
-        if by_number.contains_key(&(nwo.as_str(), number)) {
+        let key = (nwo.clone(), number);
+        if lookups.by_number.contains_key(&key) || lookups.failed_numbers.contains(&key) {
             continue;
         }
         match pulls::pr_by_number(nwo, number) {
             Ok(pr) => {
-                by_number.insert((nwo, number), pr);
+                lookups.by_number.insert(key, pr);
             }
             Err(e) => {
                 eprintln!("worker stages: looking up {nwo}#{number}: {e:#}");
-                failed.insert(nwo);
+                lookups.failed_numbers.insert(key);
             }
         }
     }
 
-    let mut stages: BTreeMap<String, Vec<Stage>> =
-        workers.iter().map(|w| (w.id.clone(), Vec::new())).collect();
-    for t in &targets {
-        let prs: Vec<PrDetail> = match (&t.name_with_owner, t.pr_number) {
-            (Some(nwo), _) if failed.contains(nwo.as_str()) => continue,
-            (Some(nwo), Some(number)) => by_number
-                .get(&(nwo.as_str(), number))
-                .cloned()
-                .flatten()
-                .into_iter()
-                .collect(),
-            (Some(nwo), None) => by_head
-                .get(&(nwo.clone(), t.branch.clone()))
-                .cloned()
-                .unwrap_or_default(),
-            (None, _) => Vec::new(),
-        };
-        let has_pr = prs.iter().any(|p| p.is_open() || p.is_merged());
-        let ahead = !has_pr && is_ahead(&t.source, &t.base, &t.branch);
-        if let Some(stage) = repo_stage(&prs, ahead) {
-            stages.entry(t.worker.clone()).or_default().push(stage);
-        }
-    }
-    Ok(stages
-        .into_iter()
-        .map(|(id, s)| (id, WorkerStage { stage: combine(s) }))
-        .collect())
+    let repos = targets.iter().map(|t| {
+        let stage = lookups.prs(t).map(|prs| {
+            let has_pr = prs.iter().any(|p| p.is_open() || p.is_merged());
+            let ahead = !has_pr && is_ahead(&t.source, &t.base, &t.branch);
+            repo_stage(&prs, ahead)
+        });
+        (t.worker.clone(), stage)
+    });
+    Ok(by_worker(workers.iter().map(|w| w.id.clone()), repos))
 }
 
 #[cfg(test)]
@@ -251,6 +312,81 @@ mod tests {
             Some(NeedsAttention)
         );
         assert_eq!(combine([]), None);
+    }
+
+    fn target(worker: &str, branch: &str, pr_number: Option<u64>) -> Target {
+        Target {
+            worker: worker.into(),
+            source: PathBuf::new(),
+            base: "origin/main".into(),
+            name_with_owner: Some("o/r".into()),
+            branch: branch.into(),
+            pr_number,
+        }
+    }
+
+    #[test]
+    fn a_failed_lookup_fails_only_the_targets_that_needed_it() {
+        let mut lookups = Lookups::default();
+        lookups
+            .by_head
+            .insert(("o/r".into(), "feat/x".into()), vec![pr(1, "MERGED")]);
+        lookups.failed_numbers.insert(("o/r".into(), 5));
+        lookups
+            .by_number
+            .insert(("o/r".into(), 6), Some(pr(6, "MERGED")));
+
+        assert_eq!(lookups.prs(&target("a", "feat/x", None)).unwrap().len(), 1);
+        assert!(lookups.prs(&target("b", "pr-5", Some(5))).is_none());
+        assert_eq!(lookups.prs(&target("c", "pr-6", Some(6))).unwrap().len(), 1);
+
+        lookups.failed_repos.insert("o/r".into());
+        assert!(lookups.prs(&target("a", "feat/x", None)).is_none());
+        assert_eq!(lookups.prs(&target("c", "pr-6", Some(6))).unwrap().len(), 1);
+
+        let mut no_origin = target("d", "feat/x", None);
+        no_origin.name_with_owner = None;
+        assert!(lookups.prs(&no_origin).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_worker_with_an_unknown_repo_is_left_out() {
+        use Stage::*;
+        let stages = by_worker(
+            ["a", "b", "c", "d"].map(String::from),
+            [
+                ("a".into(), Some(Some(Merged))),
+                ("a".into(), None),
+                ("a".into(), Some(Some(Building))),
+                ("b".into(), Some(Some(Merged))),
+                ("b".into(), Some(Some(Building))),
+                ("c".into(), Some(None)),
+            ],
+        );
+        assert_eq!(
+            stages.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["b", "c", "d"]
+        );
+        assert_eq!(stages["b"].stage, Some(Building));
+        assert_eq!(stages["c"].stage, None);
+        assert_eq!(stages["d"].stage, None);
+    }
+
+    #[test]
+    fn a_worktree_back_on_its_base_uses_the_recorded_branch() {
+        assert_eq!(
+            lookup_branch(Some("main".into()), "feat/x", "origin/main"),
+            "feat/x"
+        );
+        assert_eq!(
+            lookup_branch(Some("feat/y".into()), "feat/x", "origin/main"),
+            "feat/y"
+        );
+        assert_eq!(lookup_branch(None, "feat/x", "origin/main"), "feat/x");
+        assert_eq!(
+            lookup_branch(Some("release/1".into()), "feat/x", "origin/release/1"),
+            "feat/x"
+        );
     }
 
     #[test]
