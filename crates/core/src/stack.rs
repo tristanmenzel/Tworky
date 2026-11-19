@@ -134,11 +134,11 @@ impl Compose {
     }
 
     pub fn up(&self, unreachable_hint: &str, log: &mut dyn FnMut(&str)) -> Result<()> {
-        with_docker_hint(
+        with_missing_docker_hint(with_docker_hint(
             self.stream(&["up", "-d", "--wait"], log),
             unreachable_hint,
             || daemon_reachable(PROBE_TIMEOUT),
-        )
+        ))
     }
 
     pub fn stop(&self, log: &mut dyn FnMut(&str)) -> Result<()> {
@@ -200,13 +200,15 @@ fn unless_docker_missing(result: Result<()>, log: &mut dyn FnMut(&str)) -> Resul
     }
 }
 
+const DOCKER_MISSING: &str = "Docker isn't installed or isn't on PATH. Install Docker Desktop (or the Docker engine), then run `tw worker setup` again.";
+
 pub const DOCKER_UNREACHABLE: &str = "Docker doesn't seem to be running or reachable. Is Docker Desktop (or the Docker service) started?";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn daemon_reachable(timeout: Duration) -> bool {
     let mut cmd = process::command("docker");
-    cmd.args(["version", "--format", "{{.Server.Version}}"]);
+    cmd.arg("version");
     process::output_timeout(cmd, "docker version", timeout).is_ok()
 }
 
@@ -219,6 +221,13 @@ fn with_docker_hint<T>(
 ) -> Result<T> {
     match result {
         Err(e) if !docker_missing(&e) && !reachable() => Err(e.context(hint.to_string())),
+        r => r,
+    }
+}
+
+fn with_missing_docker_hint<T>(result: Result<T>) -> Result<T> {
+    match result {
+        Err(e) if docker_missing(&e) => Err(e.context(DOCKER_MISSING)),
         r => r,
     }
 }
@@ -284,6 +293,22 @@ mod tests {
 
         let e = with_docker_hint(failed(), "hint", || true).unwrap_err();
         assert_eq!(format!("{e:#}"), "`docker compose up` failed");
+    }
+
+    #[test]
+    fn says_docker_is_missing_only_when_it_is() {
+        let missing = process::stream(
+            process::command("tworky-no-such-program"),
+            "tworky-no-such-program",
+            &mut |_| {},
+        );
+        let e = with_missing_docker_hint(missing).unwrap_err();
+        assert!(format!("{e:#}").starts_with(DOCKER_MISSING));
+
+        let failed: Result<()> = Err(anyhow::anyhow!("`docker compose up` failed"));
+        let e = with_missing_docker_hint(failed).unwrap_err();
+        assert_eq!(format!("{e:#}"), "`docker compose up` failed");
+        assert!(with_missing_docker_hint(Ok(())).is_ok());
     }
 
     #[test]

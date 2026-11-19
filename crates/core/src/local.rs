@@ -144,9 +144,11 @@ fn stack_containers(w: &WorkerRecord, project: Option<&ProjectConfig>) -> StackV
             ),
             Err(e) if stack::docker_missing(&e) => view(None, None, false),
             // A probe after a timeout would make the poll wait out a second timeout.
-            Err(e) if !process::timed_out(&e) && !stack::daemon_reachable(PS_TIMEOUT) => {
-                view(None, Some(stack::DOCKER_UNREACHABLE.to_string()), true)
-            }
+            Err(e) if !process::timed_out(&e) && !stack::daemon_reachable(PS_TIMEOUT) => view(
+                None,
+                Some(format!("{} {e:#}", stack::DOCKER_UNREACHABLE)),
+                true,
+            ),
             Err(e) => view(None, Some(format!("{e:#}")), false),
         },
     }
