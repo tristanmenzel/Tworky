@@ -22,7 +22,6 @@ pub struct LocalStatus {
     /// `None` when the project has no stack or docker isn't installed.
     pub stack: Option<Vec<ContainerStatus>>,
     pub stack_error: Option<String>,
-    /// `docker compose ps` failed and the daemon didn't answer either.
     pub docker_down: bool,
     pub listeners: Vec<PortListener>,
 }

@@ -37,8 +37,7 @@ the user to add [[services]] to the project in its project setup session (Projec
 Tworky can start them and the user can start or stop them. Projects without dev servers, such as \
 a CLI or library, need none.";
 
-/// Whether to show `NO_SERVICES_NOTE`. A dev server needs a port, so a set-up project with no
-/// `[ports]` has none to declare.
+/// Outside onboarding, a project with no `[ports]` has no dev servers, since each needs a port.
 pub fn suggest_services(project: &ProjectConfig) -> bool {
     project.services.is_empty() && (!project.ports.is_empty() || project.onboarding)
 }

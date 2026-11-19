@@ -210,8 +210,8 @@ pub fn daemon_reachable(timeout: Duration) -> bool {
     process::output_timeout(cmd, "docker version", timeout).is_ok()
 }
 
-/// Docker's own error doesn't reliably say the daemon is down, so a failure other than a missing
-/// docker asks the daemon directly and, if it doesn't answer, adds `hint`.
+/// Docker's own error doesn't reliably say the daemon is down, so on failure this probes it and
+/// adds `hint` if it doesn't answer.
 fn with_docker_hint<T>(
     result: Result<T>,
     hint: &str,
