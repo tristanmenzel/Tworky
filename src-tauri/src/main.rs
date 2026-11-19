@@ -1,9 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod browser;
+mod freshness;
 mod keep_awake;
 mod pty;
-mod title;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -1085,6 +1085,7 @@ fn watch_activity(app: AppHandle) {
     let Ok(paths) = Paths::resolve() else { return };
     let mut memory_changes = memory_change_names(&paths);
     let mut memory_files = memory_file_stamps(&paths);
+    let mut freshness = freshness::Freshness::default();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(750));
         let names = memory_change_names(&paths);
@@ -1096,8 +1097,11 @@ fn watch_activity(app: AppHandle) {
         }
         let state = app.state::<AppState>();
         let mut now = activity::read_all(&paths);
+        let polled = std::time::Instant::now();
+        freshness.poll(activity::modified_all(&paths).ok(), polled);
+        let mut quietly_idle = HashSet::new();
         for (id, session) in now.iter_mut() {
-            if session.activity == Activity::Working
+            if session.recorded == Activity::Working
                 && state
                     .sessions
                     .silent_for(id)
@@ -1106,6 +1110,13 @@ fn watch_activity(app: AppHandle) {
                 && let Some(updated) = activity::read(&paths, id)
             {
                 *session = updated;
+            }
+            if session.activity == Activity::Working
+                && session.recorded != Activity::Working
+                && (!state.sessions.is_live(id) || freshness.is_stale(id, polled))
+            {
+                session.activity = Activity::Idle;
+                quietly_idle.insert(id.clone());
             }
         }
         let before = std::mem::replace(&mut *state.activity.lock().unwrap(), now.clone());
@@ -1135,8 +1146,10 @@ fn watch_activity(app: AppHandle) {
                 (was, Some(Activity::Account)) if was != Some(Activity::Account) => {
                     attention = Some(tauri::UserAttentionType::Critical);
                 }
-                (Some(Activity::Working), Some(Activity::Idle))
-                | (Some(Activity::Working | Activity::Idle), Some(Activity::Uat)) => {
+                (Some(Activity::Working), Some(Activity::Idle)) if !quietly_idle.contains(id) => {
+                    attention.get_or_insert(tauri::UserAttentionType::Informational);
+                }
+                (Some(Activity::Working | Activity::Idle), Some(Activity::Uat)) => {
                     attention.get_or_insert(tauri::UserAttentionType::Informational);
                 }
                 _ => {}
