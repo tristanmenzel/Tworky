@@ -93,9 +93,11 @@ Tworky works with no configuration. `tw paths` prints where config and data live
 ## Building from source
 
 Prerequisites:
-- Rust (stable)
-- Node 24
+- Rust (version in `rust-toolchain.toml`, installed by rustup)
+- Node (version in `.node-version`)
 - On Linux, `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config`
+
+mise reads `.node-version` only with idiomatic version files enabled for node (`mise settings add idiomatic_version_file_enable_tools node`; opt-in since mise v2025.10.0). rustup reads `rust-toolchain.toml` itself, but a global mise `rust` entry exports `RUSTUP_TOOLCHAIN`, which outranks the file, unless `rust` is also enabled as an idiomatic tool.
 
 ```sh
 npm ci

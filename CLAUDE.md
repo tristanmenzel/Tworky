@@ -31,6 +31,7 @@ Everything on the list is an **item** with a random name such as `brisk-otter`, 
 
 ## Commands
 
+- The Rust version is pinned in `rust-toolchain.toml` (with clippy and rustfmt) and the Node version in `.node-version`. CI and release read both, so bump them there.
 - `cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings` must pass. Run `cargo fmt --all` before committing.
 - `npm run check` runs svelte-check. `npm run build` builds the UI.
