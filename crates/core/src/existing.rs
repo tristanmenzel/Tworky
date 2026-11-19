@@ -479,7 +479,14 @@ pub fn is_ready(pr: &PrDetail) -> bool {
 }
 
 pub fn verdict(b: &BranchWork) -> Option<Verdict> {
-    let pr = b.pull_requests.first().filter(|p| p.is_open())?;
+    b.pull_requests.first().and_then(pr_verdict)
+}
+
+/// `None` unless the PR is open.
+pub fn pr_verdict(pr: &PrDetail) -> Option<Verdict> {
+    if !pr.is_open() {
+        return None;
+    }
     Some(
         if !pr.checks.failing.is_empty() || has_conflicts(pr) || !pr.changes_requested_by.is_empty()
         {
@@ -763,10 +770,13 @@ mod tests {
         let mut p = pr();
         p.approved_by = vec!["a".into()];
         edit(&mut p);
-        verdict(&BranchWork {
+        let of_pr = pr_verdict(&p);
+        let of_branch = verdict(&BranchWork {
             pull_requests: vec![p],
             ..Default::default()
-        })
+        });
+        assert_eq!(of_pr, of_branch);
+        of_branch
     }
 
     #[test]

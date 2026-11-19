@@ -247,6 +247,11 @@ async fn delete_branch(
 }
 
 #[tauri::command]
+async fn worker_stages() -> CmdResult<BTreeMap<String, tworky_core::stage::WorkerStage>> {
+    blocking(|| tworky_core::stage::worker_stages(&workspace()?).map_err(err)).await
+}
+
+#[tauri::command]
 async fn assign_to_me(app: AppHandle, issue_id: String) -> CmdResult<IssuesPayload> {
     blocking(move || {
         let state = app.state::<AppState>();
@@ -1431,6 +1436,7 @@ fn main() {
             remove_item,
             existing_work,
             delete_branch,
+            worker_stages,
             list_workers,
             worker_log,
             list_jobs,

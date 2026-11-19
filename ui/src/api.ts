@@ -207,6 +207,18 @@ export type Verdict = 'needs_attention' | 'draft' | 'ready' | 'in_review'
 
 export type WorkSubject = { kind: 'issue'; id: string } | { kind: 'item'; name: string }
 
+export type Stage =
+  | 'building'
+  | 'pr_draft'
+  | 'in_review'
+  | 'needs_attention'
+  | 'ready'
+  | 'merged'
+
+export interface WorkerStage {
+  stage: Stage | null
+}
+
 export interface BranchWork {
   repo: string
   name_with_owner: string | null
@@ -513,6 +525,7 @@ export const api = {
     invoke<BranchWork[]>('existing_work', { subject, refresh }),
   deleteBranch: (subject: WorkSubject, repo: string, branch: string) =>
     invoke<string[]>('delete_branch', { subject, repo, branch }),
+  workerStages: () => invoke<Record<string, WorkerStage>>('worker_stages'),
   issues: (refresh: boolean) => invoke<IssuesPayload>('get_issues', { refresh }),
   workers: () => invoke<Worker[]>('list_workers'),
   workerLog: (id: string) => invoke<string[]>('worker_log', { id }),
