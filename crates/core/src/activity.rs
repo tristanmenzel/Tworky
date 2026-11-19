@@ -66,7 +66,15 @@ pub fn phase_from_hook(input: &serde_json::Value) -> Option<Phase> {
         "PreToolUse" if text("/tool_name") == Some("Skill") => {
             skill_phase(text("/tool_input/skill")?)
         }
-        "UserPromptSubmit" if text("/permission_mode") == Some("plan") => Some(Phase::Planning),
+        "UserPromptSubmit" if text("/permission_mode") == Some("plan") => {
+            let command = text("/prompt")
+                .and_then(|prompt| prompt.trim_start().strip_prefix('/'))
+                .and_then(|prompt| prompt.split_whitespace().next());
+            match command.and_then(skill_phase) {
+                Some(_) => None,
+                None => Some(Phase::Planning),
+            }
+        }
         "PostToolUse" if text("/tool_name") == Some("ExitPlanMode") => Some(Phase::Building),
         _ => None,
     }
@@ -491,6 +499,18 @@ mod tests {
             ),
             (
                 json!({"hook_event_name": "UserPromptSubmit", "permission_mode": "plan", "prompt": "x"}),
+                Some(Phase::Planning),
+            ),
+            (
+                json!({"hook_event_name": "UserPromptSubmit", "permission_mode": "plan", "prompt": "/graft:research x"}),
+                None,
+            ),
+            (
+                json!({"hook_event_name": "UserPromptSubmit", "permission_mode": "plan", "prompt": "  /graft:orchestrate"}),
+                None,
+            ),
+            (
+                json!({"hook_event_name": "UserPromptSubmit", "permission_mode": "plan", "prompt": "/graft:diff"}),
                 Some(Phase::Planning),
             ),
             (

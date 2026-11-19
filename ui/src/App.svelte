@@ -69,6 +69,7 @@
   const DUE_CHECK_MS = 30_000
   const JOBS_POLL_MS = 10_000
   const STAGES_DEBOUNCE_MS = 10_000
+  const STAGES_MIN_GAP_MS = 60_000
   const ITEM_PREFIX = 'item:'
 
   interface JobTab {
@@ -85,6 +86,9 @@
   let workerStages = $state<Record<string, WorkerStage>>({})
   let stagesTimer: ReturnType<typeof setTimeout> | undefined
   let stagesRequest = 0
+  let stagesApplied = 0
+  let stagesPending = false
+  let stagesDebouncedAt = 0
   let selectedId = $state<string | null>(null)
   let flashId = $state<string | null>(null)
   let itemTab = $state<string>('overview')
@@ -248,7 +252,8 @@
     const request = ++stagesRequest
     try {
       const loaded = await api.workerStages()
-      if (request !== stagesRequest) return
+      if (request <= stagesApplied) return
+      stagesApplied = request
       const merged = { ...loaded }
       for (const w of workers) if (!(w.id in merged) && workerStages[w.id]) merged[w.id] = workerStages[w.id]
       workerStages = merged
@@ -258,14 +263,28 @@
   }
 
   function loadWorkerStagesSoon() {
-    if (stagesTimer !== undefined) return
+    if (stagesTimer !== undefined || stagesPending) return
+    const delay = Math.max(STAGES_DEBOUNCE_MS, stagesDebouncedAt + STAGES_MIN_GAP_MS - Date.now())
     stagesTimer = setTimeout(() => {
       stagesTimer = undefined
-      loadWorkerStages()
-    }, STAGES_DEBOUNCE_MS)
+      runPendingStagesLoad()
+    }, delay)
+  }
+
+  function runPendingStagesLoad() {
+    stagesPending = document.hidden
+    if (stagesPending) return
+    stagesDebouncedAt = Date.now()
+    loadWorkerStages()
+  }
+
+  function onVisibilityChange() {
+    refreshIssuesIfDue()
+    if (!document.hidden && stagesPending) runPendingStagesLoad()
   }
 
   async function loadIssues(refresh: boolean) {
+    stagesPending = false
     loadWorkerStages()
     loading = true
     if (refresh) issuesRefreshedAt = Date.now()
@@ -692,7 +711,7 @@
     loadMemoryChanges()
     api.browserTabs().then((tabs) => (browserTabs = tabs), showError)
     const timer = setInterval(refreshIssuesIfDue, DUE_CHECK_MS)
-    document.addEventListener('visibilitychange', refreshIssuesIfDue)
+    document.addEventListener('visibilitychange', onVisibilityChange)
     const jobsTimer = setInterval(() => {
       if (document.hidden) return
       loadJobs()
@@ -740,7 +759,7 @@
       clearInterval(timer)
       clearInterval(jobsTimer)
       clearTimeout(stagesTimer)
-      document.removeEventListener('visibilitychange', refreshIssuesIfDue)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
       unlisten.forEach((p) => p.then((f) => f()))
     }
   })
