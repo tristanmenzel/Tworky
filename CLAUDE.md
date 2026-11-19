@@ -31,11 +31,11 @@ Everything on the list is an **item** with a random name such as `brisk-otter`, 
 
 ## Commands
 
-- The Rust version is pinned in `rust-toolchain.toml` (with clippy and rustfmt) and the Node version in `.node-version`. CI and release read both, so bump them there.
+- `rust-toolchain.toml` pins the Rust version (with clippy and rustfmt) and `.node-version` the Node version. CI and release read both, so change versions there.
 - `cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings` must pass. Run `cargo fmt --all` before committing.
 - `npm run check` runs svelte-check. `npm run build` builds the UI.
-- `npm run fmt:check` checks the UI code's formatting (oxfmt). Run `npm run fmt` before committing UI changes. Both pass `--threads=1` because multi-threaded oxfmt 0.79 crashes on Windows (an access violation at exit, in about 18% of runs, only with `.svelte` files), so don't drop it as a speed tweak.
+- `npm run fmt:check` checks the UI code's formatting (oxfmt). Run `npm run fmt` before committing UI changes. Keep `--threads=1` in both scripts: multi-threaded oxfmt 0.79 crashes on Windows with an access violation at exit in about 18% of runs on `.svelte` files.
 - `node scripts/notices.mjs` regenerates `THIRD-PARTY-NOTICES.txt`. Run it after any dependency change; CI fails if the file is stale.
   - It needs `cargo install cargo-about --locked --version 0.9.3 --features cli`.
   - A devDependency whose code Vite bundles into `dist` must be added to `bundledDevDependencies` in the script, or it is left out.
