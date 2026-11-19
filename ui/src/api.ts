@@ -55,6 +55,9 @@ export type WorkerStatus = 'creating' | 'ready' | 'failed' | 'cleaning'
  */
 export type Activity = 'working' | 'idle' | 'waiting' | 'uat' | 'account'
 
+/** The Graft skill a worker's session last ran, recorded by its hooks. Kept after the session ends. */
+export type Phase = 'researching' | 'planning' | 'building'
+
 export interface Handover {
   summary: string
   steps: string[]
@@ -90,6 +93,7 @@ export interface Worker {
   activity: Activity | null
   handover: Handover | null
   account_requests: AccountRequest[]
+  phase: Phase | null
 }
 
 /** A dev server, watcher or test run still running in a worker. */

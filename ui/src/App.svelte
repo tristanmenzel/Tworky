@@ -13,6 +13,7 @@
     type BrowserTabView,
     type Handover,
     type AccountRequest,
+    type Phase,
     type Job,
     type LocalStatus,
     type ProjectMemoryChanges,
@@ -665,7 +666,13 @@
         logs[e.payload.id] ??= []
         logs[e.payload.id].push(e.payload.line)
       }),
-      listen<{ id: string; activity: Activity | null; handover: Handover | null; account_requests: AccountRequest[] }>(
+      listen<{
+        id: string
+        activity: Activity | null
+        handover: Handover | null
+        account_requests: AccountRequest[]
+        phase: Phase | null
+      }>(
         'session-activity',
         (e) => {
           const w = workerById(e.payload.id)
@@ -673,6 +680,7 @@
             w.activity = e.payload.activity
             w.handover = e.payload.handover
             w.account_requests = e.payload.account_requests
+            w.phase = e.payload.phase
           }
         },
       ),

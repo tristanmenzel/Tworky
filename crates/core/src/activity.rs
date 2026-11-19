@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -43,6 +42,38 @@ pub struct Handover {
     pub tabs: Vec<u64>,
 }
 
+/// Which Graft skill the session last ran, recorded by `tw session-phase --from-hook`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    Researching,
+    Planning,
+    Building,
+}
+
+fn skill_phase(skill: &str) -> Option<Phase> {
+    match skill.trim_start_matches('/') {
+        "graft:research" => Some(Phase::Researching),
+        "graft:plan" => Some(Phase::Planning),
+        "graft:orchestrate" | "graft:execute" | "graft:yolo" => Some(Phase::Building),
+        _ => None,
+    }
+}
+
+/// The phase a Claude Code hook's input implies, if any.
+pub fn phase_from_hook(input: &serde_json::Value) -> Option<Phase> {
+    let text = |pointer: &str| input.pointer(pointer).and_then(serde_json::Value::as_str);
+    match text("/hook_event_name")? {
+        "UserPromptExpansion" => skill_phase(text("/command_name")?),
+        "PreToolUse" if text("/tool_name") == Some("Skill") => {
+            skill_phase(text("/tool_input/skill")?)
+        }
+        "UserPromptSubmit" if text("/permission_mode") == Some("plan") => Some(Phase::Planning),
+        "PostToolUse" if text("/tool_name") == Some("ExitPlanMode") => Some(Phase::Building),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountRequest {
     pub name: String,
@@ -57,6 +88,7 @@ pub struct Session {
     pub activity: Activity,
     pub handover: Option<Handover>,
     pub account_requests: Vec<AccountRequest>,
+    pub phase: Option<Phase>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -66,6 +98,8 @@ struct Record {
     handover: Option<Handover>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     account_requests: Vec<AccountRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase: Option<Phase>,
 }
 
 impl Record {
@@ -79,6 +113,7 @@ impl Record {
             activity,
             handover: self.handover,
             account_requests: self.account_requests,
+            phase: self.phase,
         }
     }
 }
@@ -91,14 +126,20 @@ fn load(file: &Path) -> Option<Record> {
     serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()
 }
 
-static UPDATING: Mutex<()> = Mutex::new(());
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
-/// Written atomically, so the app polling the folder never reads half a file.
+/// Written atomically, so the app polling the folder never reads half a file. Hooks for one event
+/// run in parallel as separate processes, so the read-modify-write holds a lock on a file beside it.
 fn update(paths: &Paths, worker: &str, change: impl FnOnce(&mut Record)) -> Result<()> {
-    let _updating = UPDATING.lock().unwrap_or_else(|e| e.into_inner());
     let dir = dir(paths);
     std::fs::create_dir_all(&dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(format!("{worker}.lock")))?;
+    lock.lock()?;
     let file = dir.join(format!("{worker}.json"));
     let mut record = load(&file).unwrap_or_default();
     change(&mut record);
@@ -137,6 +178,10 @@ pub fn new_conversation(paths: &Paths, worker: &str) -> Result<()> {
     })
 }
 
+pub fn set_phase(paths: &Paths, worker: &str, phase: Phase) -> Result<()> {
+    update(paths, worker, |r| r.phase = Some(phase))
+}
+
 pub fn hand_over(paths: &Paths, worker: &str, handover: Handover) -> Result<()> {
     update(paths, worker, |r| r.handover = Some(handover))
 }
@@ -167,6 +212,7 @@ pub fn dismiss_account_requests(paths: &Paths, worker: &str) -> Result<()> {
 
 pub fn forget(paths: &Paths, worker: &str) {
     let _ = std::fs::remove_file(dir(paths).join(format!("{worker}.json")));
+    let _ = std::fs::remove_file(dir(paths).join(format!("{worker}.lock")));
 }
 
 pub fn read(paths: &Paths, worker: &str) -> Option<Session> {
@@ -418,5 +464,114 @@ mod tests {
         let session = read(&paths, "acme-1").unwrap();
         assert_eq!(session.activity, Activity::Idle);
         assert!(session.account_requests.is_empty());
+        assert_eq!(session.phase, None);
+    }
+
+    #[test]
+    fn hooks_map_to_phases() {
+        use serde_json::json;
+        let cases = [
+            (
+                json!({"hook_event_name": "UserPromptExpansion", "command_name": "graft:research"}),
+                Some(Phase::Researching),
+            ),
+            (
+                json!({"hook_event_name": "UserPromptExpansion", "command_name": "/graft:plan"}),
+                Some(Phase::Planning),
+            ),
+            (
+                json!({"hook_event_name": "PreToolUse", "tool_name": "Skill", "tool_input": {"skill": "graft:orchestrate"}}),
+                Some(Phase::Building),
+            ),
+            (
+                json!({"hook_event_name": "PreToolUse", "tool_name": "Skill", "tool_input": {"skill": "graft:execute"}}),
+                Some(Phase::Building),
+            ),
+            (
+                json!({"hook_event_name": "PreToolUse", "tool_name": "Skill", "tool_input": {"skill": "graft:yolo"}}),
+                Some(Phase::Building),
+            ),
+            (
+                json!({"hook_event_name": "UserPromptSubmit", "permission_mode": "plan", "prompt": "x"}),
+                Some(Phase::Planning),
+            ),
+            (
+                json!({"hook_event_name": "PostToolUse", "tool_name": "ExitPlanMode"}),
+                Some(Phase::Building),
+            ),
+            (
+                json!({"hook_event_name": "PreToolUse", "tool_name": "Skill", "tool_input": {"skill": "simplify"}}),
+                None,
+            ),
+            (
+                json!({"hook_event_name": "UserPromptExpansion", "command_name": "other:plan"}),
+                None,
+            ),
+            (
+                json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "permission_mode": "plan"}),
+                None,
+            ),
+            (
+                json!({"hook_event_name": "UserPromptSubmit", "permission_mode": "auto"}),
+                None,
+            ),
+            (
+                json!({"hook_event_name": "PostToolUse", "tool_name": "Bash"}),
+                None,
+            ),
+            (json!({"hook_event_name": "UserPromptExpansion"}), None),
+            (
+                json!({"hook_event_name": "PreToolUse", "tool_name": "Skill"}),
+                None,
+            ),
+            (json!({"hook_event_name": "UserPromptSubmit"}), None),
+            (json!({"command_name": "graft:plan"}), None),
+            (json!("graft:plan"), None),
+        ];
+        for (input, phase) in cases {
+            assert_eq!(phase_from_hook(&input), phase, "{input}");
+        }
+    }
+
+    #[test]
+    fn the_phase_lasts_across_turns_and_conversations() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = paths(home.path());
+        set_phase(&paths, "acme-1", Phase::Planning).unwrap();
+        new_turn(&paths, "acme-1").unwrap();
+        new_conversation(&paths, "acme-1").unwrap();
+        record(&paths, "acme-1", Activity::Idle).unwrap();
+        assert_eq!(read(&paths, "acme-1").unwrap().phase, Some(Phase::Planning));
+        set_phase(&paths, "acme-1", Phase::Building).unwrap();
+        assert_eq!(read(&paths, "acme-1").unwrap().phase, Some(Phase::Building));
+        let saved = std::fs::read_to_string(dir(&paths).join("acme-1.json")).unwrap();
+        assert!(saved.contains(r#""phase":"building""#), "{saved}");
+    }
+
+    #[test]
+    fn writers_of_different_fields_never_undo_each_other() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = paths(home.path());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..150 {
+                    record(&paths, "acme-1", Activity::Idle).unwrap();
+                    assert_eq!(activity(&paths, "acme-1"), Some(Activity::Idle));
+                    new_turn(&paths, "acme-1").unwrap();
+                    assert_eq!(activity(&paths, "acme-1"), Some(Activity::Working));
+                }
+            });
+            scope.spawn(|| {
+                for phase in [Phase::Planning, Phase::Building].repeat(150) {
+                    set_phase(&paths, "acme-1", phase).unwrap();
+                    assert_eq!(read(&paths, "acme-1").unwrap().phase, Some(phase));
+                }
+            });
+        });
+        let session = read(&paths, "acme-1").unwrap();
+        assert_eq!(
+            (session.activity, session.phase),
+            (Activity::Working, Some(Phase::Building))
+        );
     }
 }

@@ -89,6 +89,10 @@ pub(crate) fn session_settings(
         }] }])
     };
     let waiting = report("waiting");
+    let phase = serde_json::json!([{
+        "type": "command",
+        "command": format!("tw session-phase --from-hook{target} || true"),
+    }]);
     let mut settings = serde_json::json!({
         "hooks": {
             "SessionStart": [
@@ -96,14 +100,24 @@ pub(crate) fn session_settings(
                 { "matcher": "startup|resume", "hooks": report("idle")[0]["hooks"] },
                 { "matcher": "clear", "hooks": report("idle --new-conversation")[0]["hooks"] },
             ],
-            "UserPromptSubmit": report("working --new-turn"),
-            "PreToolUse": [{ "matcher": "AskUserQuestion|ExitPlanMode", "hooks": waiting[0]["hooks"] }],
+            "UserPromptSubmit": [
+                report("working --new-turn")[0],
+                { "hooks": phase },
+            ],
+            "UserPromptExpansion": [{ "matcher": "^graft:", "hooks": phase }],
+            "PreToolUse": [
+                { "matcher": "AskUserQuestion|ExitPlanMode", "hooks": waiting[0]["hooks"] },
+                { "matcher": "Skill", "hooks": phase },
+            ],
             "PermissionRequest": waiting,
             "Notification": [{
                 "matcher": "permission_prompt|elicitation_dialog|elicitation_url_dialog",
                 "hooks": waiting[0]["hooks"],
             }],
-            "PostToolUse": report("working"),
+            "PostToolUse": [
+                report("working")[0],
+                { "matcher": "ExitPlanMode", "hooks": phase },
+            ],
             "PostToolUseFailure": report("working"),
             "Stop": report("idle"),
             "StopFailure": report("idle"),
@@ -2717,6 +2731,45 @@ run = "{sleep}"
         let resumed = hooks(&ws.launch(&w.id, None).unwrap());
         assert_eq!(resumed.len(), 3);
         assert!(resumed[2].contains("run tw worker setup"));
+    }
+
+    #[test]
+    fn session_hooks_record_the_graft_phase() {
+        let settings: Value = serde_json::from_str(&session_settings(
+            "acme",
+            Path::new("m.md"),
+            false,
+            false,
+            Some("setup@acme"),
+        ))
+        .unwrap();
+        let hooks = &settings["hooks"];
+        let phase = "tw session-phase --from-hook --worker 'setup@acme' || true";
+        let command = |entry: &Value| entry["hooks"][0]["command"].as_str().unwrap().to_string();
+
+        let submit = hooks["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(submit.len(), 2);
+        assert!(command(&submit[0]).contains("tw session-state working --new-turn"));
+        assert_eq!(command(&submit[1]), phase);
+        assert_eq!(submit[1].get("matcher"), None);
+
+        let expansion = &hooks["UserPromptExpansion"][0];
+        assert_eq!(expansion["matcher"], "^graft:");
+        assert_eq!(command(expansion), phase);
+
+        let pre = hooks["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0]["matcher"], "AskUserQuestion|ExitPlanMode");
+        assert!(command(&pre[0]).contains("tw session-state waiting"));
+        assert_eq!(pre[1]["matcher"], "Skill");
+        assert_eq!(command(&pre[1]), phase);
+
+        let post = hooks["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 2);
+        assert_eq!(post[0].get("matcher"), None);
+        assert!(command(&post[0]).contains("tw session-state working"));
+        assert_eq!(post[1]["matcher"], "ExitPlanMode");
+        assert_eq!(command(&post[1]), phase);
     }
 
     #[test]
