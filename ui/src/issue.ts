@@ -1,4 +1,17 @@
-import type { Activity, BoardStatus, Card, Issue, IssueState, Item, PrSummary, Service, Worker } from './api'
+import type {
+  Activity,
+  BoardStatus,
+  Card,
+  Issue,
+  IssueState,
+  Item,
+  Phase,
+  PrSummary,
+  Service,
+  Stage,
+  Worker,
+  WorkerStage,
+} from './api'
 import { ask } from './confirm.svelte'
 
 export function typeClass(type: string | null): string {
@@ -171,4 +184,33 @@ export function activityRank(a: Activity | null): number {
 export function serviceUrl(service: Service, w: Worker): string | null {
   const port = service.port === null ? undefined : w.ports[service.port]
   return port === undefined ? null : `${service.https ? 'https' : 'http'}://localhost:${port}/`
+}
+
+export type CardStage = Phase | Stage
+
+export type StageTone = 'muted' | 'epic' | 'accent' | 'warn' | 'bad' | 'ok'
+
+export const STAGE_INFO: Record<CardStage, { label: string; step: number; tone: StageTone }> = {
+  researching: { label: 'Researching', step: 1, tone: 'muted' },
+  planning: { label: 'Planning', step: 2, tone: 'epic' },
+  building: { label: 'Building', step: 3, tone: 'accent' },
+  pr_draft: { label: 'PR draft', step: 4, tone: 'muted' },
+  in_review: { label: 'In review', step: 5, tone: 'warn' },
+  needs_attention: { label: 'PR needs attention', step: 5, tone: 'bad' },
+  ready: { label: 'Ready to merge', step: 6, tone: 'ok' },
+  merged: { label: 'Merged', step: 7, tone: 'ok' },
+}
+
+export const STAGE_STEPS = 7
+
+/** The least advanced stage of the card's workers; `needs_attention` beats everything. */
+export function cardStage(workers: Worker[], stages: Record<string, WorkerStage>): CardStage | null {
+  let least: CardStage | null = null
+  for (const w of workers) {
+    const stage = stages[w.id]?.stage ?? w.phase
+    if (!stage) continue
+    if (stage === 'needs_attention') return stage
+    if (!least || STAGE_INFO[stage].step < STAGE_INFO[least].step) least = stage
+  }
+  return least
 }

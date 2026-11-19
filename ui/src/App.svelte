@@ -19,6 +19,7 @@
     type ProjectMemoryChanges,
     type ProjectSummary,
     type Worker,
+    type WorkerStage,
   } from './api'
   import ActionMenu from './ActionMenu.svelte'
   import AddIssueDialog from './AddIssueDialog.svelte'
@@ -55,16 +56,19 @@
     activityLabel,
     activityOf,
     activityRank,
+    cardStage,
     formatBytes,
     jobLabel,
     ownsItem,
     serviceUrl,
     subjectLabel,
     subjectUrl,
+    type CardStage,
   } from './issue'
 
   const DUE_CHECK_MS = 30_000
   const JOBS_POLL_MS = 10_000
+  const STAGES_DEBOUNCE_MS = 10_000
   const ITEM_PREFIX = 'item:'
 
   interface JobTab {
@@ -78,6 +82,8 @@
   let view = $state<View>('items')
   let payload = $state<IssuesPayload | null>(null)
   let workers = $state<Worker[]>([])
+  let workerStages = $state<Record<string, WorkerStage>>({})
+  let stagesTimer: ReturnType<typeof setTimeout> | undefined
   let selectedId = $state<string | null>(null)
   let flashId = $state<string | null>(null)
   let itemTab = $state<string>('overview')
@@ -149,6 +155,19 @@
       const card = workItemOf(w)
       const activity = activityOf(w)
       if (card && activity && activityRank(activity) > activityRank(m.get(card) ?? null)) m.set(card, activity)
+    }
+    return m
+  })
+  const stageByCard = $derived.by(() => {
+    const byCard = new Map<string, Worker[]>()
+    for (const w of workers) {
+      const card = workItemOf(w)
+      if (card) byCard.set(card, [...(byCard.get(card) ?? []), w])
+    }
+    const m = new Map<string, CardStage>()
+    for (const [card, ws] of byCard) {
+      const stage = cardStage(ws, workerStages)
+      if (stage) m.set(card, stage)
     }
     return m
   })
@@ -224,7 +243,21 @@
     error = message
   }
 
+  async function loadWorkerStages() {
+    try {
+      workerStages = await api.workerStages()
+    } catch (e) {
+      console.error('Loading worker stages failed', e)
+    }
+  }
+
+  function loadWorkerStagesSoon() {
+    clearTimeout(stagesTimer)
+    stagesTimer = setTimeout(loadWorkerStages, STAGES_DEBOUNCE_MS)
+  }
+
   async function loadIssues(refresh: boolean) {
+    loadWorkerStages()
     loading = true
     if (refresh) issuesRefreshedAt = Date.now()
     try {
@@ -677,6 +710,7 @@
         (e) => {
           const w = workerById(e.payload.id)
           if (w) {
+            if (w.activity === 'working' && e.payload.activity !== 'working') loadWorkerStagesSoon()
             w.activity = e.payload.activity
             w.handover = e.payload.handover
             w.account_requests = e.payload.account_requests
@@ -696,6 +730,7 @@
     return () => {
       clearInterval(timer)
       clearInterval(jobsTimer)
+      clearTimeout(stagesTimer)
       document.removeEventListener('visibilitychange', refreshIssuesIfDue)
       unlisten.forEach((p) => p.then((f) => f()))
     }
@@ -836,6 +871,7 @@
               workers={workersByIssue}
               itemWorkers={workersByItem}
               {activityByCard}
+              {stageByCard}
               {selectedId}
               {flashId}
               onSelect={select}
