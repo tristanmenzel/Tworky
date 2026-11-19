@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -109,6 +108,10 @@ pub struct Session {
     pub recorded: Activity,
     #[serde(skip)]
     pub background: bool,
+    /// Counts the hooks' writes, so the app can tell a session still running them from one that
+    /// has gone quiet. The app's own writes leave it alone.
+    #[serde(skip)]
+    pub beat: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -120,6 +123,8 @@ struct Record {
     account_requests: Vec<AccountRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     background: Vec<BackgroundTask>,
+    #[serde(default)]
+    beat: u64,
 }
 
 impl Record {
@@ -137,6 +142,7 @@ impl Record {
             account_requests: self.account_requests,
             recorded: self.activity,
             background,
+            beat: self.beat,
         }
     }
 }
@@ -152,9 +158,16 @@ fn load(file: &Path) -> Option<Record> {
 static UPDATING: Mutex<()> = Mutex::new(());
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
+/// A hook's write, which counts as a sign of life (see `Session::beat`).
+fn beat(paths: &Paths, worker: &str, change: impl FnOnce(&mut Record)) -> Result<()> {
+    update(paths, worker, |r| {
+        r.beat = r.beat.wrapping_add(1);
+        change(r);
+    })
+}
+
 /// Written atomically, so the app polling the folder never reads half a file. Main-agent and
-/// subagent hooks run `tw` at the same time, hence the file lock. Every call writes, even when
-/// nothing changes, because the app reads a new mtime as a sign of life.
+/// subagent hooks run `tw` at the same time, hence the file lock.
 fn update(paths: &Paths, worker: &str, change: impl FnOnce(&mut Record)) -> Result<()> {
     let _updating = UPDATING.lock().unwrap_or_else(|e| e.into_inner());
     let dir = dir(paths);
@@ -177,15 +190,21 @@ fn update(paths: &Paths, worker: &str, change: impl FnOnce(&mut Record)) -> Resu
     Ok(())
 }
 
-/// Records what the session is doing. A handover stays until the next prompt or a dismiss.
+/// Records what the session is doing, as a hook reports it. A handover stays until the next prompt
+/// or a dismiss.
 pub fn record(paths: &Paths, worker: &str, activity: Activity) -> Result<()> {
+    beat(paths, worker, |r| r.activity = activity)
+}
+
+/// The app's own judgement of what the session is doing, which isn't a sign of life.
+pub fn correct(paths: &Paths, worker: &str, activity: Activity) -> Result<()> {
     update(paths, worker, |r| r.activity = activity)
 }
 
 /// The user sent a new prompt: the session is working and any handover or account request is over.
 /// Background work stays listed, because Esc can end this turn without a Stop that would re-list it.
 pub fn new_turn(paths: &Paths, worker: &str) -> Result<()> {
-    update(paths, worker, |r| {
+    beat(paths, worker, |r| {
         r.activity = Activity::Working;
         r.handover = None;
         r.account_requests.clear();
@@ -195,7 +214,7 @@ pub fn new_turn(paths: &Paths, worker: &str) -> Result<()> {
 /// Background work reported back, and the session takes a turn over it. Unlike a prompt from the
 /// user, it leaves a handover and account requests pending.
 pub fn background_report(paths: &Paths, worker: &str) -> Result<()> {
-    update(paths, worker, |r| r.activity = Activity::Working)
+    beat(paths, worker, |r| r.activity = Activity::Working)
 }
 
 /// The turn ended. `background` replaces the listed background work; `None` keeps it.
@@ -204,7 +223,7 @@ pub fn record_stop(
     worker: &str,
     background: Option<Vec<BackgroundTask>>,
 ) -> Result<()> {
-    update(paths, worker, |r| {
+    beat(paths, worker, |r| {
         r.activity = Activity::Idle;
         if let Some(background) = background {
             r.background = background;
@@ -214,14 +233,25 @@ pub fn record_stop(
 
 /// The session started or resumed, so background work from before is gone.
 pub fn session_start(paths: &Paths, worker: &str) -> Result<()> {
-    update(paths, worker, |r| {
-        r.activity = Activity::Idle;
-        r.background.clear();
-    })
+    beat(paths, worker, start)
+}
+
+/// The app is about to start the session's Claude, so nothing an earlier run recorded still holds.
+/// Makes no record when there is none.
+pub fn launching(paths: &Paths, worker: &str) -> Result<()> {
+    if read(paths, worker).is_none() {
+        return Ok(());
+    }
+    update(paths, worker, start)
+}
+
+fn start(r: &mut Record) {
+    r.activity = Activity::Idle;
+    r.background.clear();
 }
 
 /// The session started a new conversation: a handover, account request or background work from
-/// the old one is over.
+/// the old one is over. The hook records an activity alongside, which is its sign of life.
 pub fn new_conversation(paths: &Paths, worker: &str) -> Result<()> {
     if read(paths, worker).is_none() {
         return Ok(());
@@ -233,14 +263,14 @@ pub fn new_conversation(paths: &Paths, worker: &str) -> Result<()> {
     })
 }
 
-/// A subagent finished a tool call. Rewrites the record so it reads as fresh, and ends a `Waiting`,
+/// A subagent finished a tool call. Counts as a sign of life, and ends a `Waiting`,
 /// since the call proves its dialog was answered (by mouse, which doesn't count as typing).
 /// `Idle` and `Working` stay as they are. Makes no record when there is none.
 pub fn touch(paths: &Paths, worker: &str) -> Result<()> {
     if read(paths, worker).is_none() {
         return Ok(());
     }
-    update(paths, worker, |r| {
+    beat(paths, worker, |r| {
         if r.activity == Activity::Waiting {
             r.activity = Activity::Working;
         }
@@ -296,27 +326,6 @@ pub fn read_all(paths: &Paths) -> HashMap<String, Session> {
             Some((worker, load(&path)?.session()))
         })
         .collect()
-}
-
-/// Kept apart from `Session` so a write that changes nothing the UI shows isn't reported as a
-/// change. A record whose time can't be read is left out.
-pub fn modified_all(paths: &Paths) -> std::io::Result<HashMap<String, SystemTime>> {
-    let entries = match std::fs::read_dir(dir(paths)) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(e) => return Err(e),
-    };
-    Ok(entries
-        .filter_map(|e| {
-            let entry = e.ok()?;
-            let path = entry.path();
-            if path.extension()? != "json" {
-                return None;
-            }
-            let worker = path.file_stem()?.to_str()?.to_string();
-            Some((worker, entry.metadata().ok()?.modified().ok()?))
-        })
-        .collect())
 }
 
 #[cfg(test)]
@@ -509,17 +518,6 @@ mod tests {
     }
 
     #[test]
-    fn modification_times_cover_records_only() {
-        let home = tempfile::tempdir().unwrap();
-        let paths = paths(home.path());
-        assert!(modified_all(&paths).unwrap().is_empty());
-        record(&paths, "acme-1", Activity::Working).unwrap();
-        std::fs::write(dir(&paths).join("acme-2.1.0.tmp"), "{}").unwrap();
-        let modified = modified_all(&paths).unwrap();
-        assert_eq!(modified.keys().collect::<Vec<_>>(), ["acme-1"]);
-    }
-
-    #[test]
     fn a_record_without_requests_reads_as_none() {
         let home = tempfile::tempdir().unwrap();
         let paths = paths(home.path());
@@ -529,6 +527,7 @@ mod tests {
         assert_eq!(session.activity, Activity::Idle);
         assert!(session.account_requests.is_empty());
         assert!(!session.background);
+        assert_eq!(session.beat, 0);
     }
 
     fn stop_input() -> serde_json::Value {
@@ -706,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn touch_moves_the_mtime_and_changes_nothing_else() {
+    fn touch_beats_and_changes_nothing_else() {
         let home = tempfile::tempdir().unwrap();
         let paths = paths(home.path());
         touch(&paths, "acme-1").unwrap();
@@ -723,19 +722,66 @@ mod tests {
         )
         .unwrap();
         record_stop(&paths, "acme-1", Some(vec![task("a1", "subagent")])).unwrap();
-        let file = dir(&paths).join("acme-1.json");
-        let before = std::fs::read_to_string(&file).unwrap();
-        let past = SystemTime::now() - std::time::Duration::from_secs(3600);
-        std::fs::File::options()
-            .write(true)
-            .open(&file)
-            .unwrap()
-            .set_modified(past)
-            .unwrap();
+        let before = read(&paths, "acme-1").unwrap();
 
         touch(&paths, "acme-1").unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
-        assert!(modified_all(&paths).unwrap()["acme-1"] > past);
+        let after = read(&paths, "acme-1").unwrap();
+        assert_eq!(after.beat, before.beat + 1);
+        assert_eq!(Session { beat: 0, ..after }, Session { beat: 0, ..before });
+    }
+
+    #[test]
+    fn only_hook_writes_beat() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = paths(home.path());
+        let beat = |paths: &Paths| read(paths, "acme-1").unwrap().beat;
+        record(&paths, "acme-1", Activity::Working).unwrap();
+        let mut last = beat(&paths);
+        for hook in [
+            |p: &Paths| record(p, "acme-1", Activity::Idle),
+            |p: &Paths| new_turn(p, "acme-1"),
+            |p: &Paths| background_report(p, "acme-1"),
+            |p: &Paths| record_stop(p, "acme-1", None),
+            |p: &Paths| session_start(p, "acme-1"),
+            |p: &Paths| touch(p, "acme-1"),
+        ] {
+            hook(&paths).unwrap();
+            assert_eq!(beat(&paths), last + 1);
+            last += 1;
+        }
+
+        let handover = Handover {
+            summary: "s".into(),
+            steps: vec![],
+            tabs: vec![],
+        };
+        hand_over(&paths, "acme-1", handover).unwrap();
+        request_account(&paths, "acme-1", request("Admin", "r")).unwrap();
+        dismiss(&paths, "acme-1").unwrap();
+        dismiss_account_request(&paths, "acme-1", "Admin").unwrap();
+        dismiss_account_requests(&paths, "acme-1").unwrap();
+        correct(&paths, "acme-1", Activity::Working).unwrap();
+        new_conversation(&paths, "acme-1").unwrap();
+        launching(&paths, "acme-1").unwrap();
+        assert_eq!(beat(&paths), last);
+    }
+
+    #[test]
+    fn launching_clears_what_an_earlier_run_recorded() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = paths(home.path());
+        launching(&paths, "acme-1").unwrap();
+        assert_eq!(read(&paths, "acme-1"), None, "no record is made");
+
+        new_turn(&paths, "acme-1").unwrap();
+        record_stop(&paths, "acme-1", Some(vec![task("a1", "subagent")])).unwrap();
+        new_turn(&paths, "acme-1").unwrap();
+        launching(&paths, "acme-1").unwrap();
+        let session = read(&paths, "acme-1").unwrap();
+        assert_eq!(
+            (session.activity, session.recorded, session.background),
+            (Activity::Idle, Activity::Idle, false)
+        );
     }
 
     #[test]

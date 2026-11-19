@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -18,7 +19,6 @@ struct Shared {
     /// its opening cursor position query before the program can start.
     attached: bool,
     alive: bool,
-    last_output: Option<std::time::Instant>,
 }
 
 struct Session {
@@ -29,31 +29,55 @@ struct Session {
     generation: u64,
 }
 
-/// The live sessions by id, apart from `inner` so the keep awake controller never waits behind a
-/// pty write that blocks. An entry is started, and replaced, only under the `inner` lock, so its
-/// generation is always that of the session in `inner`. An end from any other generation is
-/// ignored, so an old reader finishing after a respawn leaves the new entry alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Live {
+    pub generation: u64,
+    pub last_output: Option<Instant>,
+}
+
+impl Live {
+    /// How long the session has written nothing to its terminal, if it ever has.
+    pub fn silent_for(&self, now: Instant) -> Option<Duration> {
+        self.last_output.map(|at| now.saturating_duration_since(at))
+    }
+}
+
+/// The live sessions by id, apart from `inner` so `watch_activity` and the keep awake controller
+/// never wait behind a pty write that blocks. An entry is started, and replaced, only under the
+/// `inner` lock, so its generation is always that of the session in `inner`. Output and an end
+/// from any other generation are ignored, so an old reader after a respawn leaves the new entry
+/// alone.
 #[derive(Default, Clone)]
-struct Liveness(Arc<Mutex<HashMap<String, u64>>>);
+struct Liveness(Arc<Mutex<HashMap<String, Live>>>);
 
 impl Liveness {
     fn start(&self, id: &str, generation: u64) {
-        self.0.lock().unwrap().insert(id.to_string(), generation);
+        self.0.lock().unwrap().insert(
+            id.to_string(),
+            Live {
+                generation,
+                last_output: None,
+            },
+        );
+    }
+
+    fn output(&self, id: &str, generation: u64, at: Instant) {
+        if let Some(live) = self.0.lock().unwrap().get_mut(id)
+            && live.generation == generation
+        {
+            live.last_output = Some(at);
+        }
     }
 
     fn end(&self, id: &str, generation: u64) {
         let mut live = self.0.lock().unwrap();
-        if live.get(id) == Some(&generation) {
+        if live.get(id).is_some_and(|l| l.generation == generation) {
             live.remove(id);
         }
     }
 
-    fn ids(&self) -> HashSet<String> {
-        self.0.lock().unwrap().keys().cloned().collect()
-    }
-
-    fn contains(&self, id: &str) -> bool {
-        self.0.lock().unwrap().contains_key(id)
+    fn snapshot(&self) -> HashMap<String, Live> {
+        self.0.lock().unwrap().clone()
     }
 }
 
@@ -71,13 +95,6 @@ impl Sessions {
             .unwrap()
             .get(id)
             .is_some_and(|s| s.shared.lock().unwrap().alive)
-    }
-
-    /// How long a live session has written nothing to its terminal.
-    pub fn silent_for(&self, id: &str) -> Option<std::time::Duration> {
-        let sessions = self.inner.lock().unwrap();
-        let s = sessions.get(id)?.shared.lock().unwrap();
-        s.alive.then(|| s.last_output.map(|t| t.elapsed()))?
     }
 
     pub fn spawn(
@@ -153,8 +170,8 @@ impl Sessions {
                 if text.is_empty() {
                     continue;
                 }
+                liveness.output(&thread_id, generation, Instant::now());
                 let mut s = thread_shared.lock().unwrap();
-                s.last_output = Some(std::time::Instant::now());
                 s.scrollback.push_str(&text);
                 trim_front(&mut s.scrollback, SCROLLBACK_LIMIT);
                 if let Some(ch) = &s.channel
@@ -236,12 +253,8 @@ impl Sessions {
     }
 
     /// The live sessions, read without waiting on the pty lock.
-    pub fn live_ids(&self) -> HashSet<String> {
-        self.liveness.ids()
-    }
-
-    pub fn is_live(&self, id: &str) -> bool {
-        self.liveness.contains(id)
+    pub fn live_sessions(&self) -> HashMap<String, Live> {
+        self.liveness.snapshot()
     }
 
     pub fn kill_all(&self) {
@@ -405,20 +418,33 @@ mod tests {
     #[test]
     fn liveness_follows_only_the_current_generation() {
         let live = Liveness::default();
+        let now = Instant::now();
         live.start("acme-1", 0);
-        assert!(live.contains("acme-1"));
+        live.output("acme-1", 0, now);
+        assert_eq!(live.snapshot()["acme-1"].last_output, Some(now));
 
         live.start("acme-1", 1);
+        live.output("acme-1", 0, now + Duration::from_secs(1));
         live.end("acme-1", 0);
-        assert!(
-            live.contains("acme-1"),
-            "the old reader's end leaves the new entry"
+        assert_eq!(
+            live.snapshot(),
+            HashMap::from([(
+                "acme-1".to_string(),
+                Live {
+                    generation: 1,
+                    last_output: None
+                }
+            )]),
+            "the old reader's output and end leave the new entry"
         );
-        assert_eq!(live.ids(), HashSet::from(["acme-1".to_string()]));
 
+        live.output("acme-1", 1, now);
+        assert_eq!(
+            live.snapshot()["acme-1"].silent_for(now + Duration::from_secs(5)),
+            Some(Duration::from_secs(5))
+        );
         live.end("acme-1", 1);
-        assert!(!live.contains("acme-1"));
-        assert!(live.ids().is_empty());
+        assert!(live.snapshot().is_empty());
     }
 
     #[test]

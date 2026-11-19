@@ -1,17 +1,18 @@
 //! Keeps the host from idle-sleeping while a session's Claude is busy, as its activity record says.
 
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant, SystemTime};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tworky_core::activity::{self, Activity, Session};
+use tworky_core::activity::{Activity, Session};
 use tworky_core::config::Paths;
 use tworky_core::power::{self, LockKind, PowerSource, SLEEP_LOCK_REASON, SleepLock};
 use tworky_core::settings::{KeepAwake, Settings};
 
 use crate::freshness::Freshness;
+use crate::pty::Live;
 use crate::{AppState, CmdResult, err};
 
 const POLL: Duration = Duration::from_secs(1);
@@ -89,15 +90,15 @@ impl<L: Lock> Controller<L> {
     fn count_busy(
         &mut self,
         sessions: &HashMap<String, Session>,
-        live: &HashSet<String>,
-        mtimes: Option<HashMap<String, SystemTime>>,
+        live: &HashMap<String, Live>,
         now: Instant,
     ) -> usize {
-        self.freshness.poll(mtimes, now);
+        self.freshness
+            .poll(sessions.iter().map(|(id, s)| (id.as_str(), s.beat)), now);
         sessions
             .iter()
             .filter(|(id, s)| {
-                live.contains(*id)
+                live.contains_key(*id)
                     && !self.freshness.is_stale(id, now)
                     && (s.recorded == Activity::Working || s.background)
             })
@@ -182,12 +183,7 @@ pub fn run(app: AppHandle) {
         let mode = state.keep_awake.lock().unwrap().mode;
         let sessions = state.activity.lock().unwrap().clone();
         let now = Instant::now();
-        let busy = controller.count_busy(
-            &sessions,
-            &state.sessions.live_ids(),
-            activity::modified_all(&paths).ok(),
-            now,
-        );
+        let busy = controller.count_busy(&sessions, &state.sessions.live_sessions(), now);
         let status = controller.step(mode, busy, now, power::power_source, || {
             SleepLock::acquire(SLEEP_LOCK_REASON)
         });
@@ -244,6 +240,7 @@ mod tests {
             account_requests: vec![],
             recorded,
             background,
+            beat: 0,
         }
     }
 
@@ -252,7 +249,6 @@ mod tests {
         now: Instant,
         session: Session,
         live: bool,
-        mtime: SystemTime,
     }
 
     impl Sim {
@@ -262,7 +258,6 @@ mod tests {
                 now: Instant::now(),
                 session,
                 live: true,
-                mtime: SystemTime::UNIX_EPOCH,
             };
             sim.poll();
             sim
@@ -271,14 +266,17 @@ mod tests {
         fn poll(&mut self) -> usize {
             let sessions = HashMap::from([("acme-1".to_string(), self.session.clone())]);
             let live = if self.live {
-                HashSet::from(["acme-1".to_string()])
+                HashMap::from([(
+                    "acme-1".to_string(),
+                    Live {
+                        generation: 0,
+                        last_output: None,
+                    },
+                )])
             } else {
-                HashSet::new()
+                HashMap::new()
             };
-            let mtimes = HashMap::from([("acme-1".to_string(), self.mtime)]);
-            let busy = self
-                .controller
-                .count_busy(&sessions, &live, Some(mtimes), self.now);
+            let busy = self.controller.count_busy(&sessions, &live, self.now);
             let (status, _, _) = step(
                 &mut self.controller,
                 KeepAwake::Always,
@@ -296,7 +294,7 @@ mod tests {
             for i in 1..=secs {
                 self.now += SEC;
                 if write_every.is_some_and(|n| i % n == 0) {
-                    self.mtime += SEC;
+                    self.session.beat += 1;
                 }
                 busy = self.poll();
             }
@@ -352,16 +350,24 @@ mod tests {
             let mut sim = Sim::new(session(Activity::Working, background));
             assert_eq!(sim.run(30 * 60 - 1, None), 1);
             assert_eq!(sim.run(1, None), 0);
-            assert_eq!(sim.run(1, Some(1)), 1, "a write makes it fresh again");
+            assert_eq!(sim.run(1, Some(1)), 1, "a hook write makes it fresh again");
         }
     }
 
     #[test]
-    fn a_session_whose_record_time_was_never_read_is_not_busy() {
-        let mut c = Controller::<FakeLock>::new(false);
-        let live = HashSet::from(["acme-1".to_string()]);
-        let sessions = HashMap::from([("acme-1".to_string(), session(Activity::Working, false))]);
-        assert_eq!(c.count_busy(&sessions, &live, None, Instant::now()), 0);
+    fn an_app_write_does_not_keep_a_session_busy() {
+        let mut handed_over = session(Activity::Idle, true);
+        handed_over.activity = Activity::Uat;
+        handed_over.handover = Some(Handover {
+            summary: "s".into(),
+            steps: vec![],
+            tabs: vec![],
+        });
+        let mut sim = Sim::new(handed_over);
+        assert_eq!(sim.run(29 * 60, None), 1);
+        sim.session.handover = None;
+        sim.session.activity = Activity::Working;
+        assert_eq!(sim.run(60, None), 0, "dismissing the handover isn't a beat");
     }
 
     #[derive(Debug)]
