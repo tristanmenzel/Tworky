@@ -132,7 +132,18 @@ mod tests {
         serde_json::from_str(&script[start..]).unwrap()
     }
 
-    fn parse_with_node(script: &str) -> Option<Result<(), String>> {
+    const RUN_IN_NODE: &str = r#"
+const vm = require('vm')
+const window = {}
+window.top = window
+class HTMLInputElement {}
+Object.defineProperty(HTMLInputElement.prototype, 'value', { get() { return '' }, set(_) {} })
+const document = { querySelectorAll: () => [] }
+const result = vm.runInNewContext(require('fs').readFileSync(0, 'utf8'), { window, document, HTMLInputElement })
+process.stdout.write(result === undefined ? 'undefined' : JSON.stringify(result))
+"#;
+
+    fn run_with_node(script: &str) -> Option<Result<String, String>> {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
@@ -143,16 +154,19 @@ mod tests {
                 return None;
             }
         }
-        let mut child = Command::new("node")
-            .args([
-                "-e",
-                "new (require('vm').Script)(require('fs').readFileSync(0,'utf8'))",
-            ])
+        let mut child = match Command::new("node")
+            .args(["-e", RUN_IN_NODE])
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .ok()?;
+        {
+            Ok(child) => child,
+            Err(error) => {
+                println!("skipped: node couldn't be spawned: {error}");
+                return None;
+            }
+        };
         child
             .stdin
             .take()
@@ -160,24 +174,25 @@ mod tests {
             .write_all(script.as_bytes())
             .unwrap();
         let out = child.wait_with_output().unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("SyntaxError") {
-            return Some(Err(stderr.into_owned()));
-        }
         if !out.status.success() {
-            println!("skipped: node failed without a SyntaxError: {stderr}");
-            return None;
+            return Some(Err(String::from_utf8_lossy(&out.stderr).into_owned()));
         }
-        Some(Ok(()))
+        Some(Ok(String::from_utf8_lossy(&out.stdout).into_owned()))
     }
 
     #[test]
-    fn the_wrapped_scripts_parse_as_classic_scripts() {
-        for script in [detect_script(), fill_script(Some("tom"), Some("pw"), true)] {
-            if let Some(Err(error)) = parse_with_node(&script) {
-                panic!("{error}");
-            }
-        }
+    fn the_wrapped_scripts_run_and_return_the_call_result() {
+        let Some(detected) = run_with_node(&detect_script()) else {
+            return;
+        };
+        assert_eq!(detected.unwrap_or_else(|e| panic!("{e}")), "undefined");
+        let Some(filled) = run_with_node(&fill_script(Some("tom"), Some("pw"), true)) else {
+            return;
+        };
+        assert_eq!(
+            filled.unwrap_or_else(|e| panic!("{e}")),
+            r#"{"filled":[],"submitted":false}"#
+        );
     }
 
     #[tokio::test]
