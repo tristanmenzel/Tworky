@@ -92,6 +92,13 @@
     }
   }
 
+  /** The main window has no new-window handler, so a middle-click or "Open link in new window" would load GitHub in an app window. */
+  function externalLink(e: MouseEvent, url: string) {
+    if (e.type === 'auxclick' && e.button !== 1) return
+    e.preventDefault()
+    if (e.type !== 'contextmenu') openUrl(url)
+  }
+
   function hasConflicts(pr: PrDetail): boolean {
     return pr.mergeable === 'CONFLICTING' || pr.merge_state === 'DIRTY'
   }
@@ -184,10 +191,23 @@
       {@const verdict = VERDICTS[b.verdict!]}
       <div class="panel card" class:attention={b.verdict === 'needs_attention'}>
         <div class="top">
+          <span class="pill verdict {verdict.tone}">{verdict.label}</span>
           <div class="main">
             <div class="title-line">
-              <button class="link title" onclick={() => openUrl(pr.url)}>{pr.title}</button>
-              <button class="link muted" onclick={() => openUrl(pr.url)}>{b.repo}#{pr.number} ↗</button>
+              <a
+                class="title"
+                href={pr.url}
+                onclick={(e) => externalLink(e, pr.url)}
+                onauxclick={(e) => externalLink(e, pr.url)}
+                oncontextmenu={(e) => externalLink(e, pr.url)}>{pr.title}</a
+              >
+              <a
+                class="repo-link"
+                href={pr.url}
+                onclick={(e) => externalLink(e, pr.url)}
+                onauxclick={(e) => externalLink(e, pr.url)}
+                oncontextmenu={(e) => externalLink(e, pr.url)}>{b.repo}#{pr.number} ↗</a
+              >
             </div>
             <div class="muted meta">
               <code>{pr.head}</code> → <code>{pr.base}</code>
@@ -195,7 +215,6 @@
               {#if pr.updated_at}· updated {ago(Date.parse(pr.updated_at))}{/if}
             </div>
           </div>
-          <span class="pill {verdict.tone}">{verdict.label}</span>
         </div>
         <div class="pills">
           {#each pr.checks.failing as c (c.name)}
@@ -377,27 +396,31 @@
     padding: 6px 14px;
   }
   .top {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    align-items: flex-start;
+    display: flow-root;
+  }
+  .verdict {
+    float: right;
+    margin-left: 10px;
+    line-height: 1.2;
   }
   .main {
     flex: 1 1 300px;
     min-width: 0;
   }
   .title-line {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    align-items: center;
+    overflow-wrap: anywhere;
+  }
+  .title,
+  .repo-link {
+    text-decoration: none;
   }
   .title {
     color: var(--text);
     font-weight: 600;
     font-size: 14px;
   }
-  .title:hover {
+  .title:hover,
+  .repo-link:hover {
     text-decoration: underline;
   }
   .meta {
@@ -492,13 +515,6 @@
   .compact .card.waiting {
     padding: 8px 10px;
     gap: 6px 8px;
-  }
-  .compact .top {
-    flex-wrap: nowrap;
-    gap: 8px;
-  }
-  .compact .main {
-    flex: 1 1 0;
   }
   .compact .waiting .main {
     flex-basis: 100%;
