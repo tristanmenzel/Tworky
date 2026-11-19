@@ -72,6 +72,12 @@ enum Command {
         /// requests.
         #[arg(long)]
         new_conversation: bool,
+        /// The turn ended. Reads the hook's `background_tasks` from stdin.
+        #[arg(long)]
+        stop: bool,
+        /// The session started or resumed, which ends any background work listed before.
+        #[arg(long)]
+        session_start: bool,
     },
     /// Record the Graft phase (researching, planning or building) a hook's input implies. Run by
     /// session hooks.
@@ -437,16 +443,17 @@ fn main() -> Result<()> {
             id,
             new_turn,
             new_conversation,
+            stop,
+            session_start,
         } => {
-            let paths = Paths::resolve()?;
-            if new_turn {
-                return tworky_core::activity::new_turn(&paths, &id);
-            }
-            tworky_core::activity::record(&paths, &id, activity)?;
-            if new_conversation {
-                tworky_core::activity::new_conversation(&paths, &id)?;
-            }
-            Ok(())
+            let flags = SessionFlags {
+                new_turn,
+                new_conversation,
+                stop,
+                session_start,
+            };
+            let change = session_change(activity, flags, hook_input().as_ref());
+            apply_session_change(&Paths::resolve()?, &id, change)
         }
         Command::SessionPhase { from_hook, id } => {
             anyhow::ensure!(from_hook, "pass --from-hook with the hook's input on stdin");
@@ -470,6 +477,87 @@ fn main() -> Result<()> {
         Command::Issue(cmd) => issue(cmd),
         Command::Item(cmd) => item(cmd),
         Command::Project(cmd) => project(cmd),
+    }
+}
+
+/// A terminal on stdin means a person ran the command, and reading it would block.
+fn hook_input() -> Option<serde_json::Value> {
+    use std::io::{IsTerminal, Read};
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return None;
+    }
+    let mut text = String::new();
+    stdin.read_to_string(&mut text).ok()?;
+    parse_hook_input(&text)
+}
+
+fn parse_hook_input(text: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(text).ok()
+}
+
+#[derive(Clone, Copy, Default)]
+struct SessionFlags {
+    new_turn: bool,
+    new_conversation: bool,
+    stop: bool,
+    session_start: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum SessionChange {
+    Record(tworky_core::activity::Activity),
+    NewTurn,
+    BackgroundReport,
+    NewConversation(tworky_core::activity::Activity),
+    Stop(Option<Vec<tworky_core::activity::BackgroundTask>>),
+    SessionStart,
+    Touch,
+}
+
+fn session_change(
+    activity: tworky_core::activity::Activity,
+    flags: SessionFlags,
+    input: Option<&serde_json::Value>,
+) -> SessionChange {
+    use tworky_core::activity::{self, Activity};
+    let field = |name: &str| input.and_then(|i| i.get(name)).and_then(|v| v.as_str());
+    if flags.new_turn {
+        return if field("prompt").is_some_and(|p| p.trim_start().starts_with("<task-notification>"))
+        {
+            SessionChange::BackgroundReport
+        } else {
+            SessionChange::NewTurn
+        };
+    }
+    if flags.stop {
+        return SessionChange::Stop(input.and_then(activity::background_from_hook));
+    }
+    if flags.session_start {
+        return SessionChange::SessionStart;
+    }
+    if flags.new_conversation {
+        return SessionChange::NewConversation(activity);
+    }
+    if activity == Activity::Working && field("agent_id").is_some_and(|id| !id.is_empty()) {
+        return SessionChange::Touch;
+    }
+    SessionChange::Record(activity)
+}
+
+fn apply_session_change(paths: &Paths, id: &str, change: SessionChange) -> Result<()> {
+    use tworky_core::activity;
+    match change {
+        SessionChange::Record(a) => activity::record(paths, id, a),
+        SessionChange::NewTurn => activity::new_turn(paths, id),
+        SessionChange::BackgroundReport => activity::background_report(paths, id),
+        SessionChange::NewConversation(a) => {
+            activity::record(paths, id, a)?;
+            activity::new_conversation(paths, id)
+        }
+        SessionChange::Stop(background) => activity::record_stop(paths, id, background),
+        SessionChange::SessionStart => activity::session_start(paths, id),
+        SessionChange::Touch => activity::touch(paths, id),
     }
 }
 
@@ -1262,6 +1350,137 @@ fn worktree(cmd: WorktreeCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tworky_core::activity::{self, Activity, BackgroundTask};
+
+    fn change(activity: Activity, flags: SessionFlags, stdin: &str) -> SessionChange {
+        session_change(activity, flags, parse_hook_input(stdin).as_ref())
+    }
+
+    const STOP: SessionFlags = SessionFlags {
+        new_turn: false,
+        new_conversation: false,
+        stop: true,
+        session_start: false,
+    };
+
+    const NEW_TURN: SessionFlags = SessionFlags {
+        new_turn: true,
+        new_conversation: false,
+        stop: false,
+        session_start: false,
+    };
+
+    fn temp_paths(home: &std::path::Path) -> Paths {
+        Paths {
+            config_dir: home.join("config"),
+            data_dir: home.join("data"),
+        }
+    }
+
+    #[test]
+    fn a_stop_reads_running_background_tasks_from_stdin() {
+        let stdin = r#"{"hook_event_name":"Stop","background_tasks":[
+            {"id":"a1","type":"subagent","status":"running"},
+            {"id":"a2","type":"subagent","status":"completed"},
+            {"id":"s1","type":"shell","status":"running"}]}"#;
+        let stop = change(Activity::Idle, STOP, stdin);
+        assert_eq!(
+            stop,
+            SessionChange::Stop(Some(vec![BackgroundTask {
+                id: "a1".into(),
+                kind: "subagent".into()
+            }]))
+        );
+
+        let home = tempfile::tempdir().unwrap();
+        let paths = temp_paths(home.path());
+        apply_session_change(&paths, "acme-1", stop).unwrap();
+        let session = activity::read(&paths, "acme-1").unwrap();
+        assert_eq!(
+            (session.activity, session.recorded, session.background),
+            (Activity::Working, Activity::Idle, true)
+        );
+    }
+
+    #[test]
+    fn a_stop_without_a_task_list_or_input_keeps_the_list() {
+        let stdin = r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#;
+        assert_eq!(
+            change(Activity::Idle, STOP, stdin),
+            SessionChange::Stop(None)
+        );
+        assert_eq!(change(Activity::Idle, STOP, ""), SessionChange::Stop(None));
+        assert_eq!(
+            change(Activity::Idle, STOP, "not json"),
+            SessionChange::Stop(None)
+        );
+        assert_eq!(
+            change(Activity::Idle, SessionFlags::default(), ""),
+            SessionChange::Record(Activity::Idle)
+        );
+    }
+
+    #[test]
+    fn a_task_notification_prompt_is_a_background_report() {
+        let stdin = r#"{"hook_event_name":"UserPromptSubmit",
+            "prompt":"<task-notification>\n<task-id>a1</task-id>"}"#;
+        assert_eq!(
+            change(Activity::Working, NEW_TURN, stdin),
+            SessionChange::BackgroundReport
+        );
+        let user =
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"fix the <task-notification> bug"}"#;
+        assert_eq!(
+            change(Activity::Working, NEW_TURN, user),
+            SessionChange::NewTurn
+        );
+        assert_eq!(
+            change(Activity::Working, NEW_TURN, ""),
+            SessionChange::NewTurn
+        );
+    }
+
+    #[test]
+    fn a_subagent_tool_call_leaves_an_idle_record_idle() {
+        let stdin = r#"{"hook_event_name":"PostToolUse","agent_id":"a1","agent_type":"Explore"}"#;
+        let touch = change(Activity::Working, SessionFlags::default(), stdin);
+        assert_eq!(touch, SessionChange::Touch);
+
+        let home = tempfile::tempdir().unwrap();
+        let paths = temp_paths(home.path());
+        activity::record(&paths, "acme-1", Activity::Idle).unwrap();
+        apply_session_change(&paths, "acme-1", touch).unwrap();
+        assert_eq!(
+            activity::read(&paths, "acme-1").unwrap().activity,
+            Activity::Idle
+        );
+
+        let main = r#"{"hook_event_name":"PostToolUse","tool_name":"Bash"}"#;
+        assert_eq!(
+            change(Activity::Working, SessionFlags::default(), main),
+            SessionChange::Record(Activity::Working)
+        );
+    }
+
+    #[test]
+    fn session_start_and_clear_map_to_their_changes() {
+        let start = SessionFlags {
+            session_start: true,
+            ..SessionFlags::default()
+        };
+        assert_eq!(
+            change(Activity::Idle, start, ""),
+            SessionChange::SessionStart
+        );
+        let clear = SessionFlags {
+            new_conversation: true,
+            ..SessionFlags::default()
+        };
+        assert_eq!(
+            change(Activity::Idle, clear, ""),
+            SessionChange::NewConversation(Activity::Idle)
+        );
+    }
 
     /// `tw` commands quoted in a guide, with placeholders filled in.
     fn quoted_commands(guide: &str) -> Vec<String> {

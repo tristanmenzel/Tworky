@@ -1,48 +1,23 @@
-//! Keeps the host from idle-sleeping while a session's Claude is working, judged by its title
-//! spinner (`title.rs`).
+//! Keeps the host from idle-sleeping while a session's Claude is busy, as its activity record says.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tworky_core::activity;
+use tworky_core::activity::{Activity, Session};
 use tworky_core::config::Paths;
 use tworky_core::power::{self, LockKind, PowerSource, SLEEP_LOCK_REASON, SleepLock};
 use tworky_core::settings::{KeepAwake, Settings};
 
+use crate::freshness::Freshness;
+use crate::pty::Live;
 use crate::{AppState, CmdResult, err};
 
-/// A session is busy this long after its last spinner tick.
-pub const BUSY_WINDOW: Duration = Duration::from_secs(5);
-/// A longer gap between ticks starts a new run. It is wider than `BUSY_WINDOW` so that a title
-/// changing every few seconds is one run for the stuck rule rather than many short ones.
-const STUCK_RUN_GAP: Duration = Duration::from_secs(60);
-const STUCK_AFTER: Duration = Duration::from_secs(15 * 60);
 const POLL: Duration = Duration::from_secs(1);
 const POWER_POLL: Duration = Duration::from_secs(15);
 const LOCK_RETRY: Duration = Duration::from_secs(60);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ticks {
-    pub run_start: Instant,
-    pub last: Instant,
-}
-
-impl Ticks {
-    pub fn after(previous: Option<Ticks>, now: Instant) -> Ticks {
-        match previous {
-            Some(t) if now.saturating_duration_since(t.last) <= STUCK_RUN_GAP => {
-                Ticks { last: now, ..t }
-            }
-            _ => Ticks {
-                run_start: now,
-                last: now,
-            },
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KeepAwakeStatus {
@@ -73,83 +48,6 @@ pub struct Control {
     pub status: KeepAwakeStatus,
 }
 
-/// A run that ticks for `STUCK_AFTER` without a write to the session's activity file is a hung
-/// tool or a spinner that never stops. The window starts at the later of the run's start and the
-/// last write, both as `Instant`s the controller saw, so a wall-clock step can't stretch it.
-fn is_stuck(ticks: Ticks, last_write: Option<Instant>, now: Instant) -> bool {
-    let since = last_write.map_or(ticks.run_start, |w| w.max(ticks.run_start));
-    now.saturating_duration_since(since) >= STUCK_AFTER
-}
-
-struct StuckRun {
-    run_start: Instant,
-    at: Instant,
-}
-
-/// Counts busy sessions, leaving out each stuck one until its run of ticks ends or its activity
-/// file is written.
-#[derive(Default)]
-struct BusyCounter {
-    mtimes: HashMap<String, SystemTime>,
-    last_write: HashMap<String, Instant>,
-    stuck_runs: HashMap<String, StuckRun>,
-}
-
-impl BusyCounter {
-    /// `mtimes` is `None` when the activity folder couldn't be read. A file's first time is only a
-    /// baseline, and a ticking session keeps its last time while its file is missing, so a poll
-    /// that misses files can't pass for a write when they reappear.
-    fn count(
-        &mut self,
-        ticks: &HashMap<String, Ticks>,
-        mtimes: Option<HashMap<String, SystemTime>>,
-        now: Instant,
-    ) -> usize {
-        if let Some(mtimes) = mtimes {
-            self.mtimes
-                .retain(|id, _| mtimes.contains_key(id) || ticks.contains_key(id));
-            for (id, mtime) in mtimes {
-                if self
-                    .mtimes
-                    .insert(id.clone(), mtime)
-                    .is_some_and(|m| m != mtime)
-                {
-                    self.last_write.insert(id, now);
-                }
-            }
-            self.last_write.retain(|id, _| self.mtimes.contains_key(id));
-        }
-        self.stuck_runs.retain(|id, stuck| {
-            ticks
-                .get(id)
-                .is_some_and(|t| t.run_start == stuck.run_start)
-                && self.last_write.get(id).is_none_or(|&w| w <= stuck.at)
-        });
-
-        let mut busy = 0;
-        for (id, &t) in ticks {
-            if now.saturating_duration_since(t.last) >= BUSY_WINDOW
-                || self.stuck_runs.contains_key(id)
-            {
-                continue;
-            }
-            if is_stuck(t, self.last_write.get(id).copied(), now) {
-                eprintln!("keep awake: {id} has ticked for 15 min without activity; ignoring it");
-                self.stuck_runs.insert(
-                    id.clone(),
-                    StuckRun {
-                        run_start: t.run_start,
-                        at: now,
-                    },
-                );
-                continue;
-            }
-            busy += 1;
-        }
-        busy
-    }
-}
-
 trait Lock {
     fn refresh(&mut self) -> Result<()>;
     fn kind(&self) -> LockKind;
@@ -168,7 +66,7 @@ impl Lock for SleepLock {
 /// OS calls come in through `step`'s arguments so tests can fake them.
 struct Controller<L> {
     has_battery: bool,
-    busy: BusyCounter,
+    freshness: Freshness,
     mode: Option<KeepAwake>,
     source: Option<(Instant, PowerSource)>,
     lock: Option<L>,
@@ -179,7 +77,7 @@ impl<L: Lock> Controller<L> {
     fn new(has_battery: bool) -> Self {
         Controller {
             has_battery,
-            busy: BusyCounter::default(),
+            freshness: Freshness::default(),
             mode: None,
             source: None,
             lock: None,
@@ -187,16 +85,34 @@ impl<L: Lock> Controller<L> {
         }
     }
 
+    /// A live session with a fresh record is busy while it records working or lists background
+    /// work, whatever its card shows, so a handover posted while a subagent runs still counts.
+    fn count_busy(
+        &mut self,
+        sessions: &HashMap<String, Session>,
+        live: &HashMap<String, Live>,
+        now: Instant,
+    ) -> usize {
+        self.freshness
+            .poll(sessions.iter().map(|(id, s)| (id.as_str(), s.beat)), now);
+        sessions
+            .iter()
+            .filter(|(id, s)| {
+                live.contains_key(*id)
+                    && !self.freshness.is_stale(id, now)
+                    && (s.recorded == Activity::Working || s.background)
+            })
+            .count()
+    }
+
     fn step(
         &mut self,
         mode: KeepAwake,
-        ticks: &HashMap<String, Ticks>,
-        mtimes: Option<HashMap<String, SystemTime>>,
+        busy: usize,
         now: Instant,
         power_source: impl FnOnce() -> PowerSource,
         acquire: impl FnOnce() -> Result<L>,
     ) -> KeepAwakeStatus {
-        let busy = self.busy.count(ticks, mtimes, now);
         if self.mode != Some(mode) {
             self.mode = Some(mode);
             self.source = None;
@@ -265,14 +181,12 @@ pub fn run(app: AppHandle) {
     }
     loop {
         let mode = state.keep_awake.lock().unwrap().mode;
-        let status = controller.step(
-            mode,
-            &state.sessions.ticks(),
-            activity::modified_all(&paths).ok(),
-            Instant::now(),
-            power::power_source,
-            || SleepLock::acquire(SLEEP_LOCK_REASON),
-        );
+        let sessions = state.activity.lock().unwrap().clone();
+        let now = Instant::now();
+        let busy = controller.count_busy(&sessions, &state.sessions.live_sessions(), now);
+        let status = controller.step(mode, busy, now, power::power_source, || {
+            SleepLock::acquire(SLEEP_LOCK_REASON)
+        });
         state.keep_awake.lock().unwrap().status = status.clone();
         if emitted.as_ref() != Some(&status) {
             let was_holding = emitted
@@ -314,237 +228,147 @@ pub fn set_keep_awake(state: State<'_, AppState>, mode: KeepAwake) -> CmdResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tworky_core::activity::Handover;
 
     const MIN: Duration = Duration::from_secs(60);
     const SEC: Duration = Duration::from_secs(1);
 
-    struct Session {
-        ticks: Option<Ticks>,
-        mtime: SystemTime,
+    fn session(recorded: Activity, background: bool) -> Session {
+        Session {
+            activity: recorded,
+            handover: None,
+            account_requests: vec![],
+            recorded,
+            background,
+            beat: 0,
+            phase: None,
+        }
     }
 
     struct Sim {
-        counter: BusyCounter,
+        controller: Controller<FakeLock>,
         now: Instant,
         session: Session,
+        live: bool,
     }
 
     impl Sim {
-        fn new() -> Self {
-            Sim {
-                counter: BusyCounter::default(),
+        fn new(session: Session) -> Self {
+            let mut sim = Sim {
+                controller: Controller::new(false),
                 now: Instant::now(),
-                session: Session {
-                    ticks: None,
-                    mtime: SystemTime::UNIX_EPOCH,
-                },
+                session,
+                live: true,
+            };
+            sim.poll();
+            sim
+        }
+
+        fn poll(&mut self) -> usize {
+            let sessions = HashMap::from([("acme-1".to_string(), self.session.clone())]);
+            let live = if self.live {
+                HashMap::from([(
+                    "acme-1".to_string(),
+                    Live {
+                        generation: 0,
+                        last_output: None,
+                    },
+                )])
+            } else {
+                HashMap::new()
+            };
+            let busy = self.controller.count_busy(&sessions, &live, self.now);
+            let (status, _, _) = step(
+                &mut self.controller,
+                KeepAwake::Always,
+                busy,
+                self.now,
+                PowerSource::Ac,
+                ok(),
+            );
+            assert_eq!(status.holding, status.busy_sessions > 0);
+            status.busy_sessions
+        }
+
+        fn run(&mut self, secs: u64, write_every: Option<u64>) -> usize {
+            let mut busy = 0;
+            for i in 1..=secs {
+                self.now += SEC;
+                if write_every.is_some_and(|n| i % n == 0) {
+                    self.session.beat += 1;
+                }
+                busy = self.poll();
             }
-        }
-
-        fn run(&mut self, secs: u64, ticking: bool, write_every: Option<u64>) -> usize {
-            let trace = self.trace(secs, ticking.then_some(1), write_every);
-            trace.last().copied().unwrap_or(0)
-        }
-
-        fn trace(
-            &mut self,
-            secs: u64,
-            tick_every: Option<u64>,
-            write_every: Option<u64>,
-        ) -> Vec<usize> {
-            (1..=secs)
-                .map(|i| {
-                    self.now += SEC;
-                    if tick_every.is_some_and(|n| i % n == 0) {
-                        self.session.ticks = Some(Ticks::after(self.session.ticks, self.now));
-                    }
-                    if write_every.is_some_and(|n| i % n == 0) {
-                        self.write();
-                    }
-                    self.count()
-                })
-                .collect()
-        }
-
-        fn write(&mut self) {
-            self.session.mtime += SEC;
-        }
-
-        fn count(&mut self) -> usize {
-            let mtimes = HashMap::from([("acme-1".to_string(), self.session.mtime)]);
-            self.poll(Some(mtimes))
-        }
-
-        fn poll(&mut self, mtimes: Option<HashMap<String, SystemTime>>) -> usize {
-            let ticks = self
-                .session
-                .ticks
-                .map(|t| HashMap::from([("acme-1".to_string(), t)]))
-                .unwrap_or_default();
-            self.counter.count(&ticks, mtimes, self.now)
+            busy
         }
     }
 
     #[test]
-    fn ticks_continue_a_run_across_gaps_up_to_a_minute() {
-        let start = Instant::now();
-        let t = Ticks::after(None, start);
-        let t = Ticks::after(Some(t), start + MIN);
-        assert_eq!(t.run_start, start);
-        let t = Ticks::after(Some(t), start + 2 * MIN + SEC);
-        assert_eq!(t.run_start, start + 2 * MIN + SEC);
+    fn busy_while_working() {
+        let mut sim = Sim::new(session(Activity::Working, false));
+        assert_eq!(sim.poll(), 1);
+        sim.session = session(Activity::Idle, false);
+        assert_eq!(sim.run(1, None), 0);
     }
 
     #[test]
-    fn busy_only_while_ticks_are_recent() {
-        let mut sim = Sim::new();
-        sim.count();
-        assert_eq!(sim.run(3, true, None), 1);
-        assert_eq!(sim.run(4, false, None), 1);
-        assert_eq!(sim.run(1, false, None), 0);
+    fn still_busy_after_31_minutes_of_working_with_a_write_every_minute() {
+        let mut sim = Sim::new(session(Activity::Working, false));
+        assert_eq!(sim.run(31 * 60, Some(60)), 1);
     }
 
     #[test]
-    fn a_run_without_writes_is_stuck_until_its_ticks_stop_for_a_minute() {
-        let mut sim = Sim::new();
-        sim.count();
-        assert_eq!(sim.run(15 * 60, true, None), 1);
-        assert_eq!(sim.run(1, true, None), 0);
-        assert_eq!(sim.run(10 * 60, true, None), 0);
-
-        sim.run(60, false, None);
-        assert_eq!(sim.run(1, true, None), 1, "a new run is judged afresh");
-        assert_eq!(sim.run(15 * 60 - 1, true, None), 1);
-        assert_eq!(sim.run(1, true, None), 0, "a second episode");
+    fn busy_while_idle_with_background_work() {
+        let mut sim = Sim::new(session(Activity::Idle, true));
+        assert_eq!(sim.poll(), 1);
     }
 
     #[test]
-    fn a_pause_under_a_minute_does_not_end_a_stuck_run() {
-        let mut sim = Sim::new();
-        sim.count();
-        assert_eq!(sim.run(15 * 60 + 1, true, None), 0);
-        sim.run(59, false, None);
-        assert_eq!(sim.run(1, true, None), 0);
+    fn busy_while_handed_over_with_background_work() {
+        let mut uat = session(Activity::Idle, true);
+        uat.activity = Activity::Uat;
+        uat.handover = Some(Handover {
+            summary: "s".into(),
+            steps: vec![],
+            tabs: vec![],
+        });
+        let mut sim = Sim::new(uat);
+        assert_eq!(sim.poll(), 1);
+        sim.session.background = false;
+        assert_eq!(sim.run(1, None), 0);
     }
 
     #[test]
-    fn a_write_ends_a_stuck_episode() {
-        let mut sim = Sim::new();
-        sim.count();
-        assert_eq!(sim.run(15 * 60 + 1, true, None), 0);
-        sim.write();
-        assert_eq!(sim.run(1, true, None), 1);
-        assert_eq!(sim.run(15 * 60 - 1, true, None), 1);
-        assert_eq!(
-            sim.run(1, true, None),
-            0,
-            "stuck again without another write"
-        );
+    fn not_busy_when_dead() {
+        let mut sim = Sim::new(session(Activity::Working, true));
+        sim.live = false;
+        assert_eq!(sim.run(1, Some(1)), 0);
     }
 
     #[test]
-    fn a_title_changing_every_few_seconds_goes_stuck_and_stays_out() {
-        let mut sim = Sim::new();
-        sim.count();
-        let trace = sim.trace(30 * 60, Some(6), None);
-        assert_eq!(trace[..5], [0; 5]);
-        assert_eq!(trace[5..10], [1; 5]);
-        assert_eq!(trace[899], 1);
-        assert!(trace[905..].iter().all(|&b| b == 0), "no churn once stuck");
-
-        sim.run(60, false, None);
-        assert_eq!(
-            sim.run(1, true, None),
-            1,
-            "the run ended a minute after the last tick"
-        );
-        let trace = sim.trace(16 * 60, Some(6), None);
-        assert_eq!(trace[..899].iter().filter(|&&b| b == 0).count(), 150);
-        assert!(trace[899..].iter().all(|&b| b == 0), "a second episode");
-    }
-
-    #[test]
-    fn the_window_starts_at_the_run_when_the_last_write_is_older() {
-        let mut sim = Sim::new();
-        sim.count();
-        sim.write();
-        sim.run(10 * 60, false, None);
-        assert_eq!(sim.run(15 * 60, true, None), 1);
-        assert_eq!(sim.run(1, true, None), 0);
-    }
-
-    #[test]
-    fn the_window_starts_at_the_last_write_within_the_run() {
-        let mut sim = Sim::new();
-        sim.count();
-        sim.run(10 * 60, true, None);
-        sim.write();
-        assert_eq!(sim.run(15 * 60, true, None), 1);
-        assert_eq!(sim.run(1, true, None), 0);
-    }
-
-    #[test]
-    fn regular_writes_keep_a_ticking_session_busy() {
-        let mut sim = Sim::new();
-        sim.count();
-        assert_eq!(sim.run(2 * 60 * 60, true, Some(5 * 60)), 1);
-    }
-
-    #[test]
-    fn writes_seen_before_the_first_poll_are_not_counted() {
-        let mut counter = BusyCounter::default();
-        let now = Instant::now();
-        let mtimes = HashMap::from([("acme-1".to_string(), SystemTime::now())]);
-        counter.count(&HashMap::new(), Some(mtimes), now);
-        assert!(counter.last_write.is_empty());
-    }
-
-    fn stuck_sim() -> Sim {
-        let mut sim = Sim::new();
-        sim.count();
-        assert_eq!(sim.run(15 * 60 + 1, true, None), 0);
-        sim
-    }
-
-    #[test]
-    fn a_poll_that_misses_files_is_not_a_write() {
-        let other = HashMap::from([("acme-2".to_string(), SystemTime::UNIX_EPOCH)]);
-        for missing in [None, Some(HashMap::new()), Some(other)] {
-            let mut sim = stuck_sim();
-            sim.now += SEC;
-            sim.session.ticks = Some(Ticks::after(sim.session.ticks, sim.now));
-            assert_eq!(sim.poll(missing), 0);
-            assert_eq!(sim.run(1, true, None), 0, "still stuck when it reappears");
-            assert!(sim.counter.last_write.is_empty());
+    fn not_busy_after_30_minutes_without_a_write() {
+        for background in [false, true] {
+            let mut sim = Sim::new(session(Activity::Working, background));
+            assert_eq!(sim.run(30 * 60 - 1, None), 1);
+            assert_eq!(sim.run(1, None), 0);
+            assert_eq!(sim.run(1, Some(1)), 1, "a hook write makes it fresh again");
         }
     }
 
     #[test]
-    fn a_write_after_a_poll_that_missed_files_ends_a_stuck_episode() {
-        let mut sim = stuck_sim();
-        sim.poll(Some(HashMap::new()));
-        sim.write();
-        assert_eq!(sim.run(1, true, None), 1);
-    }
-
-    #[test]
-    fn a_new_file_is_a_baseline_and_its_next_change_a_write() {
-        let mut counter = BusyCounter::default();
-        let now = Instant::now();
-        counter.count(&HashMap::new(), Some(HashMap::new()), now);
-        let t = SystemTime::UNIX_EPOCH;
-        counter.count(
-            &HashMap::new(),
-            Some(HashMap::from([("acme-1".to_string(), t)])),
-            now + SEC,
-        );
-        assert!(counter.last_write.is_empty());
-        counter.count(
-            &HashMap::new(),
-            Some(HashMap::from([("acme-1".to_string(), t + SEC)])),
-            now + 2 * SEC,
-        );
-        assert_eq!(counter.last_write["acme-1"], now + 2 * SEC);
+    fn changes_without_a_beat_do_not_refresh_a_session() {
+        let mut handed_over = session(Activity::Idle, true);
+        handed_over.activity = Activity::Uat;
+        handed_over.handover = Some(Handover {
+            summary: "s".into(),
+            steps: vec![],
+            tabs: vec![],
+        });
+        let mut sim = Sim::new(handed_over);
+        assert_eq!(sim.run(29 * 60, None), 1);
+        sim.session.handover = None;
+        sim.session.activity = Activity::Working;
+        assert_eq!(sim.run(60, None), 0, "dismissing the handover isn't a beat");
     }
 
     #[derive(Debug)]
@@ -565,20 +389,10 @@ mod tests {
         }
     }
 
-    fn busy(now: Instant) -> HashMap<String, Ticks> {
-        HashMap::from([(
-            "acme-1".to_string(),
-            Ticks {
-                run_start: now,
-                last: now,
-            },
-        )])
-    }
-
     fn step(
         c: &mut Controller<FakeLock>,
         mode: KeepAwake,
-        ticks: &HashMap<String, Ticks>,
+        busy: usize,
         now: Instant,
         source: PowerSource,
         acquire: Result<FakeLock>,
@@ -586,8 +400,7 @@ mod tests {
         let (mut read, mut tried) = (false, false);
         let status = c.step(
             mode,
-            ticks,
-            Some(HashMap::new()),
+            busy,
             now,
             || {
                 read = true;
@@ -611,14 +424,7 @@ mod tests {
     fn holds_while_busy_and_releases_when_idle() {
         let mut c = Controller::new(false);
         let now = Instant::now();
-        let (status, read, _) = step(
-            &mut c,
-            KeepAwake::Always,
-            &busy(now),
-            now,
-            PowerSource::Ac,
-            ok(),
-        );
+        let (status, read, _) = step(&mut c, KeepAwake::Always, 1, now, PowerSource::Ac, ok());
         assert!(!read, "power isn't read in always mode");
         assert_eq!(
             status,
@@ -634,7 +440,7 @@ mod tests {
         let (status, _, _) = step(
             &mut c,
             KeepAwake::Always,
-            &HashMap::new(),
+            0,
             now + SEC,
             PowerSource::Ac,
             ok(),
@@ -647,19 +453,12 @@ mod tests {
     fn plugged_in_reads_power_at_most_every_15_seconds_and_only_while_busy() {
         let mut c = Controller::new(true);
         let now = Instant::now();
-        let (_, read, _) = step(
-            &mut c,
-            KeepAwake::PluggedIn,
-            &HashMap::new(),
-            now,
-            PowerSource::Ac,
-            ok(),
-        );
+        let (_, read, _) = step(&mut c, KeepAwake::PluggedIn, 0, now, PowerSource::Ac, ok());
         assert!(!read);
         let (status, read, _) = step(
             &mut c,
             KeepAwake::PluggedIn,
-            &busy(now),
+            1,
             now,
             PowerSource::Battery,
             ok(),
@@ -670,7 +469,7 @@ mod tests {
         let (_, read, _) = step(
             &mut c,
             KeepAwake::PluggedIn,
-            &busy(later),
+            1,
             later,
             PowerSource::Ac,
             ok(),
@@ -680,7 +479,7 @@ mod tests {
         let (status, read, _) = step(
             &mut c,
             KeepAwake::PluggedIn,
-            &busy(later),
+            1,
             later,
             PowerSource::Ac,
             ok(),
@@ -688,14 +487,7 @@ mod tests {
         assert!(read);
         assert_eq!((status.holding, status.on_battery), (true, Some(false)));
 
-        let (status, _, _) = step(
-            &mut c,
-            KeepAwake::Always,
-            &busy(later),
-            later,
-            PowerSource::Ac,
-            ok(),
-        );
+        let (status, _, _) = step(&mut c, KeepAwake::Always, 1, later, PowerSource::Ac, ok());
         assert_eq!(status.on_battery, None, "not read in this mode");
     }
 
@@ -703,14 +495,7 @@ mod tests {
     fn off_never_takes_the_lock() {
         let mut c = Controller::new(false);
         let now = Instant::now();
-        let (status, read, tried) = step(
-            &mut c,
-            KeepAwake::Off,
-            &busy(now),
-            now,
-            PowerSource::Ac,
-            ok(),
-        );
+        let (status, read, tried) = step(&mut c, KeepAwake::Off, 1, now, PowerSource::Ac, ok());
         assert!(!read && !tried && !status.holding);
         assert_eq!(status.busy_sessions, 1);
     }
@@ -722,31 +507,17 @@ mod tests {
         let (status, _, tried) = step(
             &mut c,
             KeepAwake::Always,
-            &busy(now),
+            1,
             now,
             PowerSource::Ac,
             Err(anyhow::anyhow!("no")),
         );
         assert!(tried && !status.holding);
         let later = now + MIN - SEC;
-        let (_, _, tried) = step(
-            &mut c,
-            KeepAwake::Always,
-            &busy(later),
-            later,
-            PowerSource::Ac,
-            ok(),
-        );
+        let (_, _, tried) = step(&mut c, KeepAwake::Always, 1, later, PowerSource::Ac, ok());
         assert!(!tried);
         let later = now + MIN;
-        let (status, _, tried) = step(
-            &mut c,
-            KeepAwake::Always,
-            &busy(later),
-            later,
-            PowerSource::Ac,
-            ok(),
-        );
+        let (status, _, tried) = step(&mut c, KeepAwake::Always, 1, later, PowerSource::Ac, ok());
         assert!(tried && status.holding);
     }
 
@@ -755,34 +526,13 @@ mod tests {
         let mut c = Controller::new(false);
         let now = Instant::now();
         let failing = Ok(FakeLock { fail_refresh: true });
-        let (status, _, _) = step(
-            &mut c,
-            KeepAwake::Always,
-            &busy(now),
-            now,
-            PowerSource::Ac,
-            failing,
-        );
+        let (status, _, _) = step(&mut c, KeepAwake::Always, 1, now, PowerSource::Ac, failing);
         assert!(status.holding);
         let later = now + SEC;
-        let (status, _, tried) = step(
-            &mut c,
-            KeepAwake::Always,
-            &busy(later),
-            later,
-            PowerSource::Ac,
-            ok(),
-        );
+        let (status, _, tried) = step(&mut c, KeepAwake::Always, 1, later, PowerSource::Ac, ok());
         assert!(!tried && !status.holding);
         let later = now + SEC + MIN;
-        let (status, _, tried) = step(
-            &mut c,
-            KeepAwake::Always,
-            &busy(later),
-            later,
-            PowerSource::Ac,
-            ok(),
-        );
+        let (status, _, tried) = step(&mut c, KeepAwake::Always, 1, later, PowerSource::Ac, ok());
         assert!(tried && status.holding);
     }
 }

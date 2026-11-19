@@ -2,14 +2,12 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tauri::ipc::Channel;
 use tworky_core::worker::Launch;
-
-use crate::keep_awake::Ticks;
-use crate::title::TitleTracker;
 
 const SCROLLBACK_LIMIT: usize = 512 * 1024;
 
@@ -21,7 +19,6 @@ struct Shared {
     /// its opening cursor position query before the program can start.
     attached: bool,
     alive: bool,
-    last_output: Option<std::time::Instant>,
 }
 
 struct Session {
@@ -32,58 +29,61 @@ struct Session {
     generation: u64,
 }
 
-struct SessionTicks {
-    generation: u64,
-    ticks: Option<Ticks>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Live {
+    pub generation: u64,
+    pub last_output: Option<Instant>,
 }
 
-/// Each live session's spinner ticks, apart from `inner` so the keep awake controller never waits
-/// behind a pty write that blocks. An entry is started, and replaced, only under the `inner` lock,
-/// so its generation is always that of the session in `inner`. Ticks and ends from any other
-/// generation are ignored, so an old reader finishing after a respawn leaves the new entry alone.
-#[derive(Default, Clone)]
-struct TickBoard(Arc<Mutex<HashMap<String, SessionTicks>>>);
+impl Live {
+    pub fn silent_for(&self, now: Instant) -> Option<Duration> {
+        self.last_output.map(|at| now.saturating_duration_since(at))
+    }
+}
 
-impl TickBoard {
+/// The live sessions by id, apart from `inner` so `watch_activity` and the keep awake controller
+/// never wait behind a pty write that blocks. An entry is started, and replaced, only under the
+/// `inner` lock, so its generation is always that of the session in `inner`. Output and an end
+/// from any other generation are ignored, so an old reader after a respawn leaves the new entry
+/// alone.
+#[derive(Default, Clone)]
+struct Liveness(Arc<Mutex<HashMap<String, Live>>>);
+
+impl Liveness {
     fn start(&self, id: &str, generation: u64) {
         self.0.lock().unwrap().insert(
             id.to_string(),
-            SessionTicks {
+            Live {
                 generation,
-                ticks: None,
+                last_output: None,
             },
         );
     }
 
-    fn tick(&self, id: &str, generation: u64, now: std::time::Instant) {
-        if let Some(s) = self.0.lock().unwrap().get_mut(id)
-            && s.generation == generation
+    fn output(&self, id: &str, generation: u64, at: Instant) {
+        if let Some(live) = self.0.lock().unwrap().get_mut(id)
+            && live.generation == generation
         {
-            s.ticks = Some(Ticks::after(s.ticks, now));
+            live.last_output = Some(at);
         }
     }
 
     fn end(&self, id: &str, generation: u64) {
-        let mut board = self.0.lock().unwrap();
-        if board.get(id).is_some_and(|s| s.generation == generation) {
-            board.remove(id);
+        let mut live = self.0.lock().unwrap();
+        if live.get(id).is_some_and(|l| l.generation == generation) {
+            live.remove(id);
         }
     }
 
-    fn current(&self) -> HashMap<String, Ticks> {
-        self.0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|(id, s)| Some((id.clone(), s.ticks?)))
-            .collect()
+    fn snapshot(&self) -> HashMap<String, Live> {
+        self.0.lock().unwrap().clone()
     }
 }
 
 #[derive(Default)]
 pub struct Sessions {
     inner: Mutex<HashMap<String, Session>>,
-    ticks: TickBoard,
+    liveness: Liveness,
     generations: AtomicU64,
 }
 
@@ -94,13 +94,6 @@ impl Sessions {
             .unwrap()
             .get(id)
             .is_some_and(|s| s.shared.lock().unwrap().alive)
-    }
-
-    /// How long a live session has written nothing to its terminal.
-    pub fn silent_for(&self, id: &str) -> Option<std::time::Duration> {
-        let sessions = self.inner.lock().unwrap();
-        let s = sessions.get(id)?.shared.lock().unwrap();
-        s.alive.then(|| s.last_output.map(|t| t.elapsed()))?
     }
 
     pub fn spawn(
@@ -143,12 +136,12 @@ impl Sessions {
         }));
 
         let thread_shared = shared.clone();
-        let board = self.ticks.clone();
+        let liveness = self.liveness.clone();
         let thread_id = id.to_string();
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         let previous = {
             let mut inner = self.inner.lock().unwrap();
-            board.start(id, generation);
+            liveness.start(id, generation);
             inner.insert(
                 id.to_string(),
                 Session {
@@ -166,7 +159,6 @@ impl Sessions {
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             let mut pending: Vec<u8> = Vec::new();
-            let mut titles = TitleTracker::default();
             loop {
                 let n = match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -177,12 +169,8 @@ impl Sessions {
                 if text.is_empty() {
                     continue;
                 }
-                let now = std::time::Instant::now();
-                if titles.feed(text.as_bytes()) {
-                    board.tick(&thread_id, generation, now);
-                }
+                liveness.output(&thread_id, generation, Instant::now());
                 let mut s = thread_shared.lock().unwrap();
-                s.last_output = Some(now);
                 s.scrollback.push_str(&text);
                 trim_front(&mut s.scrollback, SCROLLBACK_LIMIT);
                 if let Some(ch) = &s.channel
@@ -192,7 +180,7 @@ impl Sessions {
                 }
             }
             thread_shared.lock().unwrap().alive = false;
-            board.end(&thread_id, generation);
+            liveness.end(&thread_id, generation);
             on_exit();
         });
         Ok(())
@@ -248,7 +236,7 @@ impl Sessions {
     pub fn kill(&self, id: &str) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(mut s) = inner.remove(id) {
-            self.ticks.end(id, s.generation);
+            self.liveness.end(id, s.generation);
             let _ = s.child.kill();
         }
     }
@@ -263,13 +251,13 @@ impl Sessions {
             .collect()
     }
 
-    pub fn ticks(&self) -> HashMap<String, Ticks> {
-        self.ticks.current()
+    pub fn live_sessions(&self) -> HashMap<String, Live> {
+        self.liveness.snapshot()
     }
 
     pub fn kill_all(&self) {
         let mut inner = self.inner.lock().unwrap();
-        self.ticks.0.lock().unwrap().clear();
+        self.liveness.0.lock().unwrap().clear();
         for (_, mut s) in inner.drain() {
             let _ = s.child.kill();
         }
@@ -426,34 +414,35 @@ mod tests {
     }
 
     #[test]
-    fn the_tick_board_follows_only_the_current_generation() {
-        let board = TickBoard::default();
-        let now = std::time::Instant::now();
-        board.start("acme-1", 0);
-        assert!(board.current().is_empty(), "no ticks yet");
-        board.tick("acme-1", 0, now);
-        assert_eq!(board.current()["acme-1"].last, now);
+    fn liveness_follows_only_the_current_generation() {
+        let live = Liveness::default();
+        let now = Instant::now();
+        live.start("acme-1", 0);
+        live.output("acme-1", 0, now);
+        assert_eq!(live.snapshot()["acme-1"].last_output, Some(now));
 
-        board.start("acme-1", 1);
-        assert!(board.current().is_empty(), "a respawn starts afresh");
-        board.tick("acme-1", 0, now);
-        assert!(
-            board.current().is_empty(),
-            "the old reader's ticks are ignored"
-        );
-        board.end("acme-1", 0);
-        let later = now + std::time::Duration::from_secs(1);
-        board.tick("acme-1", 1, later);
+        live.start("acme-1", 1);
+        live.output("acme-1", 0, now + Duration::from_secs(1));
+        live.end("acme-1", 0);
         assert_eq!(
-            board.current()["acme-1"].last,
-            later,
-            "the old reader's end leaves the new entry"
+            live.snapshot(),
+            HashMap::from([(
+                "acme-1".to_string(),
+                Live {
+                    generation: 1,
+                    last_output: None
+                }
+            )]),
+            "the old reader's output and end leave the new entry"
         );
 
-        board.end("acme-1", 1);
-        assert!(board.current().is_empty());
-        board.tick("acme-1", 1, later);
-        assert!(board.current().is_empty(), "no entry after its end");
+        live.output("acme-1", 1, now);
+        assert_eq!(
+            live.snapshot()["acme-1"].silent_for(now + Duration::from_secs(5)),
+            Some(Duration::from_secs(5))
+        );
+        live.end("acme-1", 1);
+        assert!(live.snapshot().is_empty());
     }
 
     #[test]

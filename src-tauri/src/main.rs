@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod browser;
+mod freshness;
 mod keep_awake;
 mod pty;
-mod title;
+mod session_view;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -957,6 +958,9 @@ async fn open_session(
                     &format!("could not pre-trust the session folder: {e:#}"),
                 );
             }
+            if let Ok(paths) = Paths::resolve() {
+                let _ = activity::launching(&paths, &id);
+            }
             let exit_app = app.clone();
             let exit_id = id.clone();
             state
@@ -991,7 +995,7 @@ fn write_session(state: State<'_, AppState>, id: String, data: String) -> CmdRes
             .is_some_and(|s| s.activity == Activity::Waiting)
         && let Ok(paths) = Paths::resolve()
     {
-        let _ = activity::record(&paths, &id, Activity::Working);
+        let _ = activity::correct(&paths, &id, Activity::Working);
     }
     state.sessions.write(&id, &data).map_err(err)
 }
@@ -1093,6 +1097,8 @@ fn watch_activity(app: AppHandle) {
     let Ok(paths) = Paths::resolve() else { return };
     let mut memory_changes = memory_change_names(&paths);
     let mut memory_files = memory_file_stamps(&paths);
+    let mut freshness = freshness::Freshness::default();
+    let mut live_before = HashMap::new();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(750));
         let names = memory_change_names(&paths);
@@ -1103,17 +1109,30 @@ fn watch_activity(app: AppHandle) {
             let _ = app.emit("memory-changes", ());
         }
         let state = app.state::<AppState>();
+        // Liveness first: a launch between the two reads would otherwise pair its new generation
+        // with the record from before its reset, and the reset would flash on the next poll.
+        let live = state.sessions.live_sessions();
         let mut now = activity::read_all(&paths);
+        let polled = std::time::Instant::now();
+        freshness.poll(now.iter().map(|(id, s)| (id.as_str(), s.beat)), polled);
+        let mut quietly_idle = HashSet::new();
         for (id, session) in now.iter_mut() {
-            if session.activity == Activity::Working
-                && state
-                    .sessions
-                    .silent_for(id)
+            if session.recorded == Activity::Working
+                && live
+                    .get(id)
+                    .and_then(|l| l.silent_for(polled))
                     .is_some_and(|d| d > SILENT_IS_IDLE)
-                && activity::record(&paths, id, Activity::Idle).is_ok()
+                && activity::correct(&paths, id, Activity::Idle).is_ok()
                 && let Some(updated) = activity::read(&paths, id)
             {
                 *session = updated;
+            }
+            if session_view::settle(
+                session,
+                live.contains_key(id),
+                freshness.is_stale(id, polled),
+            ) {
+                quietly_idle.insert(id.clone());
             }
         }
         let before = std::mem::replace(&mut *state.activity.lock().unwrap(), now.clone());
@@ -1121,7 +1140,7 @@ fn watch_activity(app: AppHandle) {
         let ids: HashSet<&String> = before.keys().chain(now.keys()).collect();
         for id in ids {
             let (was, is) = (before.get(id), now.get(id));
-            if was == is {
+            if was.map(session_view::shown) == is.map(session_view::shown) {
                 continue;
             }
             let _ = app.emit(
@@ -1134,23 +1153,25 @@ fn watch_activity(app: AppHandle) {
                     phase: is.and_then(|s| s.phase),
                 },
             );
-            if !state.sessions.is_alive(id) {
+            let generation = |live: &HashMap<String, pty::Live>| live.get(id).map(|l| l.generation);
+            if !session_view::same_spawn(generation(&live_before), generation(&live)) {
                 continue;
             }
-            match (was.map(|s| s.activity), is.map(|s| s.activity)) {
-                (_, Some(Activity::Waiting)) => {
+            match session_view::flash(
+                was.map(|s| s.activity),
+                is.map(|s| s.activity),
+                quietly_idle.contains(id),
+            ) {
+                Some(session_view::Flash::Urgent) => {
                     attention = Some(tauri::UserAttentionType::Critical);
                 }
-                (was, Some(Activity::Account)) if was != Some(Activity::Account) => {
-                    attention = Some(tauri::UserAttentionType::Critical);
-                }
-                (Some(Activity::Working), Some(Activity::Idle))
-                | (Some(Activity::Working | Activity::Idle), Some(Activity::Uat)) => {
+                Some(session_view::Flash::Gentle) => {
                     attention.get_or_insert(tauri::UserAttentionType::Informational);
                 }
-                _ => {}
+                None => {}
             }
         }
+        live_before = live;
         if let Some(kind) = attention
             && let Some(window) = app.get_webview_window("main")
             && !window.is_focused().unwrap_or(true)

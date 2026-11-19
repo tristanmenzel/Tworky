@@ -97,7 +97,7 @@ pub(crate) fn session_settings(
         "hooks": {
             "SessionStart": [
                 { "matcher": "startup|resume", "hooks": hooks },
-                { "matcher": "startup|resume", "hooks": report("idle")[0]["hooks"] },
+                { "matcher": "startup|resume", "hooks": report("idle --session-start")[0]["hooks"] },
                 { "matcher": "clear", "hooks": report("idle --new-conversation")[0]["hooks"] },
             ],
             "UserPromptSubmit": [
@@ -119,8 +119,8 @@ pub(crate) fn session_settings(
                 { "matcher": "ExitPlanMode", "hooks": phase },
             ],
             "PostToolUseFailure": report("working"),
-            "Stop": report("idle"),
-            "StopFailure": report("idle"),
+            "Stop": report("idle --stop"),
+            "StopFailure": report("idle --stop"),
         }
     });
     let mut allow = shell_rules(&TW_GITHUB_WRITES);
@@ -2709,6 +2709,23 @@ run = "{sleep}"
                     .unwrap()
                     .contains("tw session-state idle --new-conversation")
             );
+            let started = &settings["hooks"]["SessionStart"][1];
+            assert_eq!(started["matcher"], "startup|resume");
+            assert!(
+                started["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("tw session-state idle --session-start")
+            );
+            for event in ["Stop", "StopFailure"] {
+                assert!(
+                    settings["hooks"][event][0]["hooks"][0]["command"]
+                        .as_str()
+                        .unwrap()
+                        .contains("tw session-state idle --stop"),
+                    "{event}"
+                );
+            }
             let start = &settings["hooks"]["SessionStart"][0];
             assert_eq!(start["matcher"], "startup|resume");
             start["hooks"]
