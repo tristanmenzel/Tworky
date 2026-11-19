@@ -41,6 +41,8 @@ jobs:
           cache: npm
 
       - run: npm ci
+      - run: npm run fmt:check
+        if: runner.os == 'Linux'
       - run: npm run build
 
       - name: Build the bundled CLI
