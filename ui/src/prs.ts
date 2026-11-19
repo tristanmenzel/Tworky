@@ -32,15 +32,9 @@ export function hasPrContent(work: BranchWork[]): boolean {
   return work.some((b) => b.pull_requests.length > 0 || (withoutPr(b) === 'waiting' && b.remote))
 }
 
-function prName(b: BranchWork, pr: PrDetail): string {
-  return `PR ${b.repo}#${pr.number} "${pr.title}" (branch ${pr.head})`
-}
-
 export function fixCiPrompt(b: BranchWork, pr: PrDetail): string {
   const checks = pr.checks.failing.map((c) => c.name).join(', ')
-  return singleLine(
-    `Fix the failing CI checks on ${prName(b, pr)}: ${checks}. Read the failed runs with gh, fix the cause, then commit and push.`,
-  )
+  return singleLine(`Fix the failing CI on ${b.repo}#${pr.number}: ${checks}. Commit and push the fix.`)
 }
 
 export function addressReviewPrompt(b: BranchWork, pr: PrDetail): string {
@@ -49,10 +43,10 @@ export function addressReviewPrompt(b: BranchWork, pr: PrDetail): string {
     pr.unresolved_threads ? `${pr.unresolved_threads} unresolved review thread(s)` : null,
   ].filter(Boolean)
   return singleLine(
-    `Address the review on ${prName(b, pr)}: ${asks.join(' and ')}. Read the review comments with gh, make the changes, then commit and push, and tell me how you handled each comment.`,
+    `Address the review on ${b.repo}#${pr.number}: ${asks.join(' and ')}. Commit and push the changes.`,
   )
 }
 
 export function openPrPrompt(b: BranchWork): string {
-  return singleLine(`Open a pull request for branch ${b.branch} in ${b.repo}`)
+  return singleLine(`Open a PR for ${b.branch} in ${b.repo}.`)
 }
