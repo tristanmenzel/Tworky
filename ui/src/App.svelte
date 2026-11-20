@@ -141,7 +141,10 @@
   const firstEntry = $derived(workListGroups(cards, otherItems, payload?.projects ?? {}, issues)[0]?.entries[0])
 
   $effect(() => {
-    if (selectedId === null && payload && itemsLoaded && firstEntry) selectedId = entryId(firstEntry)
+    if (selectedId !== null || !payload || !itemsLoaded || !firstEntry) return
+    const id = entryId(firstEntry)
+    selectedId = id
+    untrack(() => ensureLogs(workers.filter((w) => workItemOf(w) === id).map((w) => w.id)))
   })
   const selectedItem = $derived(
     selectedId?.startsWith(ITEM_PREFIX) ? otherItems.find((i) => ITEM_PREFIX + i.name === selectedId) : undefined,
@@ -324,6 +327,10 @@
 
   async function reloadWorkList(withIssues: boolean) {
     await Promise.all([withIssues && loadIssues(false), loadItems()])
+    clearMissingSelection()
+  }
+
+  function clearMissingSelection() {
     if (
       selectedId &&
       !cards.some((c) => c.id === selectedId) &&
@@ -473,7 +480,7 @@
     try {
       await api.linkItem(name, issueUrl)
       await Promise.all([loadItems(), loadWorkers(), loadIssues(true)])
-      selectedId = null
+      clearMissingSelection()
     } catch (e) {
       showError(String(e))
       throw e
@@ -485,7 +492,7 @@
       await api.removeItem(name)
       await loadItems()
       await loadIssues(false)
-      selectedId = null
+      clearMissingSelection()
     } catch (e) {
       showError(String(e))
     }
