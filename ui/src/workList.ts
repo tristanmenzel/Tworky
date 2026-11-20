@@ -3,7 +3,6 @@ import type { Card, Issue, Item } from './api'
 export type WorkListEntry = { kind: 'card'; card: Card; issue: Issue } | { kind: 'item'; item: Item }
 
 export interface WorkListGroup {
-  /** `''` for issues with no known project, headed "Other". */
   project: string
   multiRepo: boolean
   entries: WorkListEntry[]
