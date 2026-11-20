@@ -17,7 +17,11 @@
   let newName = $state('')
 
   onMount(async () => {
-    newName = repo.split('/')[1]?.toLowerCase().replace(/[^a-z0-9_-]/g, '-') ?? ''
+    newName =
+      repo
+        .split('/')[1]
+        ?.toLowerCase()
+        .replace(/[^a-z0-9_-]/g, '-') ?? ''
     try {
       projects = await api.projects()
       existing = projects[0]?.name ?? ''
@@ -54,8 +58,8 @@
   </label>
   {#if kind === 'existing'}
     <p class="muted small">
-      {repo} is added to the project's config, cloned first if there's no local copy. Its worktrees then work in that
-      project's workers.
+      {repo} is added to the project's config, cloned first if there's no local copy. Its worktrees then work in that project's
+      workers.
     </p>
   {/if}
   <label class="option">
@@ -65,8 +69,8 @@
   </label>
   {#if kind === 'new'}
     <p class="muted small">
-      Creates a minimal project for {repo} and opens a setup session under Projects, where Claude asks about the rest
-      of the project and configures its ports, stack, hooks and services.
+      Creates a minimal project for {repo} and opens a setup session under Projects, where Claude asks about the rest of the
+      project and configures its ports, stack, hooks and services.
     </p>
   {/if}
 </div>

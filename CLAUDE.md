@@ -31,9 +31,11 @@ Everything on the list is an **item** with a random name such as `brisk-otter`, 
 
 ## Commands
 
+- `rust-toolchain.toml` pins the Rust version (with clippy and rustfmt) and `.node-version` the Node version. CI and release read both, so change versions there.
 - `cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings` must pass. Run `cargo fmt --all` before committing.
 - `npm run check` runs svelte-check. `npm run build` builds the UI.
+- `npm run fmt:check` checks the UI code's formatting (oxfmt). Run `npm run fmt` before committing UI changes. Keep `--threads=1` in both scripts: multi-threaded oxfmt 0.79 crashes on Windows with an access violation at exit in about 18% of runs, and only with `.svelte` files.
 - `node scripts/notices.mjs` regenerates `THIRD-PARTY-NOTICES.txt`. Run it after any dependency change; CI fails if the file is stale.
   - It needs `cargo install cargo-about --locked --version 0.9.3 --features cli`.
   - A devDependency whose code Vite bundles into `dist` must be added to `bundledDevDependencies` in the script, or it is left out.
@@ -42,7 +44,7 @@ Everything on the list is an **item** with a random name such as `brisk-otter`, 
   - The build bundles a release `tw` (plus a `wa.exe` copy on Windows, see Rename transition), because sessions get the CLI on PATH from the app's install. `scripts/build-cli.mjs` builds it.
   - `tauri-build` checks that those resource files exist even for debug builds, so on a fresh clone run `node scripts/build-cli.mjs` before `cargo build` or `npm run tauri dev`.
   - On Linux, building needs `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config`.
-- `.github/workflows/ci.yml` runs fmt, clippy, tests and svelte-check on Windows, macOS and Ubuntu for pushes to main and for PRs. It builds no installers.
+- `.github/workflows/ci.yml` runs fmt, clippy, tests and svelte-check on Windows, macOS and Ubuntu, and `npm run fmt:check` on Ubuntu, for pushes to main and for PRs. It builds no installers.
 - `.github/workflows/release.yml` publishes a release, `v<major>.<minor>.<run number>`, for every push to main that changes more than the install scripts, `README.md` or `CLAUDE.md` (the app fetches the scripts from main): the NSIS installer, a universal macOS `.app` (as `Tworky-universal.app.tar.gz`) and an x64 AppImage. It keeps the newest 10. See Versioning and updates.
 - Installing for users:
   - macOS / Linux: `curl -fsSL https://raw.githubusercontent.com/tristanmenzel/Tworky/main/scripts/install.sh | sh`

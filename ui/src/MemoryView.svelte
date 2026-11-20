@@ -87,9 +87,10 @@
 
   {#if current}
     <p class="muted small">
-      Every Claude working on {current.project} sees this when its session starts or resumes, and proposes changes
-      for you to approve in the Changes tab. Stored in <code>{current.path}</code>.
-      {#if current.text.length > 8192}<span class="warn">Over 8 KB: sessions may see it truncated, so trim it.</span>{/if}
+      Every Claude working on {current.project} sees this when its session starts or resumes, and proposes changes for you
+      to approve in the Changes tab. Stored in <code>{current.path}</code>.
+      {#if current.text.length > 8192}<span class="warn">Over 8 KB: sessions may see it truncated, so trim it.</span
+        >{/if}
     </p>
     {#if editing}
       {#if refused}

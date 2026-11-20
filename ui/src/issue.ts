@@ -100,7 +100,8 @@ export function prState(summary: PrSummary | null, worktrees: number): PrState {
 function cleanupWarning(w: Worker, prs: PrSummary | null): string | null {
   const state = prState(prs, w.worktrees.length)
   if (w.pr && state.kind !== 'none') {
-    if (!prs || prs.repos.length < w.worktrees.length || prs.repos.some((r) => !r.status)) return 'Local changes not checked'
+    if (!prs || prs.repos.length < w.worktrees.length || prs.repos.some((r) => !r.status))
+      return 'Local changes not checked'
     const unsaved = prs.repos.some((r) => r.status && (r.status.dirty_files || r.status.unpushed_commits))
     return unsaved ? 'Some work is not pushed' : null
   }

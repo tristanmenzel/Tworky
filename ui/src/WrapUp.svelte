@@ -94,8 +94,9 @@
       {/if}
     </div>
     <p class="muted">
-      Clean up stops the session and removes <code>{worker.id}</code>'s stack, worktrees and the branches Tworky
-      created{scratch ? ', then takes this scratch item off the list' : ''}.
+      Clean up stops the session and removes <code>{worker.id}</code>'s stack, worktrees and the branches Tworky created{scratch
+        ? ', then takes this scratch item off the list'
+        : ''}.
     </p>
     <div class="row">
       <span class="grow"></span>

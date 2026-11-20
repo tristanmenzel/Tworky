@@ -74,13 +74,17 @@ pub fn can_fill_email(account: &Account, url: &Url, fields: &[LoginField]) -> bo
         && !account.allows(url)
 }
 
+fn finder_calling(args: &str) -> String {
+    format!("(() => {{\n{FINDER_SOURCE}\nreturn tworkyLogin({args})\n}})()")
+}
+
 pub fn detect_script() -> String {
-    format!("({FINDER_SOURCE}\n)(\"detect\")")
+    finder_calling("\"detect\"")
 }
 
 pub fn fill_script(username: Option<&str>, password: Option<&str>, submit: bool) -> String {
     let payload = json!({ "username": username, "password": password, "submit": submit });
-    format!("({FINDER_SOURCE}\n)(\"fill\", {payload})")
+    finder_calling(&format!("\"fill\", {payload}"))
 }
 
 /// Runs the detector in every new top-level document from now on, and in the current one.
@@ -122,9 +126,73 @@ mod tests {
     }
 
     fn payload(script: &str) -> serde_json::Value {
-        let start = script.rfind("(\"fill\", ").unwrap() + "(\"fill\", ".len();
-        let json = script[start..].strip_suffix(')').unwrap();
-        serde_json::from_str(json).unwrap()
+        let call = "tworkyLogin(\"fill\", ";
+        let script = script.strip_suffix(")\n})()").unwrap();
+        let start = script.rfind(call).unwrap() + call.len();
+        serde_json::from_str(&script[start..]).unwrap()
+    }
+
+    const RUN_IN_NODE: &str = r#"
+const vm = require('vm')
+const window = {}
+window.top = window
+class HTMLInputElement {}
+Object.defineProperty(HTMLInputElement.prototype, 'value', { get() { return '' }, set(_) {} })
+const document = { querySelectorAll: () => [] }
+const result = vm.runInNewContext(require('fs').readFileSync(0, 'utf8'), { window, document, HTMLInputElement })
+process.stdout.write(result === undefined ? 'undefined' : JSON.stringify(result))
+"#;
+
+    fn run_with_node(script: &str) -> Option<Result<String, String>> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        match Command::new("node").arg("--version").output() {
+            Ok(out) if out.status.success() => {}
+            _ => {
+                println!("skipped: node can't be run");
+                return None;
+            }
+        }
+        let mut child = match Command::new("node")
+            .args(["-e", RUN_IN_NODE])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                println!("skipped: node couldn't be spawned: {error}");
+                return None;
+            }
+        };
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        if !out.status.success() {
+            return Some(Err(String::from_utf8_lossy(&out.stderr).into_owned()));
+        }
+        Some(Ok(String::from_utf8_lossy(&out.stdout).into_owned()))
+    }
+
+    #[test]
+    fn the_wrapped_scripts_run_and_return_the_call_result() {
+        let Some(detected) = run_with_node(&detect_script()) else {
+            return;
+        };
+        assert_eq!(detected.unwrap_or_else(|e| panic!("{e}")), "undefined");
+        let Some(filled) = run_with_node(&fill_script(Some("tom"), Some("pw"), true)) else {
+            return;
+        };
+        assert_eq!(
+            filled.unwrap_or_else(|e| panic!("{e}")),
+            r#"{"filled":[],"submitted":false}"#
+        );
     }
 
     #[tokio::test]

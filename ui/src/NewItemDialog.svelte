@@ -33,7 +33,12 @@
   const ready = $derived(
     title.trim().length > 0 && (tab === 'projects' ? project !== null : picked.length > 0) && !creating,
   )
-  const suggestedName = $derived(picked[0]?.split('/')[1]?.toLowerCase().replace(/[^a-z0-9_-]/g, '-') ?? '')
+  const suggestedName = $derived(
+    picked[0]
+      ?.split('/')[1]
+      ?.toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '-') ?? '',
+  )
   let projectName = $state<string | null>(null)
 
   onMount(async () => {
@@ -143,8 +148,8 @@
           aria-label="Search repositories"
         />
         <p class="muted small">
-          Only repositories without a project config. Local clones are listed first; others are cloned when you
-          create the item.
+          Only repositories without a project config. Local clones are listed first; others are cloned when you create
+          the item.
         </p>
         {#if search?.search_error}<p class="warn small">GitHub search failed: {search.search_error}</p>{/if}
         {#if searching && !search}

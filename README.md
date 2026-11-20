@@ -93,9 +93,13 @@ Tworky works with no configuration. `tw paths` prints where config and data live
 ## Building from source
 
 Prerequisites:
-- Rust (stable)
-- Node 24
+- Rust through rustup, which reads the version from `rust-toolchain.toml`
+- Node, at the version in `.node-version`
 - On Linux, `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config`
+
+With mise:
+- Run `mise settings add idiomatic_version_file_enable_tools node`, or mise (2025.10.0 and later) ignores `.node-version`.
+- If your global mise config sets `rust`, also run `mise settings add idiomatic_version_file_enable_tools rust`. Otherwise mise sets `RUSTUP_TOOLCHAIN`, which overrides `rust-toolchain.toml`.
 
 ```sh
 npm ci
@@ -113,4 +117,5 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 npm run check
+npm run fmt:check
 ```

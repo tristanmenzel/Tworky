@@ -179,8 +179,7 @@
           bind:value={d.origins}
           rows="2"
           spellcheck="false"
-          placeholder="https://login.example.com/ or service:<name> (one per line)"
-        ></textarea>
+          placeholder="https://login.example.com/ or service:<name> (one per line)"></textarea>
       </label>
       <div class="row">
         <label class="inline"><input type="checkbox" bind:checked={d.mobile} /> Mobile</label>
@@ -230,7 +229,10 @@
             </dd>
             {#if a.login_origins.length}
               <dt>Login origins</dt>
-              <dd>{#each a.login_origins as o (o)}<code>{o}</code> {/each}</dd>
+              <dd>
+                {#each a.login_origins as o (o)}<code>{o}</code>
+                {/each}
+              </dd>
             {/if}
             <dt>Password</dt>
             <dd class:ok={a.has_password} class:warn={!a.has_password}>{a.has_password ? 'stored ✓' : 'not set'}</dd>
@@ -244,7 +246,13 @@
               }}
             >
               <!-- svelte-ignore a11y_autofocus -->
-              <input type="password" bind:value={password} autocomplete="new-password" placeholder="Password" autofocus />
+              <input
+                type="password"
+                bind:value={password}
+                autocomplete="new-password"
+                placeholder="Password"
+                autofocus
+              />
               <button type="button" onclick={() => (passwordFor = null)} disabled={busy}>Cancel</button>
               <button type="submit" class="primary" disabled={busy || !password}>Store</button>
             </form>

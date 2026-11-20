@@ -42,9 +42,7 @@ export function addressReviewPrompt(b: BranchWork, pr: PrDetail): string {
     pr.changes_requested_by.length ? `changes requested by ${pr.changes_requested_by.join(', ')}` : null,
     pr.unresolved_threads ? `${pr.unresolved_threads} unresolved review thread(s)` : null,
   ].filter(Boolean)
-  return singleLine(
-    `Address the review on ${b.repo}#${pr.number}: ${asks.join(' and ')}. Commit and push the changes.`,
-  )
+  return singleLine(`Address the review on ${b.repo}#${pr.number}: ${asks.join(' and ')}. Commit and push the changes.`)
 }
 
 export function openPrPrompt(b: BranchWork): string {

@@ -220,7 +220,8 @@
               {#if project}<span class="tag proj">{project}</span>{/if}
               <span class="muted">
                 · {issue.assignees.length ? `Assigned: ${issue.assignees.join(', ')}` : 'Unassigned'}
-                {#if issue.state === 'UNKNOWN'}· GitHub no longer returns this issue (deleted, transferred or out of reach)
+                {#if issue.state === 'UNKNOWN'}· GitHub no longer returns this issue (deleted, transferred or out of
+                  reach)
                 {:else if !isMine(issue, viewer)}· not assigned to you{/if}
               </span>
             </div>
@@ -250,15 +251,17 @@
               {/if}
               {#each VERDICT_PILLS as v (v.verdict)}
                 {#if verdictCounts[v.verdict]}
-                  <button class="pill {v.tone}" onclick={() => jump(prsEl)}>{verdictCounts[v.verdict]} {v.label}</button>
+                  <button class="pill {v.tone}" onclick={() => jump(prsEl)}>{verdictCounts[v.verdict]} {v.label}</button
+                  >
                 {/if}
               {/each}
               {#if waitingForPr}
                 <button class="pill warn" onclick={() => jump(prsEl)}>{waitingForPr} waiting for PR</button>
               {/if}
               {#if subtasks.length}
-                <button class="pill {subtasksDone === subtasks.length ? 'ok' : 'muted'}" onclick={() => jump(subtasksEl)}
-                  >{subtasksDone} of {subtasks.length} subtasks done</button
+                <button
+                  class="pill {subtasksDone === subtasks.length ? 'ok' : 'muted'}"
+                  onclick={() => jump(subtasksEl)}>{subtasksDone} of {subtasks.length} subtasks done</button
                 >
               {/if}
             </div>
@@ -308,7 +311,9 @@
                     {/if}
                     {#if sw}
                       <WorkerDot worker={sw} title={sw.id} />
-                      <button disabled={sw.status !== 'ready'} onclick={() => onOpenWorker(sw)}>{sessionLabel(sw)}</button>
+                      <button disabled={sw.status !== 'ready'} onclick={() => onOpenWorker(sw)}
+                        >{sessionLabel(sw)}</button
+                      >
                     {:else if mine && !closed}
                       <button
                         class="primary"

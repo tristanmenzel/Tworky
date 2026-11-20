@@ -160,11 +160,8 @@
           <h3>{active.label}</h3>
           {#if loader.checkedAt !== null}<span class="muted checked">checked {ago(loader.checkedAt)}</span>{/if}
           <span class="spacer"></span>
-          <button
-            class="small"
-            disabled={loader.loading}
-            title="Fetch the repos and refresh"
-            onclick={() => load(true)}>{loader.loading ? 'Loading…' : 'Refresh'}</button
+          <button class="small" disabled={loader.loading} title="Fetch the repos and refresh" onclick={() => load(true)}
+            >{loader.loading ? 'Loading…' : 'Refresh'}</button
           >
           <button class="small collapse" title="Collapse" aria-label="Collapse" onclick={collapse}>−</button>
         </div>

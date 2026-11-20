@@ -10,7 +10,9 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
     "dev:app": "pwsh -NoProfile -File scripts/dev.ps1",
-    "dev:tauri": "node scripts/tauri-dev.mjs"
+    "dev:tauri": "node scripts/tauri-dev.mjs",
+    "fmt": "oxfmt --threads=1 --write .",
+    "fmt:check": "oxfmt --threads=1 --check ."
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.3",
@@ -26,6 +28,7 @@
     "@tauri-apps/cli": "^2.12.2",
     "@tsconfig/svelte": "^5.0.8",
     "license-checker-rseidelsohn": "5.0.1",
+    "oxfmt": "0.79.0",
     "svelte": "^5.57.2",
     "svelte-check": "^4.7.6",
     "typescript": "^6.0.3",

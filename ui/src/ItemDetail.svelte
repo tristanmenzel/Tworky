@@ -92,7 +92,9 @@
               <code>{pr.head}</code> into <code>{pr.base}</code>. The worker checks out the PR's branch.
             </div>
           {:else if item.scratch}
-            <div class="muted">A throwaway item for testing the project's setup. It goes once its worker is cleaned up.</div>
+            <div class="muted">
+              A throwaway item for testing the project's setup. It goes once its worker is cleaned up.
+            </div>
           {:else}
             <div class="muted">Custom work with no GitHub issue yet.</div>
           {/if}

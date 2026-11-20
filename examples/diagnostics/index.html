@@ -7,45 +7,44 @@
   <body>
     <h1>Tworky diagnostics test page</h1>
     <p>
-      Serve this folder on the worker's port (for example <code>npx serve -l &lt;port&gt;</code>),
-      open it in an account's tab, then check <code>read_console</code>,
-      <code>read_network</code> and <code>list_storage</code>.
+      Serve this folder on the worker's port (for example <code>npx serve -l &lt;port&gt;</code>), open it in an
+      account's tab, then check <code>read_console</code>, <code>read_network</code> and <code>list_storage</code>.
     </p>
     <p>
       Before opening it, set that test account's stored password to
-      <code>tworky-diagnostics-test-password</code>, so <code>read_console</code> can show it
-      withholds the entry that logs it.
+      <code>tworky-diagnostics-test-password</code>, so <code>read_console</code> can show it withholds the entry that
+      logs it.
     </p>
     <ul id="results"></ul>
     <script>
-      const ACCOUNT_PASSWORD = "tworky-diagnostics-test-password";
+      const ACCOUNT_PASSWORD = 'tworky-diagnostics-test-password'
 
       // A port where nothing listens, and that browsers do not block as unsafe.
-      const DEAD_URL = "http://127.0.0.1:49151/unreachable";
+      const DEAD_URL = 'http://127.0.0.1:49151/unreachable'
 
-      const results = document.getElementById("results");
+      const results = document.getElementById('results')
       const report = (text) => {
-        const item = document.createElement("li");
-        item.textContent = text;
-        results.append(item);
-      };
+        const item = document.createElement('li')
+        item.textContent = text
+        results.append(item)
+      }
 
-      console.error("diagnostics test: something went wrong");
-      report("logged an error");
+      console.error('diagnostics test: something went wrong')
+      report('logged an error')
 
-      console.error(ACCOUNT_PASSWORD);
-      report("logged the account's password bare");
+      console.error(ACCOUNT_PASSWORD)
+      report("logged the account's password bare")
 
-      localStorage.setItem("diagnostics-test-key", "diagnostics-test-value");
-      report("set localStorage key diagnostics-test-key");
+      localStorage.setItem('diagnostics-test-key', 'diagnostics-test-value')
+      report('set localStorage key diagnostics-test-key')
 
-      fetch("/missing?code=abc")
+      fetch('/missing?code=abc')
         .then((response) => report(`/missing answered ${response.status}`))
-        .catch((error) => report(`/missing failed: ${error}`));
+        .catch((error) => report(`/missing failed: ${error}`))
 
       fetch(DEAD_URL)
         .then((response) => report(`${DEAD_URL} answered ${response.status}`))
-        .catch((error) => report(`${DEAD_URL} failed: ${error}`));
+        .catch((error) => report(`${DEAD_URL} failed: ${error}`))
     </script>
   </body>
 </html>

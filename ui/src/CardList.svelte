@@ -148,7 +148,9 @@
       </li>
     {/if}
   {:else}
-    {#if !items.length}<li class="muted empty">Nothing on the list. Add an issue, pull request or custom item with +.</li>{/if}
+    {#if !items.length}<li class="muted empty">
+        Nothing on the list. Add an issue, pull request or custom item with +.
+      </li>{/if}
   {/each}
 </ul>
 

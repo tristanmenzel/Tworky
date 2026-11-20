@@ -155,8 +155,8 @@
                       class="toggle"
                       aria-label={collapsed.has(h.id) ? 'Expand' : 'Collapse'}
                       onclick={(e) => (e.stopPropagation(), toggle(h.id))}
-                      ondblclick={(e) => e.stopPropagation()}
-                    >{collapsed.has(h.id) ? '▸' : '▾'}</button>
+                      ondblclick={(e) => e.stopPropagation()}>{collapsed.has(h.id) ? '▸' : '▾'}</button
+                    >
                   {:else}
                     <span class="toggle"></span>
                   {/if}

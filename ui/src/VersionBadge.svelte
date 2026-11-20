@@ -112,7 +112,9 @@
     return lines.length ? `\n\n${lines.join('\n')}` : ''
   })
 
-  const failureDetail = $derived(startError || [report?.progress?.message, report?.log_tail].filter(Boolean).join('\n\n'))
+  const failureDetail = $derived(
+    startError || [report?.progress?.message, report?.log_tail].filter(Boolean).join('\n\n'),
+  )
 </script>
 
 {#if info && !info.dev}
@@ -121,7 +123,8 @@
       <button
         class="action"
         onclick={restart}
-        title={`The update is downloaded. Tworky closes, installs it and reopens${checkedLine}`}>Restart to update</button
+        title={`The update is downloaded. Tworky closes, installs it and reopens${checkedLine}`}
+        >Restart to update</button
       >
     {:else if inFlight}
       <span class="pill warn" title={`${report?.log_tail || 'Starting the update'}${checkedLine}`}>
@@ -134,7 +137,10 @@
     {:else if info.status?.kind === 'latest'}
       <span class="pill ok" title={`Tworky ${info.version}, built from ${info.commit}${checkedLine}`}>latest</span>
     {:else if info.status?.kind === 'behind'}
-      <span class="pill warn" title={`Tworky ${info.version}, built from ${info.commit}; the latest release is ${info.status.tag}${checkedLine}`}>
+      <span
+        class="pill warn"
+        title={`Tworky ${info.version}, built from ${info.commit}; the latest release is ${info.status.tag}${checkedLine}`}
+      >
         {info.status.commits === 1 ? '1 commit behind' : `${info.status.commits} commits behind`}
       </span>
       <button class="action" onclick={update} title="Download the latest release">Update</button>
