@@ -51,6 +51,7 @@
   import CreateProfileDialog from './CreateProfileDialog.svelte'
   import type { ServiceLink } from './ServiceList.svelte'
   import KeepAwakePill from './KeepAwakePill.svelte'
+  import { entryId, workListGroups } from './workList'
   import VersionBadge from './VersionBadge.svelte'
   import {
     activityLabel,
@@ -116,6 +117,7 @@
   let loading = $state(false)
   let error = $state<string | null>(null)
   let items = $state<Item[]>([])
+  let itemsLoaded = $state(false)
   let projects = $state<ProjectSummary[]>([])
   let anonymousFor = $state<Worker | null>(null)
   let createProfileFor = $state<{ worker: Worker; request: AccountRequest | null } | null>(null)
@@ -136,6 +138,11 @@
   const selectedCard = $derived(cards.find((c) => c.id === selectedId))
   /** Pull request and custom items; issue items show as cards. */
   const otherItems = $derived(items.filter((i) => i.source.kind !== 'issue'))
+  const firstEntry = $derived(workListGroups(cards, otherItems, payload?.projects ?? {}, issues)[0]?.entries[0])
+
+  $effect(() => {
+    if (selectedId === null && payload && itemsLoaded && firstEntry) selectedId = entryId(firstEntry)
+  })
   const selectedItem = $derived(
     selectedId?.startsWith(ITEM_PREFIX) ? otherItems.find((i) => ITEM_PREFIX + i.name === selectedId) : undefined,
   )
@@ -290,7 +297,6 @@
       payload = await api.issues(refresh)
       if (refresh) issuesRefreshed++
       if (payload.config_error) showError(`Config: ${payload.config_error}`)
-      if (selectedId === null && payload.cards.length) selectedId = payload.cards[0].id
     } catch (e) {
       showError(String(e))
     } finally {
@@ -375,6 +381,8 @@
       items = await api.items()
     } catch (e) {
       showError(String(e))
+    } finally {
+      itemsLoaded = true
     }
   }
 
@@ -464,8 +472,8 @@
   async function linkItem(name: string, issueUrl: string) {
     try {
       await api.linkItem(name, issueUrl)
-      selectedId = null
       await Promise.all([loadItems(), loadWorkers(), loadIssues(true)])
+      selectedId = null
     } catch (e) {
       showError(String(e))
       throw e
@@ -475,9 +483,9 @@
   async function removeItem(name: string) {
     try {
       await api.removeItem(name)
-      selectedId = null
       await loadItems()
       await loadIssues(false)
+      selectedId = null
     } catch (e) {
       showError(String(e))
     }

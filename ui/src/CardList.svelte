@@ -2,6 +2,7 @@
   import type { Activity, Card, Issue, Item, Worker } from './api'
   import { cardComplete, STAGE_INFO, STAGE_STEPS, typeClass, type CardStage } from './issue'
   import WorkerDot from './WorkerDot.svelte'
+  import { entryId, repoLabeller, workListGroups } from './workList'
 
   interface Props {
     cards: Card[]
@@ -33,9 +34,7 @@
     onSelect,
   }: Props = $props()
 
-  function repoName(id: string): string {
-    return issues.get(id)?.repo ?? ''
-  }
+  const groups = $derived(workListGroups(cards, items, projects, issues))
 
   const statusBoard = (i: Issue) => statusBoards[projects[i.id]]
 </script>
@@ -67,90 +66,89 @@
 {/snippet}
 
 <ul class="cards">
-  {#if items.length}
-    <li class="group muted">Pull requests and custom items</li>
-    {#each items as item (item.name)}
-      {@const iw = itemWorkers.get(item.name)}
-      {@const activity = activityByCard.get(`item:${item.name}`) ?? null}
-      {@const itemStage = stageByCard.get(`item:${item.name}`)}
-      <li>
-        <button
-          class="card {activity ?? ''}"
-          class:selected={selectedId === `item:${item.name}`}
-          class:flash={flashId === `item:${item.name}`}
-          data-card={`item:${item.name}`}
-          onclick={() => onSelect(`item:${item.name}`)}
-        >
-          <div class="head">
-            {#if item.source.kind === 'pull_request'}
-              <span class="tag type-pr">PR</span>
-              <span class="num">#{item.source.number}</span>
-            {:else}
-              <span class="tag type-item">{item.scratch ? 'Scratch' : 'Item'}</span>
-              <span class="num">{item.name}</span>
-            {/if}
-          </div>
-          <div class="title">{item.title}</div>
-          {#if itemStage || iw || activity}
-            <div class="foot">
-              <span class="meta">
-                {#if itemStage}{@render stage(itemStage)}{/if}
-              </span>
-              {@render attention(activity)}
-              <WorkerDot worker={iw} {activity} title={iw?.id} />
-            </div>
-          {/if}
-        </button>
-      </li>
-    {/each}
-  {/if}
-  {#each cards as card, i (card.id)}
-    {@const root = issues.get(card.id)}
-    {@const rootWorker = workers.get(card.id)}
-    {@const complete = cardComplete(card, issues, statusBoard)}
-    {@const activity = activityByCard.get(card.id) ?? null}
-    {@const cardStage = stageByCard.get(card.id)}
-    {#if root}
-      {#if i === 0 || repoName(cards[i - 1].id) !== root.repo}
-        <li class="group muted">{root.repo}</li>
-      {/if}
-      <li>
-        <button
-          class="card {activity ?? ''}"
-          class:selected={selectedId === card.id}
-          class:flash={flashId === card.id}
-          class:complete
-          data-card={card.id}
-          title={complete ? 'Closed or done: remove it from the list once its worker is cleaned up' : undefined}
-          onclick={() => onSelect(card.id)}
-        >
-          <div class="head">
-            <span class="tag {typeClass(root.issue_type)}">{root.issue_type ?? 'Issue'}</span>
-            <span class="num">#{root.number}</span>
-          </div>
-          <div class="title">{root.title}</div>
-          {#if complete || cardStage || rootWorker || activity}
-            <div class="foot">
-              <span class="meta">
-                {#if complete}
-                  <span class="board done">✓ Done</span>
-                {:else if cardStage}
-                  {@render stage(cardStage)}
-                {/if}
-              </span>
-              {@render attention(activity)}
-              {#if rootWorker || activity}
-                <WorkerDot worker={rootWorker} {activity} title={rootWorker?.id} />
+  {#each groups as group (group.project)}
+    {@const repoLabel = repoLabeller(group)}
+    <li class="group muted">{group.project || 'Other'}</li>
+    {#each group.entries as entry (entryId(entry))}
+      {#if entry.kind === 'item'}
+        {@const item = entry.item}
+        {@const iw = itemWorkers.get(item.name)}
+        {@const activity = activityByCard.get(`item:${item.name}`) ?? null}
+        {@const itemStage = stageByCard.get(`item:${item.name}`)}
+        {@const repo = repoLabel(entry)}
+        <li>
+          <button
+            class="card {activity ?? ''}"
+            class:selected={selectedId === `item:${item.name}`}
+            class:flash={flashId === `item:${item.name}`}
+            data-card={`item:${item.name}`}
+            onclick={() => onSelect(`item:${item.name}`)}
+          >
+            <div class="head">
+              {#if item.source.kind === 'pull_request'}
+                <span class="tag type-pr">PR</span>
+                <span class="num">{repo ?? ''}#{item.source.number}</span>
+              {:else}
+                <span class="tag type-item">{item.scratch ? 'Scratch' : 'Item'}</span>
+                <span class="num">{item.name}</span>
               {/if}
             </div>
-          {/if}
-        </button>
-      </li>
-    {/if}
+            <div class="title">{item.title}</div>
+            {#if itemStage || iw || activity}
+              <div class="foot">
+                <span class="meta">
+                  {#if itemStage}{@render stage(itemStage)}{/if}
+                </span>
+                {@render attention(activity)}
+                <WorkerDot worker={iw} {activity} title={iw?.id} />
+              </div>
+            {/if}
+          </button>
+        </li>
+      {:else}
+        {@const card = entry.card}
+        {@const root = entry.issue}
+        {@const rootWorker = workers.get(card.id)}
+        {@const complete = cardComplete(card, issues, statusBoard)}
+        {@const activity = activityByCard.get(card.id) ?? null}
+        {@const cardStage = stageByCard.get(card.id)}
+        {@const repo = repoLabel(entry)}
+        <li>
+          <button
+            class="card {activity ?? ''}"
+            class:selected={selectedId === card.id}
+            class:flash={flashId === card.id}
+            class:complete
+            data-card={card.id}
+            title={complete ? 'Closed or done: remove it from the list once its worker is cleaned up' : undefined}
+            onclick={() => onSelect(card.id)}
+          >
+            <div class="head">
+              <span class="tag {typeClass(root.issue_type)}">{root.issue_type ?? 'Issue'}</span>
+              <span class="num">{repo ?? ''}#{root.number}</span>
+            </div>
+            <div class="title">{root.title}</div>
+            {#if complete || cardStage || rootWorker || activity}
+              <div class="foot">
+                <span class="meta">
+                  {#if complete}
+                    <span class="board done">✓ Done</span>
+                  {:else if cardStage}
+                    {@render stage(cardStage)}
+                  {/if}
+                </span>
+                {@render attention(activity)}
+                {#if rootWorker || activity}
+                  <WorkerDot worker={rootWorker} {activity} title={rootWorker?.id} />
+                {/if}
+              </div>
+            {/if}
+          </button>
+        </li>
+      {/if}
+    {/each}
   {:else}
-    {#if !items.length}<li class="muted empty">
-        Nothing on the list. Add an issue, pull request or custom item with +.
-      </li>{/if}
+    <li class="muted empty">Nothing on the list. Add an issue, pull request or custom item with +.</li>
   {/each}
 </ul>
 
