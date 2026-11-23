@@ -142,6 +142,81 @@ impl Paths {
     pub fn state_db(&self) -> PathBuf {
         self.data_dir.join("state.db")
     }
+
+    pub fn repo_dir(&self) -> PathBuf {
+        self.config_dir.join("repo")
+    }
+
+    pub fn repo_tmp_dir(&self) -> PathBuf {
+        self.config_dir.join("repo.tmp")
+    }
+
+    pub fn repo_sync_dir(&self) -> PathBuf {
+        self.config_dir.join("repo-sync")
+    }
+
+    pub fn repo_hooks_dir(&self) -> PathBuf {
+        self.config_dir.join("repo-hooks")
+    }
+
+    pub fn repo_lock(&self) -> PathBuf {
+        self.config_dir.join("repo.lock")
+    }
+
+    pub fn repo_sync_lock(&self) -> PathBuf {
+        self.config_dir.join("repo-sync.lock")
+    }
+
+    pub fn machine_file(&self) -> PathBuf {
+        self.config_dir.join("machine.toml")
+    }
+
+    /// The user's guidance for every session, then its refinement for `os`.
+    pub fn guidance_files(&self, os: Os) -> [PathBuf; 2] {
+        let dir = self.repo_dir().join("tworky");
+        [
+            dir.join("claude.local.md"),
+            dir.join(format!("claude.local.{}.md", os.name())),
+        ]
+    }
+
+    pub fn project_dir(&self, name: &str) -> PathBuf {
+        self.repo_dir().join("projects").join(name)
+    }
+
+    pub fn project_file(&self, name: &str) -> PathBuf {
+        self.project_dir(name).join("project.toml")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Os {
+    Windows,
+    Macos,
+    Linux,
+}
+
+impl Os {
+    pub const ALL: [Os; 3] = [Os::Windows, Os::Macos, Os::Linux];
+
+    /// Other Unixes count as Linux.
+    pub const fn current() -> Os {
+        if cfg!(target_os = "windows") {
+            Os::Windows
+        } else if cfg!(target_os = "macos") {
+            Os::Macos
+        } else {
+            Os::Linux
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Os::Windows => "windows",
+            Os::Macos => "macos",
+            Os::Linux => "linux",
+        }
+    }
 }
 
 /// A repo for a project made from the Repositories picker.

@@ -341,7 +341,7 @@ fn locked_with<S>(
     })
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut name = path.file_name().context("no file name")?.to_os_string();
     name.push(".tmp");
     let tmp = path.with_file_name(name);
