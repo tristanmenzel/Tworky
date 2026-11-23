@@ -644,6 +644,13 @@ async fn list_project_errors() -> CmdResult<BTreeMap<String, String>> {
     blocking(|| Ok(workspace()?.config.project_errors)).await
 }
 
+/// Problems with the config as a whole: the config repo not set up, `machine.toml` not loading, or
+/// the last commit or sweep failing.
+#[tauri::command]
+async fn list_config_errors() -> CmdResult<Vec<String>> {
+    blocking(|| Ok(workspace()?.config.load_errors)).await
+}
+
 /// Clones a repo of the project that isn't cloned on this machine. Returns where it went.
 #[tauri::command]
 async fn clone_project_repo(project: String, repo: String) -> CmdResult<PathBuf> {
@@ -1267,12 +1274,16 @@ fn sweep_config() {
         return;
     }
     let swept = Paths::resolve().and_then(|paths| {
+        if !paths.has_repo() {
+            return Ok(None);
+        }
         let guard = config_repo::with_lock(&paths)?;
-        config_repo::sweep(&guard, &paths)
+        config_repo::sweep(&guard, &paths).map(Some)
     });
     SWEEPING.store(false, Ordering::Release);
     match swept {
-        Ok(swept) => {
+        Ok(None) => {}
+        Ok(Some(swept)) => {
             for file in swept.held_back {
                 eprintln!(
                     "config repo: not committing {}: it doesn't parse",
@@ -1547,6 +1558,7 @@ fn main() {
             reject_memory_changes,
             list_projects,
             list_project_errors,
+            list_config_errors,
             clone_project_repo,
             find_project_clones,
             search_repos,

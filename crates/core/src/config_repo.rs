@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -11,8 +13,17 @@ use crate::process;
 pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
 
-const FALLBACK_NAME: &str = "Tworky";
-const FALLBACK_EMAIL: &str = "tworky@localhost";
+const FALLBACK_NAME: &str = "user.name=Tworky";
+const FALLBACK_EMAIL: &str = "user.email=tworky@localhost";
+
+/// How long a rename in the config folder is retried while Windows holds a file in it open.
+const RENAME_RETRY: Duration = Duration::from_secs(10);
+
+/// Failures by config folder, kept for [`recorded_failures`].
+type Failures = Mutex<BTreeMap<PathBuf, String>>;
+
+static MIGRATION_FAILURES: Failures = Mutex::new(BTreeMap::new());
+static COMMIT_FAILURES: Failures = Mutex::new(BTreeMap::new());
 
 const GITIGNORE: &str = "\
 *
@@ -51,6 +62,43 @@ pub fn with_sync_lock(paths: &Paths) -> Result<SyncLock> {
     })
 }
 
+/// [`with_lock`] for a writer of files in `repo/`, which refuses while the repo isn't set up, so a
+/// write never lands in a `repo/` folder that git doesn't track.
+pub fn lock_for_write(paths: &Paths) -> Result<RepoLock> {
+    let guard = with_lock(paths)?;
+    if !paths.has_repo() {
+        bail!(
+            "the config repo {} isn't set up, so config can't be changed yet; restart Tworky or run `tw project ls` to set it up",
+            paths.repo_dir().display()
+        );
+    }
+    Ok(guard)
+}
+
+/// What went wrong in this process that the user should see: setting up the config repo, while
+/// it's still missing, and the last commit or sweep, until one succeeds.
+pub fn recorded_failures(paths: &Paths) -> Vec<String> {
+    let mut failures = Vec::new();
+    let dir = &paths.config_dir;
+    if !paths.has_repo()
+        && let Some(e) = MIGRATION_FAILURES.lock().unwrap().get(dir)
+    {
+        failures.push(format!("couldn't set up the config repo: {e}"));
+    }
+    if let Some(e) = COMMIT_FAILURES.lock().unwrap().get(dir) {
+        failures.push(format!("couldn't commit to the config repo: {e}"));
+    }
+    failures
+}
+
+fn record<T>(failures: &Failures, paths: &Paths, result: &Result<T>) {
+    let mut failures = failures.lock().unwrap();
+    match result {
+        Ok(_) => failures.remove(&paths.config_dir),
+        Err(e) => failures.insert(paths.config_dir.clone(), format!("{e:#}")),
+    };
+}
+
 fn lock(path: &Path) -> Result<File> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -68,7 +116,8 @@ fn lock(path: &Path) -> Result<File> {
 }
 
 /// Runs git in `dir` with signing, hooks, line-ending conversion and every prompt turned off, so
-/// the user's own git config can't make it fail or hang.
+/// the user's own git config can't make it fail or hang. Git never looks above the config folder,
+/// so a `repo/` without `.git` can't resolve to a repo enclosing it.
 pub fn git(paths: &Paths, dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
     let hooks = format!(
         "core.hooksPath={}",
@@ -87,7 +136,11 @@ pub fn git(paths: &Paths, dir: &Path, args: &[&str], timeout: Duration) -> Resul
     .current_dir(dir)
     .env("GIT_TERMINAL_PROMPT", "0")
     .env("GCM_INTERACTIVE", "never")
-    .env("GIT_EDITOR", "true");
+    .env("GIT_EDITOR", "true")
+    .env(
+        "GIT_CEILING_DIRECTORIES",
+        forward_slashes(&paths.config_dir),
+    );
     for var in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -132,7 +185,7 @@ fn create(
     let built = scaffold(paths, &tmp)
         .and_then(|()| fill(&tmp))
         .and_then(|unstaged| commit_everything(paths, &tmp, &unstaged, message))
-        .and_then(|()| rename_retrying(&tmp, &repo));
+        .and_then(|()| rename_retrying(&tmp, &repo, RENAME_RETRY));
     if built.is_err() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -152,11 +205,6 @@ fn scaffold(paths: &Paths, dir: &Path) -> Result<()> {
         ("rerere.enabled", "true"),
     ] {
         git(&["config", key, value])?;
-    }
-    let configured = |key: &str| git(&["config", key]).is_ok_and(|v| !v.trim().is_empty());
-    if !(configured("user.name") && configured("user.email")) {
-        git(&["config", "user.name", FALLBACK_NAME])?;
-        git(&["config", "user.email", FALLBACK_EMAIL])?;
     }
 
     std::fs::write(dir.join(".gitignore"), GITIGNORE)?;
@@ -186,17 +234,42 @@ fn commit_everything(paths: &Paths, dir: &Path, unstaged: &[String], message: &s
         ]
         .concat())?;
     }
-    git(&["commit", "-q", "-m", message])?;
+    let identity = identity_args(paths, dir);
+    git(&[&identity[..], &["commit", "-q", "-m", message]].concat())?;
     Ok(())
 }
 
+/// `-c` arguments for a commit, giving git Tworky's identity for whichever of `user.name` and
+/// `user.email` the user hasn't set. Never written to the repo's config, so an identity the user
+/// sets later takes over.
+fn identity_args(paths: &Paths, dir: &Path) -> Vec<&'static str> {
+    let unset = |key: &str| {
+        !git(paths, dir, &["config", key], LOCAL_TIMEOUT).is_ok_and(|v| !v.trim().is_empty())
+    };
+    let mut args = Vec::new();
+    if unset("user.name") {
+        args.extend(["-c", FALLBACK_NAME]);
+    }
+    if unset("user.email") {
+        args.extend(["-c", FALLBACK_EMAIL]);
+    }
+    args
+}
+
 /// Brings the config repo into being, then renames the legacy folders. See
-/// [`Paths::migrate_to_repo`].
+/// [`Paths::migrate_to_repo`]. A failure is kept for [`recorded_failures`].
 pub fn migrate(paths: &Paths) -> Result<Vec<String>> {
+    let migrated = migrate_unrecorded(paths);
+    record(&MIGRATION_FAILURES, paths, &migrated);
+    migrated
+}
+
+fn migrate_unrecorded(paths: &Paths) -> Result<Vec<String>> {
     let mut done = Vec::new();
-    if !paths.repo_dir().exists() {
+    if !paths.has_repo() {
         let guard = with_lock(paths)?;
-        if !paths.repo_dir().exists() {
+        if !paths.has_repo() {
+            done.extend(set_aside_untracked_repo(paths)?);
             if has_legacy_config(paths) {
                 done.extend(import(&guard, paths)?);
             } else {
@@ -212,13 +285,39 @@ pub fn migrate(paths: &Paths) -> Result<Vec<String>> {
     Ok(done)
 }
 
+/// Moves a `repo/` with no `.git`, which an older build's writer can leave after a failed
+/// migration, out of the way of the new repo, keeping it for the user to look through.
+fn set_aside_untracked_repo(paths: &Paths) -> Result<Vec<String>> {
+    let repo = paths.repo_dir();
+    if !repo.exists() {
+        return Ok(vec![]);
+    }
+    let aside = unused_sibling(&repo, "no-git");
+    rename_retrying(&repo, &aside, RENAME_RETRY)?;
+    Ok(vec![format!(
+        "moved {} aside to {}: it had no .git",
+        repo.display(),
+        aside.display()
+    )])
+}
+
+/// `<dir>.<suffix>`, or `<dir>.<suffix>-<n>` for the first `n` not taken.
+fn unused_sibling(dir: &Path, suffix: &str) -> PathBuf {
+    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    std::iter::once(format!("{name}.{suffix}"))
+        .chain((2..).map(|n| format!("{name}.{suffix}-{n}")))
+        .map(|b| dir.with_file_name(b))
+        .find(|b| !b.exists())
+        .expect("an unused name exists")
+}
+
 fn has_legacy_config(paths: &Paths) -> bool {
     !files_with_extension(&paths.legacy_projects_dir(), "toml").is_empty()
         || !files_with_extension(&paths.legacy_memory_dir(), "md").is_empty()
 }
 
 /// Files directly in `dir` with `extension`, sorted.
-fn files_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
+pub(crate) fn files_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return vec![];
     };
@@ -247,16 +346,27 @@ fn import(guard: &RepoLock, paths: &Paths) -> Result<Vec<String>> {
                 .and_then(|s| s.to_str())
                 .filter(|s| is_project_name(s));
             let (folder, out) = match (import_project(&text, &mut machine), stem) {
-                (Ok((name, _)), _) if folders.contains(&name) => {
+                (Ok(imported), _) if folders.contains(&imported.name) => {
                     report.push(format!(
-                        "left {} in the backup: project {name} was already imported",
-                        file.display()
+                        "left {} in the backup: project {} was already imported",
+                        file.display(),
+                        imported.name
                     ));
                     continue;
                 }
-                (Ok((name, out)), _) => {
-                    report.push(format!("imported {} as project {name}", file.display()));
-                    (name, out)
+                (Ok(imported), _) => {
+                    report.push(format!(
+                        "imported {} as project {}",
+                        file.display(),
+                        imported.name
+                    ));
+                    for repo in &imported.without_repo {
+                        report.push(format!(
+                            "project {}: repo {repo} has no `repo = \"owner/name\"`; add it so its clone can be found",
+                            imported.name
+                        ));
+                    }
+                    (imported.name, imported.text)
                 }
                 (Err(e), Some(stem)) if !folders.iter().any(|f| f == stem) => {
                     report.push(format!(
@@ -301,10 +411,18 @@ fn import(guard: &RepoLock, paths: &Paths) -> Result<Vec<String>> {
     Ok(report)
 }
 
-/// The project's name and its file for the repo: each repo's `source` and the `template_dir` move
-/// to `machine` when they exist on this machine, and each repo gets a `repo` from its clone's
-/// origin, else from the one `match.repos` entry with its name.
-fn import_project(text: &str, machine: &mut MachineConfig) -> Result<(String, String)> {
+struct Imported {
+    name: String,
+    text: String,
+    /// Repos left with no `repo`, which couldn't be guessed.
+    without_repo: Vec<String>,
+}
+
+/// The project's file for the repo. Each repo's `source` and the `template_dir` move to `machine`
+/// unless it already has one, even when the path is missing right now (on a drive that isn't
+/// mounted, say). Each repo gets a `repo` from its clone's origin, else from the one `match.repos`
+/// entry with its name.
+fn import_project(text: &str, machine: &mut MachineConfig) -> Result<Imported> {
     use toml_edit::{DocumentMut, TableLike, value};
     let parsed: ProjectConfig = toml::from_str(text)?;
     let name = parsed.name.clone();
@@ -314,7 +432,7 @@ fn import_project(text: &str, machine: &mut MachineConfig) -> Result<(String, St
     let mut doc: DocumentMut = text.parse()?;
     if let Some(dir) = doc.remove("template_dir")
         && let Some(dir) = dir.as_str().map(PathBuf::from)
-        && dir.exists()
+        && machine.template_dir(&name).is_none()
     {
         machine.set_template_dir(&name, dir);
     }
@@ -331,6 +449,7 @@ fn import_project(text: &str, machine: &mut MachineConfig) -> Result<(String, St
         ),
         _ => {}
     }
+    let mut without_repo = Vec::new();
     for table in repos {
         let Some(repo) = table.get("name").and_then(|n| n.as_str()).map(String::from) else {
             continue;
@@ -338,18 +457,27 @@ fn import_project(text: &str, machine: &mut MachineConfig) -> Result<(String, St
         let source = table
             .remove("source")
             .and_then(|s| s.as_str().map(PathBuf::from));
-        if let Some(source) = source.as_ref().filter(|s| s.exists()) {
+        if let Some(source) = &source
+            && machine.source(&name, &repo).is_none()
+        {
             machine.set_source(&name, &repo, source.clone());
         }
-        if table.get("repo").is_none()
-            && let Some(nwo) = guess_repo(source.as_deref(), &repo, &parsed.match_rule.repos)
-        {
-            table.insert("repo", value(nwo));
+        if table.get("repo").is_none() {
+            match guess_repo(source.as_deref(), &repo, &parsed.match_rule.repos) {
+                Some(nwo) => {
+                    table.insert("repo", value(nwo));
+                }
+                None => without_repo.push(repo),
+            }
         }
     }
     let out = doc.to_string();
     toml::from_str::<ProjectConfig>(&out).context("the imported project config")?;
-    Ok((name, out))
+    Ok(Imported {
+        name,
+        text: out,
+        without_repo,
+    })
 }
 
 fn guess_repo(source: Option<&Path>, repo: &str, matched: &[String]) -> Option<String> {
@@ -380,17 +508,15 @@ fn is_project_name(name: &str) -> bool {
 /// builds and this one never read both.
 fn rename_legacy(paths: &Paths) -> Result<Vec<String>> {
     let mut done = Vec::new();
+    if !paths.has_repo() {
+        return Ok(done);
+    }
     for dir in [paths.legacy_projects_dir(), paths.legacy_memory_dir()] {
         if !dir.exists() {
             continue;
         }
-        let name = dir.file_name().unwrap_or_default().to_string_lossy();
-        let backup = std::iter::once(format!("{name}.pre-repo"))
-            .chain((2..).map(|n| format!("{name}.pre-repo-{n}")))
-            .map(|b| dir.with_file_name(b))
-            .find(|b| !b.exists())
-            .expect("an unused name exists");
-        match rename_retrying(&dir, &backup) {
+        let backup = unused_sibling(&dir, "pre-repo");
+        match rename_retrying(&dir, &backup, RENAME_RETRY) {
             Ok(()) => done.push(format!("moved {} to {}", dir.display(), backup.display())),
             Err(_) if !dir.exists() => {}
             Err(e) => return Err(e),
@@ -401,8 +527,8 @@ fn rename_legacy(paths: &Paths) -> Result<Vec<String>> {
 
 /// On Windows a scanner or indexer can briefly hold a file in the new repo open, which makes the
 /// rename fail with a sharing or access error.
-fn rename_retrying(from: &Path, to: &Path) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+fn rename_retrying(from: &Path, to: &Path, budget: Duration) -> Result<()> {
+    let deadline = Instant::now() + budget;
     loop {
         match std::fs::rename(from, to) {
             Ok(()) => return Ok(()),
@@ -450,21 +576,46 @@ pub fn commit(
         }
         relatives.push(relative);
     }
-    commit_paths(paths, &repo, &relatives, message)
+    let committed = commit_paths(paths, &repo, &relatives, message, true)?;
+    if let Some(file) = committed.held_back.first() {
+        bail!("{} doesn't parse as staged", repo.join(file).display());
+    }
+    Ok(committed.committed)
 }
 
-/// [`commit`], but a failure is only logged: the file is already written, and the next sweep
-/// commits it.
+/// [`commit`], but a failure is only logged and kept for [`recorded_failures`]: the file is
+/// already written, and the next sweep commits it.
 pub fn commit_logged(guard: &RepoLock, paths: &Paths, files: &[impl AsRef<Path>], message: &str) {
-    if let Err(e) = commit(guard, paths, files, message) {
+    let committed = commit(guard, paths, files, message);
+    if let Err(e) = &committed {
         eprintln!("config repo: couldn't commit \"{message}\": {e:#}");
     }
+    record(&COMMIT_FAILURES, paths, &committed);
 }
 
-/// Commits `relatives` (allowlisted, `/`-separated) as they are in the working tree.
-fn commit_paths(paths: &Paths, repo: &Path, relatives: &[String], message: &str) -> Result<bool> {
+struct Committed {
+    committed: bool,
+    /// Staged `project.toml` files that didn't parse, so were unstaged and not committed.
+    held_back: Vec<String>,
+}
+
+/// Commits `relatives` (allowlisted, `/`-separated) as they are in the working tree, except a
+/// `project.toml` whose staged content doesn't parse. That's checked after staging, because the
+/// file can change between a parse check and `git add`. With `all_or_nothing`, such a file stops
+/// the whole commit.
+fn commit_paths(
+    paths: &Paths,
+    repo: &Path,
+    relatives: &[String],
+    message: &str,
+    all_or_nothing: bool,
+) -> Result<Committed> {
+    let mut held_back = Vec::new();
     if relatives.is_empty() {
-        return Ok(false);
+        return Ok(Committed {
+            committed: false,
+            held_back,
+        });
     }
     let run = |args: &[&str], relatives: &[&String]| {
         let specs: Vec<String> = relatives.iter().map(|r| pathspec(r)).collect();
@@ -483,29 +634,78 @@ fn commit_paths(paths: &Paths, repo: &Path, relatives: &[String], message: &str)
             &missing,
         )?;
     }
-    let all: Vec<&String> = relatives.iter().collect();
-    let out = run(
-        &[
-            "diff",
-            "--cached",
-            "--name-only",
-            "--no-renames",
-            "-z",
-            "--",
-        ],
-        &all,
-    )?;
+    for relative in present
+        .iter()
+        .filter(|r| is_project_file(Path::new(r.as_str())))
+    {
+        let staged = git(
+            paths,
+            repo,
+            &["show", &format!(":{relative}")],
+            LOCAL_TIMEOUT,
+        )?;
+        if toml::from_str::<ProjectConfig>(&staged).is_err() {
+            held_back.push(relative.to_string());
+        }
+    }
+    if !held_back.is_empty() {
+        let unstage: Vec<&String> = if all_or_nothing {
+            relatives.iter().collect()
+        } else {
+            held_back.iter().collect()
+        };
+        run(&["reset", "-q", "--"], &unstage)?;
+        if all_or_nothing {
+            return Ok(Committed {
+                committed: false,
+                held_back,
+            });
+        }
+    }
+    let all: Vec<&String> = relatives
+        .iter()
+        .filter(|r| !held_back.contains(r))
+        .collect();
+    let out = if all.is_empty() {
+        String::new()
+    } else {
+        run(
+            &[
+                "diff",
+                "--cached",
+                "--name-only",
+                "--no-renames",
+                "-z",
+                "--",
+            ],
+            &all,
+        )?
+    };
     let staged: Vec<String> = out
         .split('\0')
         .filter(|p| !p.is_empty())
         .map(String::from)
         .collect();
     if staged.is_empty() {
-        return Ok(false);
+        return Ok(Committed {
+            committed: false,
+            held_back,
+        });
     }
     let staged: Vec<&String> = staged.iter().collect();
-    run(&["commit", "-q", "-m", message, "--only", "--"], &staged)?;
-    Ok(true)
+    let identity = identity_args(paths, repo);
+    run(
+        &[
+            &identity[..],
+            &["commit", "-q", "-m", message, "--only", "--"],
+        ]
+        .concat(),
+        &staged,
+    )?;
+    Ok(Committed {
+        committed: true,
+        held_back,
+    })
 }
 
 fn pathspec(relative: &str) -> String {
@@ -562,8 +762,14 @@ pub struct Sweep {
 }
 
 /// Commits every allowlisted change in `repo/`, such as edits by setup sessions or by hand, except
-/// a `project.toml` that doesn't parse.
+/// a `project.toml` that doesn't parse. A failure is kept for [`recorded_failures`].
 pub fn sweep(_guard: &RepoLock, paths: &Paths) -> Result<Sweep> {
+    let swept = sweep_unrecorded(paths);
+    record(&COMMIT_FAILURES, paths, &swept);
+    swept
+}
+
+fn sweep_unrecorded(paths: &Paths) -> Result<Sweep> {
     let repo = paths.repo_dir();
     let mut held_back = Vec::new();
     let mut relatives = Vec::new();
@@ -575,9 +781,16 @@ pub fn sweep(_guard: &RepoLock, paths: &Paths) -> Result<Sweep> {
             relatives.push(relative);
         }
     }
-    let committed = commit_paths(paths, &repo, &relatives, "Commit edits made outside Tworky")?;
+    let committed = commit_paths(
+        paths,
+        &repo,
+        &relatives,
+        "Commit edits made outside Tworky",
+        false,
+    )?;
+    held_back.extend(committed.held_back.iter().map(|r| repo.join(r)));
     Ok(Sweep {
-        committed,
+        committed: committed.committed,
         held_back,
     })
 }
@@ -737,6 +950,7 @@ mod tests {
     thread_local! {
         static GLOBAL_CONFIG: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
         static FAIL: Cell<Option<&'static str>> = const { Cell::new(None) };
+        static BEFORE_ADD: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     }
 
     const CHILD_HOME: &str = "TWORKY_TEST_LOCK_CHILD_HOME";
@@ -755,6 +969,11 @@ mod tests {
             "EMAIL",
         ] {
             cmd.env_remove(var);
+        }
+        if args.contains(&"add")
+            && let Some(before) = BEFORE_ADD.take()
+        {
+            before();
         }
         if let Some(fail) = FAIL.get()
             && args.contains(&fail)
@@ -842,6 +1061,18 @@ mod tests {
             ]
         );
         let local = |key: &str| home.git(&["config", "--local", key]).trim().to_string();
+        for key in ["user.name", "user.email"] {
+            assert!(
+                git(
+                    &home.paths,
+                    &home.paths.repo_dir(),
+                    &["config", "--local", key],
+                    LOCAL_TIMEOUT
+                )
+                .is_err(),
+                "{key} is resolved per commit, never stored"
+            );
+        }
         assert_eq!(local("commit.gpgsign"), "false");
         assert_eq!(local("core.autocrlf"), "false");
         assert_eq!(local("rerere.enabled"), "true");
@@ -1302,7 +1533,19 @@ mod tests {
 
         let machine = MachineConfig::read(paths).unwrap();
         assert_eq!(machine.source("acme", "api"), Some(&clone));
-        assert_eq!(machine.source("acme", "web"), None, "its clone is gone");
+        assert_eq!(
+            machine.source("acme", "web"),
+            Some(&home.dir.path().join("gone")),
+            "kept though it's missing right now"
+        );
+        assert_eq!(
+            machine.source("acme", "misc"),
+            Some(&PathBuf::from("C:/nowhere/misc"))
+        );
+        assert!(
+            done.iter().any(|l| l.contains("repo misc has no `repo")),
+            "{done:?}"
+        );
         assert_eq!(machine.template_dir("acme"), Some(&templates));
 
         assert_eq!(
@@ -1351,6 +1594,169 @@ mod tests {
 
         assert!(migrate(paths).unwrap().is_empty(), "a rerun does nothing");
         assert_eq!(home.log(), ["Import existing config"]);
+    }
+
+    #[test]
+    fn identity_is_resolved_per_commit() {
+        let home = Home::new("");
+        home.init();
+        let global = home.dir.path().join("gitconfig");
+        std::fs::write(
+            &global,
+            "[user]\n\tname = Later User\n\temail = later@example.com\n",
+        )
+        .unwrap();
+        let guard = with_lock(&home.paths).unwrap();
+        let memory = home.write("projects/acme/memory.md", "# Acme\n");
+        assert!(commit(&guard, &home.paths, &[&memory], "Save acme memory").unwrap());
+        assert_eq!(
+            home.lines(&["log", "--format=%an <%ae>"]),
+            [
+                "Later User <later@example.com>",
+                "Tworky <tworky@localhost>"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_project_toml_broken_between_check_and_staging_is_held_back() {
+        let home = Home::new("");
+        home.init();
+        let guard = with_lock(&home.paths).unwrap();
+        let project = home.write("projects/acme/project.toml", PROJECT);
+        let memory = home.write("projects/acme/memory.md", "# Acme\n");
+
+        let file = project.clone();
+        BEFORE_ADD.set(Some(Box::new(move || {
+            std::fs::write(file, "name = [").unwrap()
+        })));
+        let swept = sweep(&guard, &home.paths).unwrap();
+        assert!(swept.committed);
+        assert_eq!(swept.held_back, std::slice::from_ref(&project));
+        assert_eq!(
+            home.lines(&["ls-files", "projects"]),
+            ["projects/acme/memory.md"]
+        );
+        assert_eq!(
+            status(&home.paths).unwrap().changes,
+            ["projects/acme/project.toml"]
+        );
+
+        std::fs::write(&project, PROJECT).unwrap();
+        std::fs::write(&memory, "# Acme, again\n").unwrap();
+        let file = project.clone();
+        BEFORE_ADD.set(Some(Box::new(move || {
+            std::fs::write(file, "name = [").unwrap()
+        })));
+        let e = commit(&guard, &home.paths, &[&project, &memory], "Both").unwrap_err();
+        assert!(e.to_string().contains("doesn't parse"), "{e:#}");
+        assert_eq!(home.log().len(), 2, "nothing committed");
+        assert!(
+            home.git(&["diff", "--cached", "--name-only"]).is_empty(),
+            "nothing left staged"
+        );
+    }
+
+    #[test]
+    fn git_never_looks_above_the_config_folder() {
+        let home = Home::new("");
+        git(
+            &home.paths,
+            home.dir.path(),
+            &["init", "-q", "-b", "main"],
+            LOCAL_TIMEOUT,
+        )
+        .unwrap();
+        let repo = home.paths.repo_dir();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let e = git(
+            &home.paths,
+            &repo,
+            &["rev-parse", "--show-toplevel"],
+            LOCAL_TIMEOUT,
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("not a git repository"), "{e:#}");
+    }
+
+    #[test]
+    fn a_failed_import_keeps_the_legacy_config_readable_and_writers_out() {
+        let (home, clone, _) = legacy_home();
+        let paths = &home.paths;
+        FAIL.set(Some("commit"));
+        migrate(paths).unwrap_err();
+        assert!(recorded_failures(paths)[0].contains("injected failure"));
+
+        let config = crate::config::Config::load_from(paths.clone()).unwrap();
+        let acme = config.project("acme").expect("read from the legacy file");
+        assert_eq!(acme.repos[0].source, Some(clone));
+        assert!(config.project_errors.contains_key("beta"));
+        assert!(
+            config.load_errors[0].contains("isn't set up"),
+            "{:?}",
+            config.load_errors
+        );
+        assert_eq!(
+            crate::memory::read(&paths.memory_file("acme", None)).unwrap(),
+            "# Acme memory\n"
+        );
+
+        let base = crate::memory::hash("# Acme memory\n");
+        let e = crate::memory::save(paths, "acme", &base, "# Changed\n").unwrap_err();
+        assert!(e.to_string().contains("isn't set up"), "{e:#}");
+        let e = crate::config::create_repo_project(
+            paths,
+            &[],
+            &[crate::config::NewRepo {
+                name_with_owner: "acme/new".into(),
+                source: home.dir.path().join("new"),
+                base: "origin/main".into(),
+            }],
+            None,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("isn't set up"), "{e:#}");
+        assert!(!paths.repo_dir().exists(), "no writer made repo/");
+        assert_eq!(
+            std::fs::read_to_string(paths.legacy_memory_dir().join("acme.md")).unwrap(),
+            "# Acme memory\n"
+        );
+
+        FAIL.set(None);
+        migrate(paths).unwrap();
+        assert_eq!(home.log(), ["Import existing config"]);
+        assert!(recorded_failures(paths).is_empty());
+        let config = crate::config::Config::load_from(paths.clone()).unwrap();
+        assert!(config.load_errors.is_empty(), "{:?}", config.load_errors);
+        assert!(config.project("acme").is_some());
+    }
+
+    #[test]
+    fn a_repo_folder_without_git_is_set_aside_and_the_import_runs() {
+        let (home, _, _) = legacy_home();
+        let paths = &home.paths;
+        let stray = paths.project_dir("acme").join("memory.md");
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, "# Written without a repo\n").unwrap();
+
+        let done = migrate(paths).unwrap();
+        assert!(
+            done.iter().any(|l| l.contains("it had no .git")),
+            "{done:?}"
+        );
+        assert_eq!(home.log(), ["Import existing config"]);
+        assert_eq!(
+            std::fs::read_to_string(paths.memory_file("acme", None)).unwrap(),
+            "# Acme memory\n"
+        );
+        assert!(
+            paths
+                .config_dir
+                .join("repo.no-git/projects/acme/memory.md")
+                .exists()
+        );
+        assert!(!paths.legacy_projects_dir().exists());
     }
 
     #[test]

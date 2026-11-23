@@ -156,7 +156,7 @@ impl Workspace {
     /// Marks the project as set up, removing `onboarding` from its config.
     pub fn finish_onboarding(&self, name: &str) -> Result<()> {
         let project = self.configured(name)?;
-        let guard = config_repo::with_lock(&self.config.paths)?;
+        let guard = config_repo::lock_for_write(&self.config.paths)?;
         let text = std::fs::read_to_string(&project.file)?;
         let mut doc: toml_edit::DocumentMut = text.parse()?;
         if doc.remove("onboarding").is_none() {
@@ -201,10 +201,16 @@ impl Workspace {
                 );
             }
             let Some(source) = &repo.source else {
-                problem(
-                    Level::Error,
-                    format!("repo {}: {:#}", repo.name, repo.not_cloned()),
-                );
+                let text = match self.config.machine.source(&project.name, &repo.name) {
+                    Some(recorded) => format!(
+                        "repo {}: its clone at {} isn't there (on a drive that isn't mounted?); {:#}",
+                        repo.name,
+                        recorded.display(),
+                        repo.not_cloned()
+                    ),
+                    None => format!("repo {}: {:#}", repo.name, repo.not_cloned()),
+                };
+                problem(Level::Error, text);
                 continue;
             };
             if !source.join(".git").exists() {
@@ -455,6 +461,7 @@ mod tests {
             source: dir.path().join("portal"),
             base: "origin/main".into(),
         }];
+        std::fs::create_dir_all(&repos[0].source).unwrap();
         crate::config::create_repo_project(&paths, &[], &repos, None).unwrap();
         let config = Config::load_from(paths).unwrap();
         let project = config.project("portal").unwrap();
@@ -479,6 +486,7 @@ mod tests {
             source: dir.path().join("portal"),
             base: "origin/main".into(),
         }];
+        std::fs::create_dir_all(&repos[0].source).unwrap();
         crate::config::create_repo_project(&paths, &[], &repos, None).unwrap();
         let config = Config::load_from(paths).unwrap();
         let ws = Workspace {

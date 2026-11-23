@@ -120,6 +120,7 @@
   let itemsLoaded = $state(false)
   let projects = $state<ProjectSummary[]>([])
   let projectErrors = $state<Record<string, string>>({})
+  let configErrors = $state<string[]>([])
   let anonymousFor = $state<Worker | null>(null)
   let createProfileFor = $state<{ worker: Worker; request: AccountRequest | null } | null>(null)
   let selectedProject = $state<string | null>(null)
@@ -396,9 +397,10 @@
 
   async function loadProjects() {
     try {
-      const [loaded, errors] = await Promise.all([api.projects(), api.projectErrors()])
+      const [loaded, errors, configWide] = await Promise.all([api.projects(), api.projectErrors(), api.configErrors()])
       projects = loaded
       projectErrors = errors
+      configErrors = configWide
       if (!projects.some((p) => p.name === selectedProject)) selectedProject = projects[0]?.name ?? null
     } catch (e) {
       showError(String(e))
@@ -934,6 +936,9 @@
           <button onclick={loadProjects} title="Reload project config">↻</button>
         </div>
         <ul class="projects">
+          {#each configErrors as error, i (i)}
+            <li class="project broken"><span class="error-text">{error}</span></li>
+          {/each}
           {#each projects as p (p.name)}
             {@const n = workers.filter((w) => w.project === p.name).length}
             <li>

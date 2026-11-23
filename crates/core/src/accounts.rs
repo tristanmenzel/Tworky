@@ -307,7 +307,7 @@ fn edit_accounts(
     message: &str,
     change: impl FnOnce(&mut ArrayOfTables),
 ) -> Result<()> {
-    let guard = config_repo::with_lock(paths)?;
+    let guard = config_repo::lock_for_write(paths)?;
     let file = &project.file;
     let text =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;

@@ -149,8 +149,12 @@ impl Paths {
         self.config_dir.join("settings.toml")
     }
 
-    /// The project's shared memory, or with `os` its refinement for that OS.
+    /// The project's shared memory, or with `os` its refinement for that OS. While the config repo
+    /// isn't set up, the shared memory is read from the legacy `memory/<project>.md`.
     pub fn memory_file(&self, project: &str, os: Option<Os>) -> PathBuf {
+        if os.is_none() && !self.has_repo() && self.legacy_memory_dir().is_dir() {
+            return self.legacy_memory_dir().join(format!("{project}.md"));
+        }
         let name = match os {
             Some(os) => format!("memory.{}.md", os.name()),
             None => "memory.md".into(),
@@ -168,6 +172,18 @@ impl Paths {
 
     pub fn repo_dir(&self) -> PathBuf {
         self.config_dir.join("repo")
+    }
+
+    /// Whether the config repo exists. A `repo/` folder alone doesn't count: an older build's
+    /// writer could create one after a failed migration.
+    pub fn has_repo(&self) -> bool {
+        self.repo_dir().join(".git").exists()
+    }
+
+    /// Whether config is read, read-only, from the legacy `projects/`, because the config repo
+    /// isn't set up yet.
+    pub fn reads_legacy(&self) -> bool {
+        !self.has_repo() && self.legacy_projects_dir().is_dir()
     }
 
     pub fn repo_tmp_dir(&self) -> PathBuf {
@@ -289,7 +305,7 @@ pub fn create_repo_project(
     if base_name.trim_matches('-').is_empty() {
         bail!("a project needs a name");
     }
-    let guard = config_repo::with_lock(paths)?;
+    let guard = config_repo::lock_for_write(paths)?;
     let name = std::iter::once(base_name.clone())
         .chain((2..).map(|n| format!("{base_name}-{n}")))
         .find(|n| !taken.contains(n) && !paths.project_dir(n).exists())
@@ -328,14 +344,14 @@ pub fn create_repo_project(
         toml::to_string(&table)?
     );
     let parsed: ProjectConfig = toml::from_str(&text).context("generated project config")?;
-    let file = paths.project_file(&name);
-    std::fs::create_dir_all(paths.project_dir(&name))?;
-    crate::memory::write_atomic(&file, text.as_bytes())?;
     MachineConfig::update(&guard, paths, |m| {
         for r in repos {
             m.set_source(&name, &short(&r.name_with_owner), r.source.clone());
         }
     })?;
+    let file = paths.project_file(&name);
+    std::fs::create_dir_all(paths.project_dir(&name))?;
+    crate::memory::write_atomic(&file, text.as_bytes())?;
     config_repo::commit_logged(&guard, paths, &[&file], &format!("Create project {name}"));
     Ok(parsed.name)
 }
@@ -345,7 +361,7 @@ pub fn create_repo_project(
 /// and layout survive, and the file is written only if the result still parses.
 pub fn add_repo_to_project(paths: &Paths, project: &str, repo: &NewRepo) -> Result<()> {
     use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
-    let guard = config_repo::with_lock(paths)?;
+    let guard = config_repo::lock_for_write(paths)?;
     let file = paths.project_file(project);
     let text =
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
@@ -408,7 +424,6 @@ pub fn add_repo_to_project(paths: &Paths, project: &str, repo: &NewRepo) -> Resu
 
     let out = doc.to_string();
     toml::from_str::<ProjectConfig>(&out).context("the edited project config")?;
-    crate::memory::write_atomic(&file, out.as_bytes())?;
     if let Some(entry) = entry {
         MachineConfig::update(&guard, paths, |m| {
             if m.source(project, &entry).is_none() {
@@ -416,6 +431,7 @@ pub fn add_repo_to_project(paths: &Paths, project: &str, repo: &NewRepo) -> Resu
             }
         })?;
     }
+    crate::memory::write_atomic(&file, out.as_bytes())?;
     config_repo::commit_logged(
         &guard,
         paths,
@@ -475,7 +491,7 @@ pub fn find_sources(config: &Config, project: Option<&str>) -> Result<Vec<FoundS
         let guard = config_repo::with_lock(&config.paths)?;
         MachineConfig::update(&guard, &config.paths, |m| {
             for f in &found {
-                if m.source(&f.project, &f.repo).is_none() {
+                if m.source(&f.project, &f.repo).is_none_or(|s| !s.exists()) {
                     m.set_source(&f.project, &f.repo, f.source.clone());
                 }
             }
@@ -870,15 +886,26 @@ pub struct Config {
     /// Projects that didn't load, by their folder in the repo, so one broken project hides only
     /// itself.
     pub project_errors: BTreeMap<String, String>,
+    /// Why `machine.toml` didn't load, when it didn't. Every repo then looks not cloned.
+    pub machine_error: Option<String>,
+    /// Problems with the config as a whole, for the Projects list and `tw project ls|check`.
+    pub load_errors: Vec<String>,
 }
 
 impl Config {
+    /// [`Config::load_from`] for this machine's config, plus what went wrong setting up or
+    /// committing to the config repo in this process.
     pub fn load() -> Result<Self> {
-        Self::load_from(Paths::resolve()?)
+        let mut config = Self::load_from(Paths::resolve()?)?;
+        let mut errors = config_repo::recorded_failures(&config.paths);
+        errors.append(&mut config.load_errors);
+        config.load_errors = errors;
+        Ok(config)
     }
 
     /// Fails only when `config.toml` can't be read or is invalid. A project that doesn't load is
-    /// left out and listed in `project_errors`.
+    /// left out and listed in `project_errors`. While the config repo isn't set up, projects come
+    /// from the legacy `projects/*.toml`, keyed by file stem.
     pub fn load_from(paths: Paths) -> Result<Self> {
         let app: AppConfig = match std::fs::read_to_string(paths.app_config()) {
             Ok(text) => toml::from_str(&text)
@@ -887,21 +914,44 @@ impl Config {
             Err(e) => return Err(e).context("reading app config"),
         };
         validate_app(&app)?;
-        let machine = MachineConfig::read(&paths).unwrap_or_else(|e| {
-            eprintln!("ignoring machine.toml: {e:#}");
-            MachineConfig::default()
-        });
+        let mut load_errors = Vec::new();
+        let (machine, machine_error) = match MachineConfig::read(&paths) {
+            Ok(machine) => (machine, None),
+            Err(e) => {
+                let e = format!("{e:#}");
+                load_errors.push(format!(
+                    "{e}; every repo shows as not cloned until it's fixed"
+                ));
+                (MachineConfig::default(), Some(e))
+            }
+        };
+        let files: Vec<(String, PathBuf, Option<String>)> = if paths.reads_legacy() {
+            load_errors.push(format!(
+                "the config repo {} isn't set up, so projects are read from {} and can't be changed",
+                paths.repo_dir().display(),
+                paths.legacy_projects_dir().display()
+            ));
+            config_repo::files_with_extension(&paths.legacy_projects_dir(), "toml")
+                .into_iter()
+                .filter_map(|file| {
+                    let stem = file.file_stem()?.to_str()?.to_string();
+                    Some((stem, file, None))
+                })
+                .collect()
+        } else {
+            project_folders(&paths)
+                .into_iter()
+                .map(|folder| (folder.clone(), paths.project_file(&folder), Some(folder)))
+                .filter(|(_, file, _)| file.exists())
+                .collect()
+        };
         let mut projects = Vec::new();
         let mut project_errors = BTreeMap::new();
-        for folder in project_folders(&paths) {
-            let file = paths.project_file(&folder);
-            if !file.exists() {
-                continue;
-            }
-            match load_project(&file, &folder, &machine, &app) {
+        for (key, file, folder) in files {
+            match load_project(&file, folder.as_deref(), &machine, &app) {
                 Ok(project) => projects.push(project),
                 Err(e) => {
-                    project_errors.insert(folder, format!("{e:#}"));
+                    project_errors.insert(key, format!("{e:#}"));
                 }
             }
         }
@@ -911,6 +961,8 @@ impl Config {
             machine,
             projects,
             project_errors,
+            machine_error,
+            load_errors,
         })
     }
 
@@ -982,9 +1034,11 @@ fn project_folders(paths: &Paths) -> Vec<String> {
     folders
 }
 
+/// Loads a project file, refusing one whose name differs from its `folder` in the repo. A source
+/// that doesn't exist on this machine counts as not cloned.
 fn load_project(
     file: &Path,
-    folder: &str,
+    folder: Option<&str>,
     machine: &MachineConfig,
     app: &AppConfig,
 ) -> Result<ProjectConfig> {
@@ -992,7 +1046,9 @@ fn load_project(
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let (mut project, warnings) =
         parse_project(&text).with_context(|| format!("parsing {}", file.display()))?;
-    if project.name != folder {
+    if let Some(folder) = folder
+        && project.name != folder
+    {
         bail!(
             "{} names the project '{}', but its folder is '{folder}'; rename one to match",
             file.display(),
@@ -1005,7 +1061,8 @@ fn load_project(
         repo.source = machine
             .source(&project.name, &repo.name)
             .cloned()
-            .or_else(|| repo.source.take().filter(|s| s.exists()));
+            .or_else(|| repo.source.take())
+            .filter(|s| s.exists());
     }
     project.validate(app)?;
     Ok(project)
@@ -1222,6 +1279,7 @@ mod tests {
 
         let text = std::fs::read_to_string(p.project_file("admin-portal")).unwrap();
         assert!(!text.contains("source"), "{text}");
+        std::fs::create_dir_all(dir.path().join("src").join("acme/shared")).unwrap();
         let config = Config::load_from(p.clone()).unwrap();
         let project = config.project_for_repo("acme/shared").unwrap();
         assert_eq!(project.name, "admin-portal");
@@ -1311,6 +1369,7 @@ mod tests {
         );
         write_project(&p, "acme", &toml);
         let machine_clone = dir.path().join("machine-clone");
+        std::fs::create_dir_all(&machine_clone).unwrap();
         std::fs::write(
             p.machine_file(),
             format!(
@@ -1371,6 +1430,41 @@ mod tests {
             config.template_dir(config.project("acme").unwrap()),
             p.templates_dir().join("acme")
         );
+    }
+
+    #[test]
+    fn an_unreadable_machine_toml_is_a_load_error_and_stops_new_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = config_repo::test_home(dir.path());
+        write_project(&p, "acme", ACME);
+        std::fs::write(p.machine_file(), "projects = [").unwrap();
+
+        let config = Config::load_from(p.clone()).unwrap();
+        assert!(config.project("acme").is_some());
+        assert!(config.machine_error.is_some());
+        assert!(
+            config.load_errors[0].contains("machine.toml")
+                && config.load_errors[0].contains("not cloned"),
+            "{:?}",
+            config.load_errors
+        );
+
+        let repos = [NewRepo {
+            name_with_owner: "beta/web".into(),
+            source: dir.path().join("web"),
+            base: "origin/main".into(),
+        }];
+        create_repo_project(&p, &[], &repos, None).unwrap_err();
+        assert!(!p.project_dir("web").exists());
+        add_repo_to_project(&p, "acme", &repos[0]).unwrap_err();
+        assert!(
+            !std::fs::read_to_string(p.project_file("acme"))
+                .unwrap()
+                .contains("beta/web")
+        );
+
+        std::fs::remove_file(p.machine_file()).unwrap();
+        assert_eq!(create_repo_project(&p, &[], &repos, None).unwrap(), "web");
     }
 
     #[test]

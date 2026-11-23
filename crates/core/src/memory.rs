@@ -342,10 +342,10 @@ fn locked_with<S>(
     prepare: impl FnOnce(&str) -> Result<(String, S)>,
     undo: impl FnOnce(S, anyhow::Error) -> anyhow::Error,
 ) -> Result<()> {
-    let guard = config_repo::with_lock(paths)?;
+    let guard = config_repo::lock_for_write(paths)?;
     let file = paths.memory_file(project, None);
-    let (next, state) = prepare(&read(&file)?)?;
     std::fs::create_dir_all(paths.project_dir(project))?;
+    let (next, state) = prepare(&read(&file)?)?;
     write_atomic(&file, next.as_bytes()).map_err(|e| undo(state, e))?;
     config_repo::commit_logged(&guard, paths, &[&file], message);
     Ok(())
@@ -1279,6 +1279,27 @@ mod tests {
             format!("{err:#}"),
             format!("change {id} was already handled")
         );
+    }
+
+    #[test]
+    fn approve_keeps_the_change_files_when_the_project_folder_cant_be_made() {
+        let (_dir, paths) = seeded("");
+        let id = propose(
+            &paths,
+            "p",
+            ChangeKind::Add {
+                section: DEFAULT_SECTION.into(),
+                text: "added".into(),
+            },
+            "w",
+        )
+        .unwrap();
+        let folder = paths.project_dir("p");
+        std::fs::remove_dir_all(&folder).unwrap();
+        std::fs::write(&folder, "not a folder").unwrap();
+
+        approve(&paths, "p", &ids(&[&id]), &hash("")).unwrap_err();
+        assert_eq!(change_files(&paths), [format!("{id}.json")]);
     }
 
     #[test]

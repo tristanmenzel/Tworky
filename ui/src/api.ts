@@ -485,6 +485,7 @@ export const api = {
   projects: () => invoke<ProjectSummary[]>('list_projects'),
   /** Projects that didn't load, by folder, with why. */
   projectErrors: () => invoke<Record<string, string>>('list_project_errors'),
+  configErrors: () => invoke<string[]>('list_config_errors'),
   cloneProjectRepo: (project: string, repo: string) => invoke<string>('clone_project_repo', { project, repo }),
   findProjectClones: (project: string) => invoke<FoundSource[]>('find_project_clones', { project }),
   browserTabs: () => invoke<BrowserTabView[]>('browser_tabs'),

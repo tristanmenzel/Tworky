@@ -441,11 +441,17 @@ fn main() -> Result<()> {
     for line in paths.migrate_legacy()? {
         eprintln!("{line}");
     }
-    match paths.migrate_to_repo() {
-        Ok(lines) => lines.iter().for_each(|line| eprintln!("{line}")),
-        Err(e) => eprintln!("could not set up the config repo: {e:#}"),
+    let command = Cli::parse().command;
+    if !matches!(
+        command,
+        Command::SessionState { .. } | Command::SessionPhase { .. }
+    ) {
+        match paths.migrate_to_repo() {
+            Ok(lines) => lines.iter().for_each(|line| eprintln!("{line}")),
+            Err(e) => eprintln!("could not set up the config repo: {e:#}"),
+        }
     }
-    match Cli::parse().command {
+    match command {
         Command::Issues { json } => issues(json),
         Command::Paths => {
             let p = Paths::resolve()?;
@@ -596,6 +602,9 @@ fn project(cmd: ProjectCommand) -> Result<()> {
             .cloned()
             .with_context(|| format!("no project called {name}"))
     };
+    if matches!(cmd, ProjectCommand::Ls | ProjectCommand::Check(_)) {
+        report_config_problems(&ws.config);
+    }
     match cmd {
         ProjectCommand::Ls => {
             for p in &ws.config.projects {
@@ -710,6 +719,39 @@ fn project(cmd: ProjectCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Prints what's wrong with the config as a whole: load errors, and a config repo whose commits are
+/// stuck or behind.
+fn report_config_problems(config: &tworky_core::config::Config) {
+    for error in &config.load_errors {
+        println!("error: {error}");
+    }
+    if !config.paths.has_repo() {
+        return;
+    }
+    match tworky_core::config_repo::status(&config.paths) {
+        Ok(status) => {
+            if status.stale_index_lock {
+                println!(
+                    "error: {} is left from a git command that was stopped, and stops every commit to the config repo; delete it if no git is running there",
+                    config
+                        .paths
+                        .repo_dir()
+                        .join(".git")
+                        .join("index.lock")
+                        .display()
+                );
+            }
+            if !status.changes.is_empty() {
+                println!(
+                    "warning: uncommitted changes in the config repo: {} (Tworky commits them on its next sweep, unless a project.toml doesn't parse)",
+                    status.changes.join(", ")
+                );
+            }
+        }
+        Err(e) => println!("error: couldn't read the config repo's status: {e:#}"),
+    }
 }
 
 /// Looks for clones of repos with no source, prints each one found and records it. Returns whether

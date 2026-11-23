@@ -552,19 +552,37 @@ impl Workspace {
     fn drop_worktree(&self, w: &WorkerRecord, repo: &RepoConfig, log: Log) -> Result<()> {
         let path = w.dir.join(&repo.name);
         let record = w.worktrees.iter().find(|t| t.repo == repo.name);
-        let Some(source) = repo.source.as_deref().filter(|s| s.is_dir()) else {
-            if path.exists() {
-                let gone = match &repo.source {
-                    Some(source) => format!("the clone at {} is gone", source.display()),
-                    None => "it isn't cloned on this machine".into(),
-                };
-                log(&format!(
-                    "▸ {}: {gone}, so removing the worktree folder without git",
-                    repo.name
-                ));
-                remove_dir(&path)?;
-            }
-            return Ok(());
+        let found;
+        let source = match repo.source.as_deref().filter(|s| s.is_dir()) {
+            Some(source) => source,
+            None => match git::main_clone_of(&path) {
+                Some(clone) => {
+                    found = clone;
+                    &found
+                }
+                None => {
+                    if let Some(e) = &self.config.machine_error
+                        && (path.exists() || record.is_some())
+                    {
+                        bail!(
+                            "{}: can't tell where it's cloned, because {e}; fix it and clean up again",
+                            repo.name
+                        );
+                    }
+                    if path.exists() {
+                        let gone = match &repo.source {
+                            Some(source) => format!("the clone at {} is gone", source.display()),
+                            None => "it isn't cloned on this machine".into(),
+                        };
+                        log(&format!(
+                            "▸ {}: {gone}, so removing the worktree folder without git",
+                            repo.name
+                        ));
+                        remove_dir(&path)?;
+                    }
+                    return Ok(());
+                }
+            },
         };
         if git::is_worktree(&path) || record.is_some() {
             log(&format!("▸ {}: removing worktree", repo.name));
@@ -2149,6 +2167,42 @@ start_url = "http://localhost:5173/home"
         ws.cleanup(&id, None, &mut |_| {}).unwrap();
         assert!(!dir.exists());
         assert!(ws.state.get(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn removing_a_worktree_finds_its_clone_when_the_source_is_unknown() {
+        let (_d, mut ws, source, id) = git_workspace();
+        ws.add_worktree(&id, "platform", None, None, &mut |_| {})
+            .unwrap();
+        let wt = ws.state.get(&id).unwrap().unwrap().dir.join("platform");
+        ws.config.projects[0].repos[0].source = None;
+        ws.config.machine_error = Some("parsing machine.toml".into());
+
+        ws.remove_worktree(&id, "platform", &mut |_| {}).unwrap();
+        assert!(!wt.exists());
+        assert!(!git::local_branch_exists(&source, "feat/header-layout-327"));
+        assert_eq!(git(&source, &["worktree", "list"]).lines().count(), 1);
+    }
+
+    #[test]
+    fn cleanup_refuses_to_guess_while_machine_toml_doesnt_load() {
+        let (_d, mut ws, source, id) = git_workspace();
+        ws.config.projects[0].stack = None;
+        ws.add_worktree(&id, "platform", None, None, &mut |_| {})
+            .unwrap();
+        let wt = ws.state.get(&id).unwrap().unwrap().dir.join("platform");
+        std::fs::write(wt.join(".git"), "gitdir: nowhere").unwrap();
+        ws.config.projects[0].repos[0].source = None;
+        ws.config.machine_error = Some("parsing machine.toml".into());
+
+        let e = ws
+            .remove_worktree(&id, "platform", &mut |_| {})
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("machine.toml"), "{e:#}");
+        assert!(wt.exists());
+        assert!(git::local_branch_exists(&source, "feat/header-layout-327"));
+        assert!(ws.cleanup(&id, None, &mut |_| {}).is_err());
+        assert!(wt.exists());
     }
 
     #[test]
