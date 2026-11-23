@@ -88,6 +88,15 @@ pub fn git(paths: &Paths, dir: &Path, args: &[&str], timeout: Duration) -> Resul
     .env("GIT_TERMINAL_PROMPT", "0")
     .env("GCM_INTERACTIVE", "never")
     .env("GIT_EDITOR", "true");
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
     #[cfg(test)]
     tests::isolate(&mut cmd, args)?;
     process::output_timeout(cmd, &process::describe("git", args), timeout)
@@ -176,8 +185,9 @@ fn rename_retrying(from: &Path, to: &Path) -> Result<()> {
 }
 
 /// Stages `files` (paths in `repo/`, absolute or relative to it) and commits them, and nothing
-/// else, if any changed. A `project.toml` that doesn't parse is refused. Returns whether it
-/// committed.
+/// else, if any changed. A path outside the allowlist, or a `project.toml` that doesn't parse, is
+/// refused. A missing file is committed as deleted, or skipped if it was never tracked. Returns
+/// whether it committed.
 pub fn commit(
     _guard: &RepoLock,
     paths: &Paths,
@@ -185,7 +195,7 @@ pub fn commit(
     message: &str,
 ) -> Result<bool> {
     let repo = paths.repo_dir();
-    let mut specs = Vec::new();
+    let mut relatives = Vec::new();
     for file in files {
         let file = file.as_ref();
         let relative = if file.is_absolute() {
@@ -194,34 +204,93 @@ pub fn commit(
         } else {
             file
         };
-        let absolute = repo.join(relative);
-        if is_project_file(relative) && absolute.exists() {
+        let Some(relative) = repo_relative(relative).filter(|r| is_allowlisted(r)) else {
+            bail!("{} isn't a file the config repo tracks", file.display());
+        };
+        let absolute = repo.join(&relative);
+        if is_project_file(Path::new(&relative)) && absolute.exists() {
             check_project(&absolute)?;
         }
-        specs.push(pathspec(relative));
+        relatives.push(relative);
     }
-    commit_specs(paths, &repo, &specs, message)
+    commit_paths(paths, &repo, &relatives, message)
 }
 
-fn commit_specs(paths: &Paths, repo: &Path, specs: &[String], message: &str) -> Result<bool> {
-    if specs.is_empty() {
+/// Commits `relatives` (allowlisted, `/`-separated) as they are in the working tree.
+fn commit_paths(paths: &Paths, repo: &Path, relatives: &[String], message: &str) -> Result<bool> {
+    if relatives.is_empty() {
         return Ok(false);
     }
-    let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
-    let git = |args: &[&str]| git(paths, repo, &[args, &specs].concat(), LOCAL_TIMEOUT);
-    git(&["add", "-A", "--"])?;
-    if git(&["diff", "--cached", "--name-only", "--"])?
-        .trim()
-        .is_empty()
-    {
+    let run = |args: &[&str], relatives: &[&String]| {
+        let specs: Vec<String> = relatives.iter().map(|r| pathspec(r)).collect();
+        let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        git(paths, repo, &[args, &specs].concat(), LOCAL_TIMEOUT)
+    };
+    let (present, missing): (Vec<&String>, Vec<&String>) = relatives
+        .iter()
+        .partition(|r| std::fs::symlink_metadata(repo.join(r)).is_ok());
+    if !present.is_empty() {
+        run(&["add", "-A", "--"], &present)?;
+    }
+    if !missing.is_empty() {
+        run(
+            &["rm", "--cached", "-q", "--ignore-unmatch", "--"],
+            &missing,
+        )?;
+    }
+    let all: Vec<&String> = relatives.iter().collect();
+    let out = run(
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            "--",
+        ],
+        &all,
+    )?;
+    let staged: Vec<String> = out
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect();
+    if staged.is_empty() {
         return Ok(false);
     }
-    git(&["commit", "-q", "-m", message, "--only", "--"])?;
+    let staged: Vec<&String> = staged.iter().collect();
+    run(&["commit", "-q", "-m", message, "--only", "--"], &staged)?;
     Ok(true)
 }
 
-fn pathspec(relative: &Path) -> String {
-    format!(":(literal){}", forward_slashes(relative))
+fn pathspec(relative: &str) -> String {
+    format!(":(literal){relative}")
+}
+
+/// `relative` with `/` separators, or `None` if it has anything but plain names, such as `..`.
+fn repo_relative(relative: &Path) -> Option<String> {
+    let names = relative
+        .components()
+        .map(|c| match c {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!names.is_empty()).then(|| names.join("/"))
+}
+
+/// Whether `relative` (`/`-separated) has one of the shapes the `.gitignore` lets through. A nested
+/// `.gitignore` can un-ignore anything below it, so this is checked too.
+fn is_allowlisted(relative: &str) -> bool {
+    let shaped = |name: &str, prefix: &str| name.starts_with(prefix) && name.ends_with(".md");
+    match relative.split('/').collect::<Vec<_>>().as_slice() {
+        [".gitignore" | ".gitattributes"] => true,
+        ["tworky", file] => shaped(file, "claude.local"),
+        ["projects", project, file] if !project.is_empty() => {
+            *file == "project.toml" || shaped(file, "memory")
+        }
+        _ => false,
+    }
 }
 
 fn is_project_file(relative: &Path) -> bool {
@@ -252,23 +321,23 @@ pub struct Sweep {
 pub fn sweep(_guard: &RepoLock, paths: &Paths) -> Result<Sweep> {
     let repo = paths.repo_dir();
     let mut held_back = Vec::new();
-    let mut specs = Vec::new();
+    let mut relatives = Vec::new();
     for relative in changes(paths, &repo)? {
         let file = repo.join(&relative);
         if is_project_file(Path::new(&relative)) && file.exists() && check_project(&file).is_err() {
             held_back.push(file);
         } else {
-            specs.push(pathspec(Path::new(&relative)));
+            relatives.push(relative);
         }
     }
-    let committed = commit_specs(paths, &repo, &specs, "Commit edits made outside Tworky")?;
+    let committed = commit_paths(paths, &repo, &relatives, "Commit edits made outside Tworky")?;
     Ok(Sweep {
         committed,
         held_back,
     })
 }
 
-/// Changed, new and deleted paths that aren't ignored, relative to the repo with `/` separators.
+/// Changed, new and deleted allowlisted paths, relative to the repo with `/` separators.
 fn changes(paths: &Paths, repo: &Path) -> Result<Vec<String>> {
     let out = git(
         paths,
@@ -295,6 +364,7 @@ fn changes(paths: &Paths, repo: &Path) -> Result<Vec<String>> {
             changed.push(original.to_string());
         }
     }
+    changed.retain(|path| is_allowlisted(path));
     Ok(changed)
 }
 
@@ -362,6 +432,15 @@ pub fn write_machine(_guard: &RepoLock, paths: &Paths, text: &str) -> Result<()>
     crate::memory::write_atomic(&paths.machine_file(), text.as_bytes())
 }
 
+/// Points this thread's git calls at an empty global config in `dir`, which every test reaching
+/// [`git`] needs.
+#[cfg(test)]
+pub(crate) fn isolate_git_for_tests(dir: &Path) {
+    let global = dir.join("gitconfig");
+    std::fs::write(&global, "").unwrap();
+    tests::use_global_config(global);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,12 +459,26 @@ mod tests {
             .expect("the test sets a global git config");
         cmd.env("GIT_CONFIG_GLOBAL", global)
             .env("GIT_CONFIG_NOSYSTEM", "1");
+        for var in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "EMAIL",
+        ] {
+            cmd.env_remove(var);
+        }
         if let Some(fail) = FAIL.get()
             && args.contains(&fail)
         {
             bail!("injected failure of `git {fail}`");
         }
         Ok(())
+    }
+
+    pub(super) fn use_global_config(global: PathBuf) {
+        GLOBAL_CONFIG.set(Some(global));
+        FAIL.set(None);
     }
 
     fn paths_under(home: &Path) -> Paths {
@@ -405,8 +498,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let global = dir.path().join("gitconfig");
             std::fs::write(&global, global_config).unwrap();
-            GLOBAL_CONFIG.set(Some(global));
-            FAIL.set(None);
+            use_global_config(global);
             let paths = paths_under(dir.path());
             Home { dir, paths }
         }
@@ -593,6 +685,120 @@ mod tests {
         assert!(!again.committed);
         assert_eq!(again.held_back, [broken]);
         assert_eq!(home.log().len(), 2);
+    }
+
+    #[test]
+    fn commit_skips_a_file_that_never_existed_and_refuses_one_outside_the_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        isolate_git_for_tests(dir.path());
+        let paths = paths_under(dir.path());
+        init(&with_lock(&paths).unwrap(), &paths).unwrap();
+        let guard = with_lock(&paths).unwrap();
+        let ghost = Path::new("projects/ghost/memory.md");
+
+        assert!(!commit(&guard, &paths, &[ghost], "Nothing").unwrap());
+
+        let memory = paths.project_dir("acme").join("memory.md");
+        std::fs::create_dir_all(memory.parent().unwrap()).unwrap();
+        std::fs::write(&memory, "# Acme\n").unwrap();
+        assert!(
+            commit(
+                &guard,
+                &paths,
+                &[ghost, memory.as_path()],
+                "Save acme memory"
+            )
+            .unwrap()
+        );
+        let log = git(
+            &paths,
+            &paths.repo_dir(),
+            &["log", "--format=%s"],
+            LOCAL_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(log, "Save acme memory\nStart the Tworky config\n");
+
+        let env = paths.project_dir("acme").join(".env");
+        std::fs::write(&env, "SECRET=1\n").unwrap();
+        for file in [env.as_path(), Path::new("projects/acme/memory.md.tmp")] {
+            let e = commit(&guard, &paths, &[file], "Secret").unwrap_err();
+            assert!(e.to_string().contains("isn't a file"), "{e:#}");
+        }
+    }
+
+    #[test]
+    fn sweep_commits_a_deletion_already_staged() {
+        let home = Home::new("");
+        home.init();
+        let guard = with_lock(&home.paths).unwrap();
+        let memory = home.write("projects/acme/memory.md", "# Acme\n");
+        assert!(commit(&guard, &home.paths, &[&memory], "Save acme memory").unwrap());
+
+        home.git(&["rm", "-q", "projects/acme/memory.md"]);
+        let swept = sweep(&guard, &home.paths).unwrap();
+        assert!(swept.committed);
+        assert!(
+            !home
+                .lines(&["ls-files"])
+                .contains(&"projects/acme/memory.md".into())
+        );
+        assert!(status(&home.paths).unwrap().is_clean());
+        assert!(!sweep(&guard, &home.paths).unwrap().committed);
+    }
+
+    #[test]
+    fn sweep_ignores_files_a_nested_gitignore_lets_through() {
+        let home = Home::new("");
+        home.init();
+        let guard = with_lock(&home.paths).unwrap();
+        home.write("projects/acme/.gitignore", "!*\n");
+        home.write("projects/acme/.env", "SECRET=1\n");
+        home.write("projects/acme/memory.md", "# Acme\n");
+        let untracked = home.git(&["status", "--porcelain", "--untracked-files=all"]);
+        assert!(untracked.contains("projects/acme/.env"), "{untracked}");
+
+        assert!(sweep(&guard, &home.paths).unwrap().committed);
+        let tracked = home.lines(&["ls-files"]);
+        assert!(tracked.contains(&"projects/acme/memory.md".into()));
+        assert!(
+            !tracked.contains(&"projects/acme/.env".into()),
+            "{tracked:?}"
+        );
+        assert!(
+            !tracked.contains(&"projects/acme/.gitignore".into()),
+            "{tracked:?}"
+        );
+        assert!(status(&home.paths).unwrap().is_clean());
+    }
+
+    #[test]
+    fn the_allowlist_matches_only_config_shapes() {
+        for path in [
+            ".gitignore",
+            ".gitattributes",
+            "tworky/claude.local.md",
+            "tworky/claude.local.windows.md",
+            "projects/acme/project.toml",
+            "projects/acme/memory.md",
+            "projects/acme/memory.linux.md",
+        ] {
+            assert!(is_allowlisted(path), "{path}");
+        }
+        for path in [
+            "notes.txt",
+            "projects/acme/.gitignore",
+            "projects/acme/.env",
+            "projects/acme/memory.md.tmp",
+            "projects/acme/memory.md.lock",
+            "projects/acme/sub/memory.md",
+            "projects//memory.md",
+            "projects/project.toml",
+            "tworky/claude.md",
+            "tworky/sub/claude.local.md",
+        ] {
+            assert!(!is_allowlisted(path), "{path}");
+        }
     }
 
     #[test]
