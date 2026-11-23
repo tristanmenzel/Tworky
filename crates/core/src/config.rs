@@ -232,7 +232,8 @@ impl Paths {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Os {
     Windows,
     Macos,
@@ -258,6 +259,14 @@ impl Os {
             Os::Windows => "windows",
             Os::Macos => "macos",
             Os::Linux => "linux",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Os::Windows => "Windows",
+            Os::Macos => "macOS",
+            Os::Linux => "Linux",
         }
     }
 }

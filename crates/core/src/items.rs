@@ -579,10 +579,9 @@ impl Workspace {
                 w.pr = None;
                 self.state.save(&w)?;
                 if w.dir.is_dir() {
-                    let memory = self.config.paths.memory_file(&project.name, None);
                     std::fs::write(
                         w.dir.join("CLAUDE.md"),
-                        worker_claude_md(&w, project, index, &memory),
+                        worker_claude_md(&w, project, index, &self.config.paths),
                     )?;
                 }
                 Some(w)

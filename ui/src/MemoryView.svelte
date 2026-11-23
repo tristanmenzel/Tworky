@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte'
-  import { api, MEMORY_CHANGED_SINCE_EDITING, type ProjectMemory } from './api'
+  import { api, MEMORY_CHANGED_SINCE_EDITING, OS_LABEL, type Os, type ProjectMemory } from './api'
   import Markdown from './Markdown.svelte'
 
   interface Props {
@@ -12,14 +12,20 @@
 
   let { project, visible, onError, onEditingChange }: Props = $props()
 
+  const FILES: { os: Os | null; label: string }[] = [
+    { os: null, label: 'Shared' },
+    ...(['windows', 'macos', 'linux'] as const).map((os) => ({ os, label: OS_LABEL[os] })),
+  ]
+
   let memories = $state<ProjectMemory[]>([])
+  let os = $state<Os | null>(null)
   let editing = $state(false)
   let draft = $state('')
   let base = ''
   let refused = $state(false)
   let saving = $state(false)
 
-  const current = $derived(memories.find((m) => m.project === project))
+  const current = $derived(memories.find((m) => m.project === project && m.os === os))
 
   async function load() {
     try {
@@ -60,7 +66,7 @@
     if (!current) return
     saving = true
     try {
-      await api.saveMemory(current.project, base, draft)
+      await api.saveMemory(current.project, current.os, base, draft)
       editing = false
       await load()
     } catch (e) {
@@ -85,10 +91,24 @@
     {/if}
   </header>
 
+  <nav class="files" aria-label="Memory file">
+    {#each FILES as file (file.label)}
+      <button class:active={file.os === os} disabled={editing && file.os !== os} onclick={() => (os = file.os)}
+        >{file.label}</button
+      >
+    {/each}
+  </nav>
+
   {#if current}
     <p class="muted small">
-      Every Claude working on {current.project} sees this when its session starts or resumes, and proposes changes for you
-      to approve in the Changes tab. Stored in <code>{current.path}</code>.
+      {#if current.os}
+        Claudes working on {current.project} on {OS_LABEL[current.os]} see this after the shared memory, and it takes precedence
+        where they conflict. Sessions propose changes to it with <code>--os {current.os}</code>.
+      {:else}
+        Every Claude working on {current.project} sees this when its session starts, resumes, clears or compacts, and proposes
+        changes for you to approve in the Changes tab.
+      {/if}
+      Stored in <code>{current.path}</code>.
       {#if current.text.length > 8192}<span class="warn">Over 8 KB: sessions may see it truncated, so trim it.</span
         >{/if}
     </p>
@@ -134,6 +154,21 @@
   }
   .spacer {
     flex: 1;
+  }
+  .files {
+    display: flex;
+    gap: 2px;
+    border-bottom: 1px solid var(--border);
+  }
+  .files button {
+    border-radius: 6px 6px 0 0;
+    border: 1px solid transparent;
+    border-bottom: 0;
+    background: none;
+  }
+  .files button.active {
+    background: var(--panel);
+    border-color: var(--border);
   }
   .small {
     font-size: 12px;

@@ -400,8 +400,14 @@ export interface RepoSearch {
   search_error: string | null
 }
 
+export type Os = 'windows' | 'macos' | 'linux'
+
+export const OS_LABEL: Record<Os, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux' }
+
+/** A project's memory file: the shared one (`os: null`) or one OS's refinement. */
 export interface ProjectMemory {
   project: string
+  os: Os | null
   path: string
   text: string
   hash: string
@@ -412,7 +418,13 @@ export type MemoryChangeKind =
   | { kind: 'edit'; old: string; new: string }
   | { kind: 'remove'; text: string }
 
-export type MemoryChange = MemoryChangeKind & { author: string; date: string }
+export type MemoryChange = MemoryChangeKind & { author: string; date: string; os: Os | null }
+
+/** The hash of a target memory file that its changes' diffs were built from. */
+export interface MemoryBase {
+  os: Os | null
+  hash: string
+}
 
 export interface HunkLine {
   tag: 'ctx' | 'del' | 'add'
@@ -530,10 +542,11 @@ export const api = {
   linkItem: (name: string, issueUrl: string) => invoke<void>('link_item', { name, issueUrl }),
   removeItem: (name: string) => invoke<void>('remove_item', { name }),
   memories: () => invoke<ProjectMemory[]>('list_memories'),
-  saveMemory: (project: string, base: string, text: string) => invoke<void>('save_memory', { project, base, text }),
+  saveMemory: (project: string, os: Os | null, base: string, text: string) =>
+    invoke<void>('save_memory', { project, os, base, text }),
   memoryChanges: () => invoke<ProjectMemoryChanges[]>('list_memory_changes'),
-  approveMemoryChanges: (project: string, ids: string[], base: string) =>
-    invoke<void>('approve_memory_changes', { project, ids, base }),
+  approveMemoryChanges: (project: string, ids: string[], bases: MemoryBase[]) =>
+    invoke<void>('approve_memory_changes', { project, ids, bases }),
   rejectMemoryChanges: (project: string, ids: string[]) => invoke<void>('reject_memory_changes', { project, ids }),
   existingWork: (subject: WorkSubject, refresh: boolean) => invoke<BranchWork[]>('existing_work', { subject, refresh }),
   deleteBranch: (subject: WorkSubject, repo: string, branch: string) =>

@@ -85,11 +85,10 @@ impl Workspace {
         }
         self.state.save_project_session(name, &session)?;
 
-        let memory = self.config.paths.memory_file(name, None);
         let mut args: Vec<String> = self.config.app.claude[1..].to_vec();
         let mut settings: serde_json::Value = serde_json::from_str(&session_settings(
+            &self.config.paths,
             name,
-            &memory,
             false,
             false,
             Some(&session_id(name)),

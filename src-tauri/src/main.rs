@@ -14,7 +14,7 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tworky_core::activity::{self, AccountRequest, Activity, Handover, Phase, Session};
-use tworky_core::config::Paths;
+use tworky_core::config::{Os, Paths};
 use tworky_core::config_repo;
 use tworky_core::existing::WorkSubject;
 use tworky_core::github;
@@ -342,6 +342,7 @@ async fn set_board_status(
 #[derive(Serialize)]
 struct ProjectMemory {
     project: String,
+    os: Option<Os>,
     path: String,
     text: String,
     hash: String,
@@ -351,14 +352,17 @@ struct ProjectMemory {
 async fn list_memories() -> CmdResult<Vec<ProjectMemory>> {
     blocking(|| {
         let ws = workspace()?;
+        let targets = std::iter::once(None).chain(Os::ALL.map(Some));
         ws.config
             .projects
             .iter()
-            .map(|p| {
-                let path = ws.config.paths.memory_file(&p.name, None);
+            .flat_map(|p| targets.clone().map(move |os| (p, os)))
+            .map(|(p, os)| {
+                let path = ws.config.paths.memory_file(&p.name, os);
                 let text = memory::read(&path).map_err(err)?;
                 Ok(ProjectMemory {
                     project: p.name.clone(),
+                    os,
                     hash: memory::hash(&text),
                     text,
                     path: path.display().to_string(),
@@ -370,11 +374,11 @@ async fn list_memories() -> CmdResult<Vec<ProjectMemory>> {
 }
 
 #[tauri::command]
-async fn save_memory(project: String, base: String, text: String) -> CmdResult<()> {
+async fn save_memory(project: String, os: Option<Os>, base: String, text: String) -> CmdResult<()> {
     blocking(move || {
         let ws = workspace()?;
         ws.config.project(&project).ok_or("no such project")?;
-        memory::save(&ws.config.paths, &project, &base, &text).map_err(err)
+        memory::save(&ws.config.paths, &project, os, &base, &text).map_err(err)
     })
     .await
 }
@@ -411,11 +415,15 @@ async fn list_memory_changes() -> CmdResult<Vec<ProjectMemoryChanges>> {
 }
 
 #[tauri::command]
-async fn approve_memory_changes(project: String, ids: Vec<String>, base: String) -> CmdResult<()> {
+async fn approve_memory_changes(
+    project: String,
+    ids: Vec<String>,
+    bases: Vec<memory::Base>,
+) -> CmdResult<()> {
     blocking(move || {
         let ws = workspace()?;
         ws.config.project(&project).ok_or("no such project")?;
-        memory::approve(&ws.config.paths, &project, &ids, &base).map_err(err)
+        memory::approve(&ws.config.paths, &project, &ids, &bases).map_err(err)
     })
     .await
 }

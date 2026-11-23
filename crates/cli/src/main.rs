@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
-use tworky_core::config::Paths;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use tworky_core::config::{Os, Paths};
 use tworky_core::feedback;
 use tworky_core::github;
 use tworky_core::hierarchy::{IssueIndex, IssueNode};
@@ -244,9 +244,32 @@ enum AccountsCommand {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum OsName {
+    Windows,
+    Macos,
+    Linux,
+}
+
+impl From<OsName> for Os {
+    fn from(os: OsName) -> Self {
+        match os {
+            OsName::Windows => Os::Windows,
+            OsName::Macos => Os::Macos,
+            OsName::Linux => Os::Linux,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum MemoryCommand {
-    Show(ProjectArg),
+    Show {
+        /// Show that OS's memory instead of the shared one
+        #[arg(long, value_enum)]
+        os: Option<OsName>,
+        #[command(flatten)]
+        project: ProjectArg,
+    },
     /// Propose a fact, attributed to this session and dated. It lands once approved in Tworky.
     Add {
         #[arg(allow_hyphen_values = true)]
@@ -254,6 +277,9 @@ enum MemoryCommand {
         /// Heading to file it under
         #[arg(long, short, default_value = tworky_core::memory::DEFAULT_SECTION)]
         section: String,
+        /// Target that OS's memory instead of the shared one
+        #[arg(long, value_enum)]
+        os: Option<OsName>,
         #[command(flatten)]
         project: ProjectArg,
     },
@@ -270,6 +296,9 @@ enum MemoryCommand {
         /// Read the replacement from a file, or from stdin with `-`
         #[arg(long)]
         new_file: Option<String>,
+        /// Target that OS's memory instead of the shared one
+        #[arg(long, value_enum)]
+        os: Option<OsName>,
         #[command(flatten)]
         project: ProjectArg,
     },
@@ -278,6 +307,9 @@ enum MemoryCommand {
     Remove {
         #[arg(allow_hyphen_values = true)]
         text: String,
+        /// Target that OS's memory instead of the shared one
+        #[arg(long, value_enum)]
+        os: Option<OsName>,
         #[command(flatten)]
         project: ProjectArg,
     },
@@ -987,8 +1019,11 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
     use tworky_core::memory;
     let ws = Workspace::open()?;
     match cmd {
-        MemoryCommand::Show(arg) => {
-            let path = ws.config.paths.memory_file(&project_name(&ws, &arg)?, None);
+        MemoryCommand::Show { os, project } => {
+            let path = ws
+                .config
+                .paths
+                .memory_file(&project_name(&ws, &project)?, os.map(Os::from));
             let text = memory::read(&path)?;
             if text.is_empty() {
                 eprintln!("{} is empty", path.display());
@@ -1005,12 +1040,14 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
         MemoryCommand::Add {
             text,
             section,
+            os,
             project,
-        } => propose(&ws, &project, memory::ChangeKind::Add { section, text })?,
+        } => propose(&ws, &project, os, memory::ChangeKind::Add { section, text })?,
         MemoryCommand::Edit {
             old,
             new,
             new_file,
+            os,
             project,
         } => {
             let new = match (new, new_file) {
@@ -1018,10 +1055,10 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
                 (None, Some(path)) => read_text_file(&path)?,
                 (None, None) => unreachable!("clap requires --new or --new-file"),
             };
-            propose(&ws, &project, memory::ChangeKind::Edit { old, new })?
+            propose(&ws, &project, os, memory::ChangeKind::Edit { old, new })?
         }
-        MemoryCommand::Remove { text, project } => {
-            propose(&ws, &project, memory::ChangeKind::Remove { text })?
+        MemoryCommand::Remove { text, os, project } => {
+            propose(&ws, &project, os, memory::ChangeKind::Remove { text })?
         }
         MemoryCommand::Changes(arg) => {
             let name = project_name(&ws, &arg)?;
@@ -1038,7 +1075,11 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
                 };
                 let first = text.lines().next().unwrap_or("");
                 let kind = kind_name(&c.change.kind);
-                println!("{}  {kind:<6}  {}  {first}", c.id, c.change.author);
+                let target = c.change.os.map_or("shared", Os::name);
+                println!(
+                    "{}  {kind:<6}  {target:<7}  {}  {first}",
+                    c.id, c.change.author
+                );
                 if let memory::PreviewResult::Stale { reason } = &c.preview {
                     println!("    stale: {reason}");
                 }
@@ -1066,7 +1107,12 @@ fn kind_name(kind: &tworky_core::memory::ChangeKind) -> &'static str {
     }
 }
 
-fn propose(ws: &Workspace, arg: &ProjectArg, kind: tworky_core::memory::ChangeKind) -> Result<()> {
+fn propose(
+    ws: &Workspace,
+    arg: &ProjectArg,
+    os: Option<OsName>,
+    kind: tworky_core::memory::ChangeKind,
+) -> Result<()> {
     let name = project_name(ws, arg)?;
     ws.config
         .project(&name)
@@ -1077,9 +1123,11 @@ fn propose(ws: &Workspace, arg: &ProjectArg, kind: tworky_core::memory::ChangeKi
         None => "you".to_string(),
     };
     let kind_name = kind_name(&kind);
-    let id = tworky_core::memory::propose(&ws.config.paths, &name, kind, &author)?;
+    let os = os.map(Os::from);
+    let id = tworky_core::memory::propose(&ws.config.paths, &name, os, kind, &author)?;
+    let target = os.map_or(String::new(), |os| format!(" ({} memory)", os.label()));
     println!(
-        "proposed {kind_name} {id} for {name}; it applies once approved in Tworky (Projects › {name} › Changes)"
+        "proposed {kind_name} {id} for {name}{target}; it applies once approved in Tworky (Projects › {name} › Changes)"
     );
     Ok(())
 }

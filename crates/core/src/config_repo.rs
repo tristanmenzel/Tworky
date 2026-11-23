@@ -1703,7 +1703,7 @@ mod tests {
         );
 
         let base = crate::memory::hash("# Acme memory\n");
-        let e = crate::memory::save(paths, "acme", &base, "# Changed\n").unwrap_err();
+        let e = crate::memory::save(paths, "acme", None, &base, "# Changed\n").unwrap_err();
         assert!(e.to_string().contains("isn't set up"), "{e:#}");
         let e = crate::config::create_repo_project(
             paths,

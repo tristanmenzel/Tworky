@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::accounts;
 use crate::claude_config;
-use crate::config::{AccountConfig, Config, Hook, ProjectConfig, RepoConfig};
+use crate::config::{AccountConfig, Config, Hook, Os, Paths, ProjectConfig, RepoConfig};
 use crate::git;
 use crate::github::{self, PullRequest};
 use crate::hierarchy::{Issue, IssueIndex};
@@ -51,12 +51,65 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// The user's guidance, then the project's memory, each followed by its refinement for `os`. One
+/// command, because Claude Code runs a group's hooks in parallel and the levels must arrive in order.
+fn guidance_command(paths: &Paths, project: &str, os: Os) -> String {
+    let (name, label) = (os.name(), os.label());
+    let precedence = "Where it conflicts with the guidance above, it takes precedence.";
+    let [guidance, os_guidance] = paths.guidance_files(os);
+    let levels = [
+        (
+            guidance,
+            format!(
+                "Tworky user guidance for every session (claude.local.md, edited in Tworky's \
+                 Settings). It refines Tworky's own guidance. {precedence}"
+            ),
+        ),
+        (
+            os_guidance,
+            format!(
+                "Tworky user guidance for sessions on {label} (claude.local.{name}.md, edited in \
+                 Tworky's Settings). {precedence}"
+            ),
+        ),
+        (
+            paths.memory_file(project, None),
+            format!(
+                "Tworky shared memory for project {project}, kept by every Claude working on it \
+                 (latest: tw memory show). Propose additions rarely: only a fact that cost real time, \
+                 applies to most {project} work, cannot be found quickly in the repo, and is not better \
+                 fixed in the repo or reported as a Tworky problem. Run tw memory changes first and don't \
+                 file a change that is already pending. When an entry proves wrong or outdated, file a fix \
+                 with tw memory edit or remove; don't reword correct entries. A fact that holds on one OS \
+                 only goes in that OS's memory, with --os windows|macos|linux. Changes apply once the \
+                 user approves them in Tworky. {precedence}"
+            ),
+        ),
+        (
+            paths.memory_file(project, Some(os)),
+            format!(
+                "Tworky shared memory for project {project} on {label} (latest: tw memory show --os \
+                 {name}), under the same rules; propose changes to it with --os {name}. {precedence}"
+            ),
+        ),
+    ];
+    levels
+        .iter()
+        .map(|(file, header)| {
+            let file = sh_quote(&file.to_string_lossy().replace('\\', "/"));
+            let header = sh_quote(header);
+            format!("if [ -s {file} ]; then echo {header}; echo; cat {file}; echo; fi")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// A resumed conversation re-sends the system prompt recorded on its first request, so
 /// `--append-system-prompt` would be ignored; a SessionStart hook's output is added as new context.
 /// `session` names the activity record to report to; a worker's session reports to `$TW_WORKER_ID`.
 pub(crate) fn session_settings(
+    paths: &Paths,
     project: &str,
-    memory: &Path,
     stopped: bool,
     browser: bool,
     session: Option<&str>,
@@ -64,18 +117,9 @@ pub(crate) fn session_settings(
     let target = session
         .map(|s| format!(" --worker {}", sh_quote(s)))
         .unwrap_or_default();
-    let memory = sh_quote(&memory.to_string_lossy().replace('\\', "/"));
-    let header = sh_quote(&format!(
-        "Tworky shared memory for project {project}, kept by every Claude working on it \
-         (latest: tw memory show). Propose additions rarely: only a fact that cost real time, applies to \
-         most {project} work, cannot be found quickly in the repo, and is not better fixed in the repo or \
-         reported as a Tworky problem. Run tw memory changes first and don't file a change that is \
-         already pending. When an entry proves wrong or outdated, file a fix with tw memory \
-         edit or remove; don't reword correct entries. Changes apply once the user approves them in Tworky."
-    ));
     let mut hooks = vec![serde_json::json!({
         "type": "command",
-        "command": format!("if [ -s {memory} ]; then echo {header}; echo; cat {memory}; fi"),
+        "command": guidance_command(paths, project, Os::current()),
     })];
     hooks.push(serde_json::json!({ "type": "command", "command": format!("echo {}", sh_quote(FEEDBACK_NOTE)) }));
     if stopped {
@@ -96,7 +140,7 @@ pub(crate) fn session_settings(
     let mut settings = serde_json::json!({
         "hooks": {
             "SessionStart": [
-                { "matcher": "startup|resume", "hooks": hooks },
+                { "matcher": "startup|resume|clear|compact", "hooks": hooks },
                 { "matcher": "startup|resume", "hooks": report("idle --session-start")[0]["hooks"] },
                 { "matcher": "clear", "hooks": report("idle --new-conversation")[0]["hooks"] },
             ],
@@ -430,12 +474,7 @@ impl Workspace {
         std::fs::create_dir_all(&w.dir).with_context(|| format!("creating {}", w.dir.display()))?;
         std::fs::write(
             w.dir.join("CLAUDE.md"),
-            worker_claude_md(
-                &w,
-                project,
-                index,
-                &self.config.paths.memory_file(&project.name, None),
-            ),
+            worker_claude_md(&w, project, index, &self.config.paths),
         )?;
         write_graft_settings(&w.dir)?;
         w.status = WorkerStatus::Ready;
@@ -861,10 +900,15 @@ impl Workspace {
             replaced_missing = true;
         }
         let mut args: Vec<String> = self.config.app.claude[1..].to_vec();
-        let memory = self.config.paths.memory_file(&project.name, None);
         args.extend([
             "--settings".into(),
-            session_settings(&project.name, &memory, w.stopped, mcp.is_some(), None),
+            session_settings(
+                &self.config.paths,
+                &project.name,
+                w.stopped,
+                mcp.is_some(),
+                None,
+            ),
         ]);
         if let Some(endpoint) = mcp {
             args.extend(["--mcp-config".into(), mcp_config(endpoint)]);
@@ -1267,8 +1311,9 @@ pub fn worker_claude_md(
     w: &WorkerRecord,
     project: &ProjectConfig,
     index: &IssueIndex,
-    memory: &Path,
+    paths: &Paths,
 ) -> String {
+    let os = Os::current();
     let mut md = String::new();
     let push = |md: &mut String, s: &str| {
         md.push_str(s);
@@ -1316,10 +1361,14 @@ pub fn worker_claude_md(
              and `$`.\n  \
                - Send new text that holds quotes, backticks or `$` through `--new-file -` on stdin.\n  \
                - Don't merge or reword entries that are still correct.\n\
-             - The memory file is `{2}`. Don't edit it directly; use `tw memory`.\n",
+             - A fact that holds on one OS only goes in that OS's memory: add `--os windows|macos|linux` to \
+             `tw memory show|add|edit|remove`. Sessions on {4} get `{3}` after the shared memory.\n\
+             - The shared memory file is `{2}`. Don't edit the memory files directly; use `tw memory`.\n",
             project.name,
             w.compose_project,
-            memory.display()
+            paths.memory_file(&project.name, None).display(),
+            paths.memory_file(&project.name, Some(os)).display(),
+            os.label(),
         ),
     );
 
@@ -2069,7 +2118,7 @@ start_url = "http://localhost:5173/home"
         let idx = index();
         let w = ws.plan(&idx, "T").unwrap();
         let memory = ws.config.paths.memory_file("acme", None);
-        let md = worker_claude_md(&w, &project(), &idx, &memory);
+        let md = worker_claude_md(&w, &project(), &idx, &ws.config.paths);
         assert!(md.contains("## Working alongside other Claudes"));
         assert!(
             md.contains("Propose a fact only when all of these hold:\n  - It cost you real time")
@@ -2082,6 +2131,9 @@ start_url = "http://localhost:5173/home"
         assert!(md.contains("run `tw memory changes` and don't file one that is already pending"));
         assert!(!md.contains("Only after the user agrees"));
         assert!(md.contains(&memory.display().to_string()));
+        let os_memory = ws.config.paths.memory_file("acme", Some(Os::current()));
+        assert!(md.contains(&os_memory.display().to_string()));
+        assert!(md.contains("add `--os windows|macos|linux` to `tw memory show|add|edit|remove`"));
         assert!(md.contains(&format!("except with `-p {}`", w.compose_project)));
         assert!(md.contains("Story #318: Header layout"));
         assert!(md.contains("fit on my phone"));
@@ -2093,7 +2145,7 @@ start_url = "http://localhost:5173/home"
         assert!(!md.contains("## Sub-issues"));
 
         let story = ws.plan(&idx, "S").unwrap();
-        let md = worker_claude_md(&story, &project(), &idx, &memory);
+        let md = worker_claude_md(&story, &project(), &idx, &ws.config.paths);
         assert!(md.contains("## Sub-issues"));
         assert!(md.contains("Subtask #327: Implement - Web (open, assigned to me)"));
     }
@@ -2219,12 +2271,7 @@ start_url = "http://localhost:5173/home"
                 && err.contains("tw project set-source"),
             "{err}"
         );
-        let md = worker_claude_md(
-            &w,
-            &ws.config.projects[0],
-            &index(),
-            &ws.config.paths.memory_file("acme", None),
-        );
+        let md = worker_claude_md(&w, &ws.config.projects[0], &index(), &ws.config.paths);
         assert!(
             md.contains("- `platform` — not cloned on this machine"),
             "{md}"
@@ -2821,7 +2868,11 @@ run = "{sleep}"
                 );
             }
             let start = &settings["hooks"]["SessionStart"][0];
-            assert_eq!(start["matcher"], "startup|resume");
+            assert_eq!(start["matcher"], "startup|resume|clear|compact");
+            assert_eq!(
+                settings["hooks"]["SessionStart"].as_array().unwrap().len(),
+                3
+            );
             start["hooks"]
                 .as_array()
                 .unwrap()
@@ -2830,10 +2881,15 @@ run = "{sleep}"
                 .collect()
         };
         let running = hooks(&again);
-        assert_eq!(running.len(), 2, "memory and the feedback note");
-        let memory = ws.config.paths.memory_file("acme", None);
-        assert!(running[0].contains(&memory.to_string_lossy().replace('\\', "/")));
-        assert!(running[0].contains("Run tw memory changes first"));
+        assert_eq!(
+            running.len(),
+            2,
+            "guidance and memory, and the feedback note"
+        );
+        assert_eq!(
+            running[0],
+            guidance_command(&ws.config.paths, "acme", Os::current())
+        );
         assert!(running[1].contains("tw issue bug|friction"));
 
         let mut stopped = ws.state.get(&w.id).unwrap().unwrap();
@@ -2846,9 +2902,13 @@ run = "{sleep}"
 
     #[test]
     fn session_hooks_record_the_graft_phase() {
+        let paths = Paths {
+            config_dir: "config".into(),
+            data_dir: "data".into(),
+        };
         let settings: Value = serde_json::from_str(&session_settings(
+            &paths,
             "acme",
-            Path::new("m.md"),
             false,
             false,
             Some("setup@acme"),
@@ -2881,6 +2941,68 @@ run = "{sleep}"
         assert!(command(&post[0]).contains("tw session-state working"));
         assert_eq!(post[1]["matcher"], "ExitPlanMode");
         assert_eq!(command(&post[1]), phase);
+    }
+
+    fn guidance_files_in_order(paths: &Paths, os: Os) -> [PathBuf; 4] {
+        let [guidance, os_guidance] = paths.guidance_files(os);
+        [
+            guidance,
+            os_guidance,
+            paths.memory_file("acme", None),
+            paths.memory_file("acme", Some(os)),
+        ]
+    }
+
+    #[test]
+    fn guidance_hook_shows_each_nonempty_level_in_order_under_its_own_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config_repo::test_home(dir.path());
+        for os in Os::ALL {
+            let command = guidance_command(&paths, "acme", os);
+            let levels: Vec<&str> = command.split("; if ").collect();
+            assert_eq!(levels.len(), 4, "{command}");
+            for (level, file) in levels.iter().zip(guidance_files_in_order(&paths, os)) {
+                let file = sh_quote(&file.to_string_lossy().replace('\\', "/"));
+                assert!(
+                    level
+                        .trim_start_matches("if ")
+                        .starts_with(&format!("[ -s {file} ]; then echo '")),
+                    "{level}"
+                );
+                assert!(level.ends_with(&format!("cat {file}; echo; fi")), "{level}");
+                assert!(level.contains("it takes precedence"), "{level}");
+            }
+            assert!(levels[1].contains(&format!("sessions on {}", os.label())));
+            assert!(levels[2].contains("Run tw memory changes first"));
+            assert!(levels[3].contains(&format!("tw memory show --os {}", os.name())));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guidance_hook_skips_empty_and_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config_repo::test_home(dir.path());
+        let os = Os::current();
+        let [guidance, os_guidance, memory, os_memory] = guidance_files_in_order(&paths, os);
+        std::fs::create_dir_all(guidance.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(memory.parent().unwrap()).unwrap();
+        std::fs::write(&guidance, "guidance line\n").unwrap();
+        std::fs::write(&os_guidance, "").unwrap();
+        std::fs::write(&os_memory, "os memory line").unwrap();
+        let _ = std::fs::remove_file(&memory);
+        let out =
+            process::run("bash", &["-c", &guidance_command(&paths, "acme", os)], None).unwrap();
+        let guidance_at = out.find("guidance line").unwrap();
+        let os_memory_at = out.find("os memory line").unwrap();
+        assert!(guidance_at < os_memory_at, "{out}");
+        assert!(out.contains("Tworky user guidance for every session"));
+        assert!(
+            !out.contains(&format!("sessions on {}", os.label())),
+            "{out}"
+        );
+        assert!(!out.contains("Run tw memory changes first"), "{out}");
+        assert!(out.contains(&format!("project acme on {}", os.label())));
     }
 
     #[test]

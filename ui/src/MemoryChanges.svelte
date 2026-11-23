@@ -1,7 +1,14 @@
 <script lang="ts">
   import { listen } from '@tauri-apps/api/event'
   import { untrack } from 'svelte'
-  import { api, MEMORY_CHANGED_SINCE_SHOWN, type HunkLine, type PendingMemoryChange } from './api'
+  import {
+    api,
+    MEMORY_CHANGED_SINCE_SHOWN,
+    OS_LABEL,
+    type HunkLine,
+    type MemoryBase,
+    type PendingMemoryChange,
+  } from './api'
 
   interface Props {
     project: string
@@ -30,9 +37,14 @@
   const selectable = $derived((changes ?? []).filter((c) => c.preview.status === 'ready' && !fresh[c.id]))
   const staleSelected = $derived(selected.some((c) => c.preview.status === 'stale'))
   const allSelected = $derived(!!selected.length && selectable.every((c) => checked[c.id]))
-  const base = $derived.by(() => {
-    for (const c of changes ?? []) if (c.preview.status === 'ready') return c.preview.base
-    return null
+  const bases = $derived.by(() => {
+    const out: MemoryBase[] = []
+    for (const c of selected) {
+      if (c.preview.status === 'ready' && !out.some((b) => b.os === c.change.os)) {
+        out.push({ os: c.change.os, hash: c.preview.base })
+      }
+    }
+    return out
   })
 
   async function load() {
@@ -112,8 +124,8 @@
 
   function approve() {
     const ids = selected.map((c) => c.id)
-    if (!base) return
-    const b = base
+    const b = bases
+    if (!b.length) return
     act(() => api.approveMemoryChanges(project, ids, b))
   }
 
@@ -169,12 +181,12 @@
       </label>
       {#if refusedNotice}
         <span class="stale-msg" role="alert"
-          >The memory changed since these diffs were shown. Review them again, then approve.</span
+          >A memory file changed since these diffs were shown. Review them again, then approve.</span
         >
       {:else if staleSelected}<span class="stale-msg">Untick stale changes to approve.</span>{/if}
       <span class="spacer"></span>
       <button onclick={reject} disabled={busy || !selected.length}>Reject {selected.length || ''}</button>
-      <button class="approve" onclick={approve} disabled={busy || !selected.length || staleSelected || !base}
+      <button class="approve" onclick={approve} disabled={busy || !selected.length || staleSelected || !bases.length}
         >Approve {selected.length || ''}</button
       >
     </div>
@@ -188,6 +200,7 @@
             <input type="checkbox" bind:checked={checked[c.id]} onchange={() => ticked(c.id)} />
             <span class="kind {kind}">{kind}</span>
             {#if fresh[c.id]}<span class="new">New</span>{/if}
+            <span class="target" class:os={!!c.change.os}>{c.change.os ? OS_LABEL[c.change.os] : 'Shared'}</span>
             <span>
               {#if sec}{VERB[kind]} <b>{sec}</b>{:else}{kind === 'edit' ? 'Edit' : 'Remove'}{/if}
             </span>
@@ -330,6 +343,16 @@
     border-radius: 4px;
     background: var(--accent);
     color: var(--on-accent);
+  }
+  .target {
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .target.os {
+    color: var(--text);
   }
   .kind.add {
     color: var(--ok);
