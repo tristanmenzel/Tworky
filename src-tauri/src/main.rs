@@ -1509,6 +1509,7 @@ fn main() {
         .expect("building tauri app")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                browser::save_tabs_now(app);
                 let sessions = &app.state::<AppState>().sessions;
                 let live = sessions.live();
                 if !live.is_empty()

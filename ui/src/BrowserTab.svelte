@@ -14,13 +14,15 @@
   let host: HTMLDivElement
   let address: HTMLInputElement
   let url = $state('')
+  let editing = $state(false)
   let busy = $state(false)
   let settingPassword = $state(false)
 
   const needsPassword = $derived(tab.can_sign_in && tab.login_fields.includes('password') && !tab.has_password)
 
   $effect(() => {
-    if (document.activeElement !== address) url = tab.url
+    const current = tab.url
+    if (!editing) url = current
   })
 
   async function call(work: () => Promise<unknown>) {
@@ -144,11 +146,16 @@
       autocomplete="off"
       onkeydown={(e) => {
         if (e.key === 'Enter') {
+          const target = url
           address.blur()
-          void call(() => api.browserNavigate(tab.id, url))
+          void call(() => api.browserNavigate(tab.id, target))
         }
       }}
-      onblur={() => (url = tab.url)}
+      onfocus={() => (editing = true)}
+      onblur={() => {
+        editing = false
+        url = tab.url
+      }}
     />
     {#if tab.can_fill_email}
       <button class="chip" disabled={busy} title="Fill the username and remember this login page" onclick={fillEmail}>

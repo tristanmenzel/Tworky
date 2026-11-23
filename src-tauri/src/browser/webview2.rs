@@ -245,7 +245,7 @@ pub async fn create(app: &AppHandle, tab: &Arc<Tab>, profile: &str) -> Result<()
         })?;
         let core = view.webview();
         disable_password_autosave(&core);
-        watch_source(&core, &view, &tab);
+        watch_source(app, &core, &view, &tab);
         watch_login(app, &core, &tab)?;
         watch_diagnostics(&core, &tab.events);
         if !app
@@ -279,13 +279,15 @@ fn disable_password_autosave(core: &ICoreWebView2) {
 }
 
 /// Same-document navigations change the URL without a page load.
-fn watch_source(core: &ICoreWebView2, view: &WebView, tab: &Arc<Tab>) {
+fn watch_source(app: &AppHandle, core: &ICoreWebView2, view: &WebView, tab: &Arc<Tab>) {
+    let app = app.clone();
     let events = tab.events.clone();
     let source = view.webview();
     let handler = SourceChangedEventHandler::create(Box::new(move |_, _| {
         let mut uri = PWSTR::null();
         if unsafe { source.Source(&mut uri) }.is_ok() {
             events.url_changed(&take_pwstr(uri));
+            super::changed(&app);
         }
         Ok(())
     }));

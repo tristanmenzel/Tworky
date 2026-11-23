@@ -78,6 +78,7 @@ pub struct Browser {
     saved: Mutex<Saved>,
     /// Until the saved tabs are reopened, the tab list on disk is theirs and isn't overwritten.
     restored: AtomicBool,
+    save_pending: AtomicBool,
     resetting: Resetting,
 }
 
@@ -366,10 +367,26 @@ fn has_password(tab: &Tab, account: &Account) -> bool {
     tworky_core::accounts::has_password(&tab.project, &account.name)
 }
 
+/// Same-document navigations can call this per keystroke, so the tab save is coalesced.
 pub fn changed(app: &AppHandle) {
     let browser = app.state::<Browser>();
-    browser.save_tabs();
+    if !browser.save_pending.swap(true, Ordering::AcqRel) {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(SAVE_DELAY).await;
+            let browser = app.state::<Browser>();
+            browser.save_pending.store(false, Ordering::Release);
+            browser.save_tabs();
+        });
+    }
     let _ = app.emit("browser-tabs-changed", browser.views());
+}
+
+const SAVE_DELAY: Duration = Duration::from_millis(500);
+
+/// Writes the tabs a pending save would, for when the app exits before it runs.
+pub fn save_tabs_now(app: &AppHandle) {
+    app.state::<Browser>().save_tabs();
 }
 
 fn page<'a>(cdp: &'a host::TabCdp, tab: &'a Tab) -> Page<'a, host::TabCdp> {
