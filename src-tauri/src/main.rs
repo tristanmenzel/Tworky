@@ -373,6 +373,28 @@ async fn list_memories() -> CmdResult<Vec<ProjectMemory>> {
     .await
 }
 
+#[derive(Serialize)]
+struct SessionGuidanceSize {
+    os: Os,
+    bytes: u64,
+}
+
+/// The combined size of the guidance and memory a session of `project` on this OS loads.
+#[tauri::command]
+async fn session_guidance_size(project: String) -> CmdResult<SessionGuidanceSize> {
+    blocking(move || {
+        let ws = workspace()?;
+        let os = Os::current();
+        let bytes = tworky_core::worker::session_guidance_files(&ws.config.paths, &project, os)
+            .iter()
+            .filter_map(|f| std::fs::metadata(f).ok())
+            .map(|m| m.len())
+            .sum();
+        Ok(SessionGuidanceSize { os, bytes })
+    })
+    .await
+}
+
 #[tauri::command]
 async fn save_memory(project: String, os: Option<Os>, base: String, text: String) -> CmdResult<()> {
     blocking(move || {
@@ -1505,7 +1527,7 @@ fn main() {
     }
     match tworky_core::config::Paths::resolve().and_then(|p| p.migrate_to_repo()) {
         Ok(lines) => lines.iter().for_each(|line| eprintln!("{line}")),
-        Err(e) => eprintln!("could not set up the config repo: {e:#}"),
+        Err(e) => eprintln!("{e:#}"),
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -1560,6 +1582,7 @@ fn main() {
             set_issue_state,
             set_board_status,
             list_memories,
+            session_guidance_size,
             save_memory,
             list_memory_changes,
             approve_memory_changes,

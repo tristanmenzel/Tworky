@@ -480,7 +480,7 @@ fn main() -> Result<()> {
     ) {
         match paths.migrate_to_repo() {
             Ok(lines) => lines.iter().for_each(|line| eprintln!("{line}")),
-            Err(e) => eprintln!("could not set up the config repo: {e:#}"),
+            Err(e) => eprintln!("{e:#}"),
         }
     }
     match command {

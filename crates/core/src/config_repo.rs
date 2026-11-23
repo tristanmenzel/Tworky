@@ -19,6 +19,9 @@ const FALLBACK_EMAIL: &str = "user.email=tworky@localhost";
 /// How long a rename in the config folder is retried while Windows holds a file in it open.
 const RENAME_RETRY: Duration = Duration::from_secs(10);
 
+/// [`RENAME_RETRY`] for renaming the legacy folders, which is retried on every start anyway.
+const LEGACY_RENAME_RETRY: Duration = Duration::from_secs(1);
+
 /// Failures by config folder, kept for [`recorded_failures`].
 type Failures = Mutex<BTreeMap<PathBuf, String>>;
 
@@ -259,12 +262,14 @@ fn identity_args(paths: &Paths, dir: &Path) -> Vec<&'static str> {
 /// Brings the config repo into being, then renames the legacy folders. See
 /// [`Paths::migrate_to_repo`]. A failure is kept for [`recorded_failures`].
 pub fn migrate(paths: &Paths) -> Result<Vec<String>> {
-    let migrated = migrate_unrecorded(paths);
-    record(&MIGRATION_FAILURES, paths, &migrated);
-    migrated
+    let set_up = set_up(paths);
+    record(&MIGRATION_FAILURES, paths, &set_up);
+    let mut done = set_up.context("could not set up the config repo")?;
+    done.extend(rename_legacy(paths)?);
+    Ok(done)
 }
 
-fn migrate_unrecorded(paths: &Paths) -> Result<Vec<String>> {
+fn set_up(paths: &Paths) -> Result<Vec<String>> {
     let mut done = Vec::new();
     if !paths.has_repo() {
         let guard = with_lock(paths)?;
@@ -281,12 +286,12 @@ fn migrate_unrecorded(paths: &Paths) -> Result<Vec<String>> {
             }
         }
     }
-    done.extend(rename_legacy(paths)?);
     Ok(done)
 }
 
-/// Moves a `repo/` with no `.git`, which an older build's writer can leave after a failed
-/// migration, out of the way of the new repo, keeping it for the user to look through.
+/// Moves a `repo/` with no `.git` out of the way of the new repo, keeping it for the user to look
+/// through. This build never makes one, but a build from before writers and setup launches
+/// checked for the repo could, after a failed migration.
 fn set_aside_untracked_repo(paths: &Paths) -> Result<Vec<String>> {
     let repo = paths.repo_dir();
     if !repo.exists() {
@@ -516,10 +521,22 @@ fn rename_legacy(paths: &Paths) -> Result<Vec<String>> {
             continue;
         }
         let backup = unused_sibling(&dir, "pre-repo");
-        match rename_retrying(&dir, &backup, RENAME_RETRY) {
+        match rename_retrying(&dir, &backup, LEGACY_RENAME_RETRY) {
             Ok(()) => done.push(format!("moved {} to {}", dir.display(), backup.display())),
             Err(_) if !dir.exists() => {}
-            Err(e) => return Err(e),
+            Err(e) => {
+                let name = |d: &Path| {
+                    d.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                return Err(e.context(format!(
+                    "couldn't rename the old {}/ folder to {}; Tworky tries again on its next start",
+                    name(&dir),
+                    name(&backup)
+                )));
+            }
         }
     }
     Ok(done)
@@ -1800,6 +1817,39 @@ mod tests {
                 .exists()
         );
         assert_eq!(home.log(), ["Import existing config"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_blocked_legacy_rename_fails_fast_as_a_backup_rename() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (home, _, _) = legacy_home();
+        let paths = &home.paths;
+        import(&with_lock(paths).unwrap(), paths).unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(paths.legacy_projects_dir().join("acme-old.toml"))
+            .unwrap();
+
+        let started = Instant::now();
+        let e = migrate(paths).unwrap_err();
+        assert!(
+            started.elapsed() < RENAME_RETRY / 2,
+            "{:?}",
+            started.elapsed()
+        );
+        let e = format!("{e:#}");
+        assert!(
+            e.starts_with("couldn't rename the old projects/ folder to projects.pre-repo"),
+            "{e}"
+        );
+        assert!(!e.contains("set up the config repo"), "{e}");
+        assert!(recorded_failures(paths).is_empty());
+
+        drop(held);
+        migrate(paths).unwrap();
+        assert!(!paths.legacy_projects_dir().exists());
     }
 
     #[test]

@@ -1,6 +1,13 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte'
-  import { api, MEMORY_CHANGED_SINCE_EDITING, OS_LABEL, type Os, type ProjectMemory } from './api'
+  import {
+    api,
+    MEMORY_CHANGED_SINCE_EDITING,
+    OS_LABEL,
+    type Os,
+    type ProjectMemory,
+    type SessionGuidanceSize,
+  } from './api'
   import Markdown from './Markdown.svelte'
 
   interface Props {
@@ -24,6 +31,9 @@
   let base = ''
   let refused = $state(false)
   let saving = $state(false)
+  let sessionSize = $state<(SessionGuidanceSize & { project: string }) | null>(null)
+
+  const SESSION_GUIDANCE_LIMIT = 8192
 
   const current = $derived(memories.find((m) => m.project === project && m.os === os))
 
@@ -35,8 +45,26 @@
     }
   }
 
+  async function loadSessionSize(name: string) {
+    try {
+      const size = await api.sessionGuidanceSize(name)
+      if (name === project) sessionSize = { ...size, project: name }
+    } catch (e) {
+      onError(String(e))
+    }
+  }
+
+  async function refresh() {
+    await Promise.all([load(), loadSessionSize(project)])
+  }
+
   $effect(() => {
     if (visible) untrack(load)
+  })
+
+  $effect(() => {
+    const name = project
+    if (visible) untrack(() => loadSessionSize(name))
   })
 
   $effect(() => {
@@ -59,7 +87,7 @@
 
   async function reload() {
     cancel()
-    await load()
+    await refresh()
   }
 
   async function save() {
@@ -68,7 +96,7 @@
     try {
       await api.saveMemory(current.project, current.os, base, draft)
       editing = false
-      await load()
+      await refresh()
     } catch (e) {
       if (String(e).includes(MEMORY_CHANGED_SINCE_EDITING)) refused = true
       else onError(String(e))
@@ -86,7 +114,7 @@
       <button onclick={cancel} disabled={saving}>Cancel</button>
       <button class="primary" onclick={save} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
     {:else if current}
-      <button onclick={load}>Reload</button>
+      <button onclick={refresh}>Reload</button>
       <button class="primary" onclick={edit}>Edit</button>
     {/if}
   </header>
@@ -109,7 +137,9 @@
         changes for you to approve in the Changes tab.
       {/if}
       Stored in <code>{current.path}</code>.
-      {#if current.text.length > 8192}<span class="warn">Over 8 KB: sessions may see it truncated, so trim it.</span
+      {#if sessionSize?.project === current.project && sessionSize.bytes > SESSION_GUIDANCE_LIMIT}<span class="warn"
+          >Sessions on {OS_LABEL[sessionSize.os]} load {Math.ceil(sessionSize.bytes / 1024)} KB of guidance and memory, over
+          8 KB, so they get the file paths to read instead of the text. Trim it.</span
         >{/if}
     </p>
     {#if editing}

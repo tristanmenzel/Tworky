@@ -51,57 +51,91 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The user's guidance, then the project's memory, each followed by its refinement for `os`. One
-/// command, because Claude Code runs a group's hooks in parallel and the levels must arrive in order.
+/// The files [`guidance_command`] shows a session on `os`, in order: the user's guidance, then
+/// the project's memory, each followed by its refinement for `os`.
+pub fn session_guidance_files(paths: &Paths, project: &str, os: Os) -> [PathBuf; 4] {
+    let [guidance, os_guidance] = paths.guidance_files(os);
+    [
+        guidance,
+        os_guidance,
+        paths.memory_file(project, None),
+        paths.memory_file(project, Some(os)),
+    ]
+}
+
+/// Claude Code shows a hook's output past 10,000 characters only as a preview and a file path,
+/// which would cut the levels that take precedence, so past this the hook lists the files instead.
+const GUIDANCE_BUDGET: usize = 9000;
+
+/// Shows each non-empty level of [`session_guidance_files`] under its header, or, when they'd
+/// exceed [`GUIDANCE_BUDGET`], their paths for Claude to read. One command, because Claude Code
+/// runs a group's hooks in parallel and the levels must arrive in order.
 fn guidance_command(paths: &Paths, project: &str, os: Os) -> String {
     let (name, label) = (os.name(), os.label());
     let precedence = "Where it conflicts with the guidance above, it takes precedence.";
-    let [guidance, os_guidance] = paths.guidance_files(os);
-    let levels = [
-        (
-            guidance,
-            format!(
-                "Tworky user guidance for every session (claude.local.md, edited in Tworky's \
-                 Settings). It refines Tworky's own guidance. {precedence}"
-            ),
+    let headers = [
+        format!(
+            "Tworky user guidance for every session (claude.local.md, edited in Tworky's \
+             Settings). It refines Tworky's own guidance. {precedence}"
         ),
-        (
-            os_guidance,
-            format!(
-                "Tworky user guidance for sessions on {label} (claude.local.{name}.md, edited in \
-                 Tworky's Settings). {precedence}"
-            ),
+        format!(
+            "Tworky user guidance for sessions on {label} (claude.local.{name}.md, edited in \
+             Tworky's Settings). {precedence}"
         ),
-        (
-            paths.memory_file(project, None),
-            format!(
-                "Tworky shared memory for project {project}, kept by every Claude working on it \
-                 (latest: tw memory show). Propose additions rarely: only a fact that cost real time, \
-                 applies to most {project} work, cannot be found quickly in the repo, and is not better \
-                 fixed in the repo or reported as a Tworky problem. Run tw memory changes first and don't \
-                 file a change that is already pending. When an entry proves wrong or outdated, file a fix \
-                 with tw memory edit or remove; don't reword correct entries. A fact that holds on one OS \
-                 only goes in that OS's memory, with --os windows|macos|linux. Changes apply once the \
-                 user approves them in Tworky. {precedence}"
-            ),
+        format!(
+            "Tworky shared memory for project {project}, kept by every Claude working on it \
+             (latest: tw memory show). Propose additions rarely: only a fact that cost real time, \
+             applies to most {project} work, cannot be found quickly in the repo, and is not better \
+             fixed in the repo or reported as a Tworky problem. Run tw memory changes first and don't \
+             file a change that is already pending. When an entry proves wrong or outdated, file a fix \
+             with tw memory edit or remove; don't reword correct entries. A fact that holds on one OS \
+             only goes in that OS's memory, with --os windows|macos|linux. Changes apply once the \
+             user approves them in Tworky. {precedence}"
         ),
-        (
-            paths.memory_file(project, Some(os)),
-            format!(
-                "Tworky shared memory for project {project} on {label} (latest: tw memory show --os \
-                 {name}), under the same rules; propose changes to it with --os {name}. {precedence}"
-            ),
+        format!(
+            "Tworky shared memory for project {project} on {label} (latest: tw memory show --os \
+             {name}), under the same rules; propose changes to it with --os {name}. {precedence}"
         ),
     ];
-    levels
+    let quote = |file: &Path| sh_quote(&file.to_string_lossy().replace('\\', "/"));
+    let [guidance, os_guidance, memory, os_memory] = session_guidance_files(paths, project, os);
+    let repo_memory = paths.repo_memory_file(project, None);
+    let mut script: Vec<String> = [&guidance, &os_guidance, &repo_memory, &os_memory]
         .iter()
-        .map(|(file, header)| {
-            let file = sh_quote(&file.to_string_lossy().replace('\\', "/"));
-            let header = sh_quote(header);
-            format!("if [ -s {file} ]; then echo {header}; echo; cat {file}; echo; fi")
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+        .enumerate()
+        .map(|(i, file)| format!("f{i}={}", quote(file)))
+        .collect();
+    if memory != repo_memory {
+        script.push(format!("[ -s \"$f2\" ] || f2={}", quote(&memory)));
+    }
+    script.push("n=0".into());
+    let each = |show: &dyn Fn(usize, String) -> String| {
+        headers
+            .iter()
+            .enumerate()
+            .map(|(i, header)| {
+                format!(
+                    "if [ -s \"$f{i}\" ]; then {}; fi",
+                    show(i, sh_quote(header))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    script.push(each(&|i, _| {
+        format!("n=$((n + {} + $(wc -c < \"$f{i}\")))", headers[i].len() + 3)
+    }));
+    let intro = sh_quote(
+        "Tworky: this session's guidance and project memory are too long to show here. Before \
+         anything else, read each file below in full, in this order. Each level refines the ones \
+         before it.",
+    );
+    script.push(format!(
+        "if [ \"$n\" -gt {GUIDANCE_BUDGET} ]; then echo {intro}; {}; else {}; fi",
+        each(&|i, header| format!("echo; echo {header}; echo \"$f{i}\"")),
+        each(&|i, header| format!("echo {header}; echo; cat \"$f{i}\"; echo")),
+    ));
+    script.join("; ")
 }
 
 /// A resumed conversation re-sends the system prompt recorded on its first request, so
@@ -2943,39 +2977,87 @@ run = "{sleep}"
         assert_eq!(command(&post[1]), phase);
     }
 
-    fn guidance_files_in_order(paths: &Paths, os: Os) -> [PathBuf; 4] {
-        let [guidance, os_guidance] = paths.guidance_files(os);
-        [
-            guidance,
-            os_guidance,
-            paths.memory_file("acme", None),
-            paths.memory_file("acme", Some(os)),
-        ]
+    fn quoted(file: &Path) -> String {
+        sh_quote(&file.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// Where each `$f<i>` level starts in `branch`, which must be in order.
+    fn level_starts(branch: &str) -> Vec<usize> {
+        let starts: Vec<usize> = (0..4)
+            .map(|i| {
+                branch
+                    .find(&format!("if [ -s \"$f{i}\" ]; then "))
+                    .unwrap_or_else(|| panic!("level {i} in {branch}"))
+            })
+            .collect();
+        assert!(starts.is_sorted(), "{branch}");
+        starts
     }
 
     #[test]
-    fn guidance_hook_shows_each_nonempty_level_in_order_under_its_own_header() {
+    fn guidance_hook_shows_each_level_in_order_or_lists_the_files_when_too_long() {
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::config_repo::test_home(dir.path());
         for os in Os::ALL {
             let command = guidance_command(&paths, "acme", os);
-            let levels: Vec<&str> = command.split("; if ").collect();
-            assert_eq!(levels.len(), 4, "{command}");
-            for (level, file) in levels.iter().zip(guidance_files_in_order(&paths, os)) {
-                let file = sh_quote(&file.to_string_lossy().replace('\\', "/"));
+            for (i, file) in session_guidance_files(&paths, "acme", os)
+                .iter()
+                .enumerate()
+            {
                 assert!(
-                    level
-                        .trim_start_matches("if ")
-                        .starts_with(&format!("[ -s {file} ]; then echo '")),
-                    "{level}"
+                    command.contains(&format!("f{i}={}", quoted(file))),
+                    "{command}"
                 );
-                assert!(level.ends_with(&format!("cat {file}; echo; fi")), "{level}");
-                assert!(level.contains("it takes precedence"), "{level}");
             }
-            assert!(levels[1].contains(&format!("sessions on {}", os.label())));
-            assert!(levels[2].contains("Run tw memory changes first"));
-            assert!(levels[3].contains(&format!("tw memory show --os {}", os.name())));
+            assert!(!command.contains("|| f2="), "no legacy fallback: {command}");
+            let (sizes, branches) = command
+                .split_once(&format!("; if [ \"$n\" -gt {GUIDANCE_BUDGET} ]; then "))
+                .expect(&command);
+            for i in 0..4 {
+                assert!(
+                    sizes.contains(&format!("+ $(wc -c < \"$f{i}\")))")),
+                    "{sizes}"
+                );
+            }
+            let (over, under) = branches.split_once("; else ").expect(branches);
+            assert!(over.contains("too long to show here"), "{over}");
+            for (branch, shows) in [(over, "echo \"$f"), (under, "cat \"$f")] {
+                let starts = level_starts(branch);
+                let levels: Vec<&str> = (0..4)
+                    .map(|i| &branch[starts[i]..starts.get(i + 1).copied().unwrap_or(branch.len())])
+                    .collect();
+                for (i, level) in levels.iter().enumerate() {
+                    assert!(level.contains(&format!("{shows}{i}\"")), "{level}");
+                    assert!(level.contains("it takes precedence"), "{level}");
+                }
+                assert!(levels[1].contains(&format!("sessions on {}", os.label())));
+                assert!(levels[2].contains("Run tw memory changes first"));
+                assert!(levels[3].contains(&format!("tw memory show --os {}", os.name())));
+            }
+            assert!(!over.contains("cat "), "{over}");
         }
+    }
+
+    #[test]
+    fn guidance_hook_falls_back_to_legacy_memory_only_while_the_repo_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        std::fs::create_dir_all(paths.legacy_memory_dir()).unwrap();
+        let legacy = paths.memory_file("acme", None);
+        assert!(legacy.starts_with(paths.legacy_memory_dir()));
+        let command = guidance_command(&paths, "acme", Os::current());
+        let repo_memory = quoted(&paths.repo_memory_file("acme", None));
+        assert!(
+            command.contains(&format!(
+                "f2={repo_memory}; f3={}; [ -s \"$f2\" ] || f2={}; n=0",
+                quoted(&paths.repo_memory_file("acme", Some(Os::current()))),
+                quoted(&legacy)
+            )),
+            "{command}"
+        );
     }
 
     #[cfg(unix)]
@@ -2984,7 +3066,7 @@ run = "{sleep}"
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::config_repo::test_home(dir.path());
         let os = Os::current();
-        let [guidance, os_guidance, memory, os_memory] = guidance_files_in_order(&paths, os);
+        let [guidance, os_guidance, memory, os_memory] = session_guidance_files(&paths, "acme", os);
         std::fs::create_dir_all(guidance.parent().unwrap()).unwrap();
         std::fs::create_dir_all(memory.parent().unwrap()).unwrap();
         std::fs::write(&guidance, "guidance line\n").unwrap();
@@ -3003,6 +3085,64 @@ run = "{sleep}"
         );
         assert!(!out.contains("Run tw memory changes first"), "{out}");
         assert!(out.contains(&format!("project acme on {}", os.label())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guidance_hook_lists_the_files_instead_of_their_text_when_too_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config_repo::test_home(dir.path());
+        let os = Os::current();
+        let [guidance, os_guidance, memory, os_memory] = session_guidance_files(&paths, "acme", os);
+        std::fs::create_dir_all(memory.parent().unwrap()).unwrap();
+        std::fs::write(&guidance, "guidance line\n").unwrap();
+        std::fs::write(&os_guidance, "").unwrap();
+        std::fs::write(&memory, "memory line\n".repeat(700)).unwrap();
+        std::fs::write(&os_memory, "os memory line").unwrap();
+        let out =
+            process::run("bash", &["-c", &guidance_command(&paths, "acme", os)], None).unwrap();
+        assert!(out.len() < GUIDANCE_BUDGET, "{out}");
+        assert!(out.starts_with("Tworky: this session's guidance"), "{out}");
+        assert!(!out.contains("guidance line"), "{out}");
+        assert!(!out.contains("memory line"), "{out}");
+        let listed: Vec<usize> = [&guidance, &memory, &os_memory]
+            .iter()
+            .map(|f| out.find(&*f.to_string_lossy()).expect(&out))
+            .collect();
+        assert!(listed.is_sorted(), "{out}");
+        assert!(!out.contains(&*os_guidance.to_string_lossy()), "{out}");
+        assert!(
+            !out.contains(&format!("sessions on {}", os.label())),
+            "{out}"
+        );
+
+        std::fs::write(&memory, "memory line\n").unwrap();
+        let out =
+            process::run("bash", &["-c", &guidance_command(&paths, "acme", os)], None).unwrap();
+        assert!(!out.contains("too long to show here"), "{out}");
+        assert!(out.contains("memory line"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guidance_hook_reads_the_repo_memory_once_a_late_import_moved_the_legacy_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        std::fs::create_dir_all(paths.legacy_memory_dir()).unwrap();
+        std::fs::write(paths.memory_file("acme", None), "legacy line").unwrap();
+        let command = guidance_command(&paths, "acme", Os::current());
+        let out = process::run("bash", &["-c", &command], None).unwrap();
+        assert!(out.contains("legacy line"), "{out}");
+
+        let repo_memory = paths.repo_memory_file("acme", None);
+        std::fs::create_dir_all(repo_memory.parent().unwrap()).unwrap();
+        std::fs::write(&repo_memory, "repo line").unwrap();
+        std::fs::remove_dir_all(paths.legacy_memory_dir()).unwrap();
+        let out = process::run("bash", &["-c", &command], None).unwrap();
+        assert!(out.contains("repo line"), "{out}");
     }
 
     #[test]

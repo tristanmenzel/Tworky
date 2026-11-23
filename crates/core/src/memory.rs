@@ -266,20 +266,20 @@ pub fn approve(paths: &Paths, project: &str, ids: &[String], bases: &[Base]) -> 
             .expect("every change has a target");
         target.next = apply(&target.next, change).with_context(|| format!("change {id}"))?;
     }
+    let mut written: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    for target in targets.values() {
+        if let Err(e) = write_atomic(&target.file, target.next.as_bytes()) {
+            return Err(with_restore(e, &written));
+        }
+        written.push((target.file.clone(), target.current.clone().into_bytes()));
+    }
     let mut deleted: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     for (_, file, bytes, _) in claimed {
         if let Err(e) = std::fs::remove_file(file) {
             let e = anyhow::Error::from(e).context(format!("deleting {}", file.display()));
-            return Err(with_restore(e, &deleted));
+            return Err(with_restore(with_restore(e, &deleted), &written));
         }
         deleted.push((file.clone(), bytes));
-    }
-    let mut written: Vec<(PathBuf, Vec<u8>)> = Vec::new();
-    for target in targets.values() {
-        if let Err(e) = write_atomic(&target.file, target.next.as_bytes()) {
-            return Err(with_restore(with_restore(e, &written), &deleted));
-        }
-        written.push((target.file.clone(), target.current.clone().into_bytes()));
     }
     let touched: Vec<&PathBuf> = targets.values().map(|t| &t.file).collect();
     config_repo::commit_logged(
@@ -1639,6 +1639,66 @@ mod tests {
         assert!(format!("{err:#}").starts_with("Memory changed since this diff was shown"));
         assert_eq!(memory(&paths), SEED);
         assert_eq!(change_files(&paths).len(), 2);
+    }
+
+    fn shared_and_windows_bases() -> [Base; 2] {
+        [
+            Base {
+                os: None,
+                hash: hash(SEED),
+            },
+            Base {
+                os: Some(Os::Windows),
+                hash: hash(""),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_failed_target_write_restores_the_targets_already_written_and_keeps_the_changes() {
+        let (_dir, paths) = seeded(SEED);
+        let shared_id = add_to(&paths, None, "shared fact");
+        let windows_id = add_to(&paths, Some(Os::Windows), "windows fact");
+        let blocker = paths.project_dir("p").join("memory.windows.md.tmp");
+        std::fs::create_dir_all(blocker.join("x")).unwrap();
+
+        let both = ids(&[&shared_id, &windows_id]);
+        approve(&paths, "p", &both, &shared_and_windows_bases()).unwrap_err();
+        assert_eq!(memory(&paths), SEED);
+        assert_eq!(windows_memory(&paths), "");
+        assert_eq!(change_files(&paths).len(), 2);
+
+        std::fs::remove_dir_all(&blocker).unwrap();
+        approve(&paths, "p", &both, &shared_and_windows_bases()).unwrap();
+        assert!(memory(&paths).contains("- shared fact _(w, "));
+        assert!(windows_memory(&paths).contains("- windows fact _(w, "));
+        assert!(change_files(&paths).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_change_file_delete_restores_the_targets_and_the_deleted_changes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let (_dir, paths) = seeded(SEED);
+        let shared_id = add_to(&paths, None, "shared fact");
+        let windows_id = add_to(&paths, Some(Os::Windows), "windows fact");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(change_file(&paths.memory_changes_dir("p"), &windows_id).unwrap())
+            .unwrap();
+
+        let both = ids(&[&shared_id, &windows_id]);
+        let err = approve(&paths, "p", &both, &shared_and_windows_bases()).unwrap_err();
+        assert!(format!("{err:#}").starts_with("deleting "), "{err:#}");
+        assert_eq!(memory(&paths), SEED);
+        assert_eq!(windows_memory(&paths), "");
+        assert_eq!(change_files(&paths).len(), 2);
+
+        drop(held);
+        approve(&paths, "p", &both, &shared_and_windows_bases()).unwrap();
+        assert!(change_files(&paths).is_empty());
     }
 
     #[test]

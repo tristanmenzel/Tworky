@@ -155,6 +155,11 @@ impl Paths {
         if os.is_none() && !self.has_repo() && self.legacy_memory_dir().is_dir() {
             return self.legacy_memory_dir().join(format!("{project}.md"));
         }
+        self.repo_memory_file(project, os)
+    }
+
+    /// Where [`Self::memory_file`] is once the config repo is set up.
+    pub fn repo_memory_file(&self, project: &str, os: Option<Os>) -> PathBuf {
         let name = match os {
             Some(os) => format!("memory.{}.md", os.name()),
             None => "memory.md".into(),
@@ -174,8 +179,8 @@ impl Paths {
         self.config_dir.join("repo")
     }
 
-    /// Whether the config repo exists. A `repo/` folder alone doesn't count: an older build's
-    /// writer could create one after a failed migration.
+    /// Whether the config repo exists. A `repo/` folder alone doesn't count: a build from before
+    /// writers and setup launches checked for the repo could create one after a failed migration.
     pub fn has_repo(&self) -> bool {
         self.repo_dir().join(".git").exists()
     }

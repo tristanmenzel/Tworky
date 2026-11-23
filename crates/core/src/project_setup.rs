@@ -97,10 +97,13 @@ impl Workspace {
             allow.push(json!("Bash(tw:*)"));
         }
         args.extend(["--settings".into(), settings.to_string()]);
-        for d in [
-            self.config.paths.project_dir(name),
-            self.config.template_dir(project),
-        ] {
+        let paths = &self.config.paths;
+        let project_dir = if paths.has_repo() {
+            paths.project_dir(name)
+        } else {
+            paths.legacy_projects_dir()
+        };
+        for d in [project_dir, self.config.template_dir(project)] {
             std::fs::create_dir_all(&d).ok();
             args.extend(["--add-dir".into(), d.to_string_lossy().into_owned()]);
         }
@@ -747,6 +750,34 @@ start_service = "web"
                 .any(|t| t.starts_with("Warning: repo old: no `repo")),
             "{texts:?}"
         );
+    }
+
+    #[test]
+    fn a_setup_launch_in_the_legacy_layout_adds_the_legacy_projects_folder_and_makes_no_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        std::fs::create_dir_all(paths.legacy_projects_dir()).unwrap();
+        std::fs::write(
+            paths.legacy_projects_dir().join("portal.toml"),
+            "name = \"portal\"\nmatch = { owner = \"acme\" }\n[[repos]]\nname = \"web\"\n",
+        )
+        .unwrap();
+        let config = Config::load_from(paths).unwrap();
+        let ws = Workspace {
+            state: crate::state::State::open(&config.paths.state_db()).unwrap(),
+            config,
+            claude_home: None,
+        };
+        let launch = ws.launch_project_setup("portal").unwrap();
+        let first_dir = launch.args.iter().position(|a| a == "--add-dir").unwrap() + 1;
+        assert_eq!(
+            launch.args[first_dir],
+            ws.config.paths.legacy_projects_dir().display().to_string()
+        );
+        assert!(!ws.config.paths.repo_dir().exists());
     }
 
     #[test]

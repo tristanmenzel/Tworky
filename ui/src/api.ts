@@ -413,6 +413,11 @@ export interface ProjectMemory {
   hash: string
 }
 
+export interface SessionGuidanceSize {
+  os: Os
+  bytes: number
+}
+
 export type MemoryChangeKind =
   | { kind: 'add'; section: string; text: string }
   | { kind: 'edit'; old: string; new: string }
@@ -542,6 +547,7 @@ export const api = {
   linkItem: (name: string, issueUrl: string) => invoke<void>('link_item', { name, issueUrl }),
   removeItem: (name: string) => invoke<void>('remove_item', { name }),
   memories: () => invoke<ProjectMemory[]>('list_memories'),
+  sessionGuidanceSize: (project: string) => invoke<SessionGuidanceSize>('session_guidance_size', { project }),
   saveMemory: (project: string, os: Os | null, base: string, text: string) =>
     invoke<void>('save_memory', { project, os, base, text }),
   memoryChanges: () => invoke<ProjectMemoryChanges[]>('list_memory_changes'),
