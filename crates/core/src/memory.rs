@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Paths;
+use crate::config_repo;
 
 pub const DEFAULT_SECTION: &str = "Learned";
 
@@ -116,7 +117,7 @@ pub fn propose(paths: &Paths, project: &str, kind: ChangeKind, author: &str) -> 
         author: author.to_string(),
         date: today(),
     };
-    apply(&read(&paths.memory_file(project))?, &change)?;
+    apply(&read(&paths.memory_file(project, None))?, &change)?;
     let dir = paths.memory_changes_dir(project);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let json = serde_json::to_vec_pretty(&change)?;
@@ -160,7 +161,7 @@ pub fn pending(paths: &Paths, project: &str) -> Result<Vec<PendingChange>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
-    let current = read(&paths.memory_file(project))?;
+    let current = read(&paths.memory_file(project, None))?;
     let mut out = Vec::new();
     for entry in entries {
         let path = entry?.path();
@@ -201,7 +202,9 @@ pub fn approve(paths: &Paths, project: &str, ids: &[String], base: &str) -> Resu
         .map(|id| change_file(&dir, id))
         .collect::<Result<Vec<_>>>()?;
     locked_with(
-        &paths.memory_file(project),
+        paths,
+        project,
+        &format!("Approve memory changes for {project}"),
         |current| {
             let mut claimed = Vec::new();
             for (id, file) in ids.iter().zip(&files) {
@@ -245,25 +248,29 @@ pub fn reject(paths: &Paths, project: &str, ids: &[String]) -> Result<()> {
         .iter()
         .map(|id| change_file(&dir, id))
         .collect::<Result<Vec<_>>>()?;
-    with_lock(&paths.memory_file(project), || {
-        for file in &files {
-            match std::fs::remove_file(file) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).with_context(|| format!("deleting {}", file.display())),
-            }
+    let _guard = config_repo::with_lock(paths)?;
+    for file in &files {
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("deleting {}", file.display())),
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
-pub fn save(path: &Path, base: &str, text: &str) -> Result<()> {
-    locked(path, |current| {
-        if hash(current) != base {
-            bail!("Memory changed since you started editing");
-        }
-        Ok(text.to_string())
-    })
+pub fn save(paths: &Paths, project: &str, base: &str, text: &str) -> Result<()> {
+    locked(
+        paths,
+        project,
+        &format!("Save {project} memory"),
+        |current| {
+            if hash(current) != base {
+                bail!("Memory changed since you started editing");
+            }
+            Ok(text.to_string())
+        },
+    )
 }
 
 pub fn apply(current: &str, change: &Change) -> Result<String> {
@@ -311,34 +318,37 @@ pub fn preview(current: &str, change: &Change) -> Result<Preview> {
     })
 }
 
-fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let dir = path.parent().context("memory path has no folder")?;
-    std::fs::create_dir_all(dir)?;
-    let lock_path = path.with_extension("md.lock");
-    let lock = std::fs::File::create(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    lock.lock()
-        .with_context(|| format!("locking {}", lock_path.display()))?;
-    let out = f()?;
-    lock.unlock()?;
-    Ok(out)
+fn locked(
+    paths: &Paths,
+    project: &str,
+    message: &str,
+    edit: impl FnOnce(&str) -> Result<String>,
+) -> Result<()> {
+    locked_with(
+        paths,
+        project,
+        message,
+        |current| Ok((edit(current)?, ())),
+        |(), e| e,
+    )
 }
 
-fn locked(path: &Path, edit: impl FnOnce(&str) -> Result<String>) -> Result<()> {
-    locked_with(path, |current| Ok((edit(current)?, ())), |(), e| e)
-}
-
-/// Under the lock, `prepare` turns the current text into the next one plus whatever `undo` needs
-/// to put things back when the write fails.
+/// Under the repo lock, `prepare` turns the memory's current text into the next one plus whatever
+/// `undo` needs to put things back when the write fails. The write is committed as `message`.
 fn locked_with<S>(
-    path: &Path,
+    paths: &Paths,
+    project: &str,
+    message: &str,
     prepare: impl FnOnce(&str) -> Result<(String, S)>,
     undo: impl FnOnce(S, anyhow::Error) -> anyhow::Error,
 ) -> Result<()> {
-    with_lock(path, || {
-        let (next, state) = prepare(&read(path)?)?;
-        write_atomic(path, next.as_bytes()).map_err(|e| undo(state, e))
-    })
+    let guard = config_repo::with_lock(paths)?;
+    let file = paths.memory_file(project, None);
+    let (next, state) = prepare(&read(&file)?)?;
+    std::fs::create_dir_all(paths.project_dir(project))?;
+    write_atomic(&file, next.as_bytes()).map_err(|e| undo(state, e))?;
+    config_repo::commit_logged(&guard, paths, &[&file], message);
+    Ok(())
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -760,24 +770,17 @@ mod tests {
         format!("{:#}", apply(current, change).unwrap_err())
     }
 
-    fn paths(dir: &Path) -> Paths {
-        Paths {
-            config_dir: dir.join("config"),
-            data_dir: dir.join("data"),
-        }
-    }
-
     fn seeded(text: &str) -> (tempfile::TempDir, Paths) {
         let dir = tempfile::tempdir().unwrap();
-        let paths = paths(dir.path());
-        let file = paths.memory_file("p");
+        let paths = config_repo::test_home(dir.path());
+        let file = paths.memory_file("p", None);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, text).unwrap();
         (dir, paths)
     }
 
     fn memory(paths: &Paths) -> String {
-        read(&paths.memory_file("p")).unwrap()
+        read(&paths.memory_file("p", None)).unwrap()
     }
 
     fn change_files(paths: &Paths) -> Vec<String> {
@@ -1263,6 +1266,14 @@ mod tests {
         approve(&paths, "p", &ids(&[&id]), &hash(SEED)).unwrap();
         assert!(memory(&paths).contains("- new _(w, "));
         assert!(change_files(&paths).is_empty());
+        assert_eq!(
+            config_repo::log_for_tests(&paths)[0],
+            "Approve memory changes for p"
+        );
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&paths),
+            ["projects/p/memory.md"]
+        );
         let err = approve(&paths, "p", &ids(&[&id]), &hash(&memory(&paths))).unwrap_err();
         assert_eq!(
             format!("{err:#}"),
@@ -1314,7 +1325,7 @@ mod tests {
 
         let stale = propose_edit(&paths, "Subtasks.", "Sub-issues.");
         let changed = SEED.replace("Subtasks.", "Tasks.");
-        save(&paths.memory_file("p"), &hash(SEED), &changed).unwrap();
+        save(&paths, "p", &hash(SEED), &changed).unwrap();
         let err = approve(&paths, "p", &ids(&[&first, &stale]), &hash(&changed)).unwrap_err();
         assert!(format!("{err:#}").starts_with(&format!("change {stale}: not found")));
         assert_eq!(memory(&paths), changed);
@@ -1343,6 +1354,11 @@ mod tests {
         reject(&paths, "p", &ids(&[&a, &b])).unwrap();
         assert!(change_files(&paths).is_empty());
         assert_eq!(memory(&paths), SEED);
+        assert_eq!(
+            config_repo::log_for_tests(&paths),
+            ["Start the Tworky config"],
+            "rejecting changes nothing in the repo"
+        );
     }
 
     #[test]
@@ -1374,7 +1390,7 @@ mod tests {
 
     #[test]
     fn of_two_parallel_approves_with_one_base_exactly_one_lands() {
-        let (_dir, paths) = seeded(SEED);
+        let (dir, paths) = seeded(SEED);
         let a = propose_edit(&paths, "old", "a");
         let b = propose_edit(&paths, "Clone it.", "Clone.");
         let base = hash(SEED);
@@ -1382,7 +1398,11 @@ mod tests {
             .into_iter()
             .map(|id| {
                 let (paths, base) = (paths.clone(), base.clone());
-                std::thread::spawn(move || approve(&paths, "p", &[id], &base))
+                let home = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    config_repo::isolate_git_for_tests(&home);
+                    approve(&paths, "p", &[id], &base)
+                })
             })
             .collect();
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -1407,17 +1427,25 @@ mod tests {
     }
 
     #[test]
-    fn save_refuses_a_stale_base() {
+    fn save_refuses_a_stale_base_and_commits_only_the_memory() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("memory").join("acme.md");
-        let err = save(&path, &hash("old"), "new\n").unwrap_err();
+        let paths = config_repo::test_home(dir.path());
+        let path = paths.memory_file("acme", None);
+        let err = save(&paths, "acme", &hash("old"), "new\n").unwrap_err();
         assert_eq!(
             format!("{err:#}"),
             "Memory changed since you started editing"
         );
         assert_eq!(read(&path).unwrap(), "");
-        save(&path, &hash(""), "new\n").unwrap();
+        crate::config::write_project(&paths, "acme", "name = \"acme\"\n");
+        save(&paths, "acme", &hash(""), "new\n").unwrap();
         assert_eq!(read(&path).unwrap(), "new\n");
+        assert_eq!(config_repo::log_for_tests(&paths)[0], "Save acme memory");
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&paths),
+            ["projects/acme/memory.md"]
+        );
+        assert!(!paths.project_dir("acme").join("memory.md.lock").exists());
     }
 
     #[test]

@@ -156,10 +156,15 @@ pub fn worker_stages(ws: &Workspace) -> Result<BTreeMap<String, WorkerStage>> {
             continue;
         };
         for t in &w.worktrees {
-            let Some(repo) = project.repos.iter().find(|r| r.name == t.repo) else {
+            let Some((repo, source)) = project
+                .repos
+                .iter()
+                .find(|r| r.name == t.repo)
+                .and_then(|r| Some((r, r.source.clone()?)))
+            else {
                 continue;
             };
-            let name_with_owner = git::origin_name_with_owner(&repo.source).ok();
+            let name_with_owner = git::origin_name_with_owner(&source).ok();
             let pr_number =
                 w.pr.as_ref()
                     .filter(|pr| {
@@ -170,7 +175,7 @@ pub fn worker_stages(ws: &Workspace) -> Result<BTreeMap<String, WorkerStage>> {
                     .map(|pr| pr.number);
             targets.push(Target {
                 worker: w.id.clone(),
-                source: repo.source.clone(),
+                source,
                 base: repo.base.clone(),
                 branch: lookup_branch(
                     local::checked_out(&w.dir.join(&t.repo)),

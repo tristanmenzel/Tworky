@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::config::{Os, Paths, ProjectConfig};
+use crate::config::{MachineConfig, Os, Paths, ProjectConfig};
 use crate::process;
 
 pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -109,6 +109,17 @@ fn forward_slashes(path: &Path) -> String {
 /// Creates `repo/` with its first commit. It's built in `repo.tmp/` and renamed into place, so a
 /// failure leaves no `repo/`.
 pub fn init(_guard: &RepoLock, paths: &Paths) -> Result<()> {
+    create(paths, "Start the Tworky config", |_| Ok(vec![]))
+}
+
+/// Builds `repo/` in `repo.tmp/`: its git config, allowlist and guidance files plus whatever
+/// `fill` writes, in one commit, then renames it into place. `fill` returns paths to leave
+/// uncommitted.
+fn create(
+    paths: &Paths,
+    message: &str,
+    fill: impl FnOnce(&Path) -> Result<Vec<String>>,
+) -> Result<()> {
     let repo = paths.repo_dir();
     if repo.exists() {
         bail!("{} already exists", repo.display());
@@ -118,14 +129,17 @@ pub fn init(_guard: &RepoLock, paths: &Paths) -> Result<()> {
         std::fs::remove_dir_all(&tmp)
             .with_context(|| format!("removing the leftover {}", tmp.display()))?;
     }
-    let built = build(paths, &tmp).and_then(|()| rename_retrying(&tmp, &repo));
+    let built = scaffold(paths, &tmp)
+        .and_then(|()| fill(&tmp))
+        .and_then(|unstaged| commit_everything(paths, &tmp, &unstaged, message))
+        .and_then(|()| rename_retrying(&tmp, &repo));
     if built.is_err() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
     built.with_context(|| format!("creating the config repo {}", repo.display()))
 }
 
-fn build(paths: &Paths, dir: &Path) -> Result<()> {
+fn scaffold(paths: &Paths, dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::create_dir_all(paths.repo_hooks_dir())?;
     let git = |args: &[&str]| git(paths, dir, args, LOCAL_TIMEOUT);
@@ -157,9 +171,232 @@ fn build(paths: &Paths, dir: &Path) -> Result<()> {
         }
         std::fs::write(&file, "")?;
     }
-    git(&["add", "-A"])?;
-    git(&["commit", "-q", "-m", "Start the Tworky config"])?;
     Ok(())
+}
+
+fn commit_everything(paths: &Paths, dir: &Path, unstaged: &[String], message: &str) -> Result<()> {
+    let git = |args: &[&str]| git(paths, dir, args, LOCAL_TIMEOUT);
+    git(&["add", "-A"])?;
+    if !unstaged.is_empty() {
+        let specs: Vec<String> = unstaged.iter().map(|r| pathspec(r)).collect();
+        let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        git(&[
+            &["rm", "--cached", "-q", "--ignore-unmatch", "--"][..],
+            &specs,
+        ]
+        .concat())?;
+    }
+    git(&["commit", "-q", "-m", message])?;
+    Ok(())
+}
+
+/// Brings the config repo into being, then renames the legacy folders. See
+/// [`Paths::migrate_to_repo`].
+pub fn migrate(paths: &Paths) -> Result<Vec<String>> {
+    let mut done = Vec::new();
+    if !paths.repo_dir().exists() {
+        let guard = with_lock(paths)?;
+        if !paths.repo_dir().exists() {
+            if has_legacy_config(paths) {
+                done.extend(import(&guard, paths)?);
+            } else {
+                init(&guard, paths)?;
+                done.push(format!(
+                    "created the config repo {}",
+                    paths.repo_dir().display()
+                ));
+            }
+        }
+    }
+    done.extend(rename_legacy(paths)?);
+    Ok(done)
+}
+
+fn has_legacy_config(paths: &Paths) -> bool {
+    !files_with_extension(&paths.legacy_projects_dir(), "toml").is_empty()
+        || !files_with_extension(&paths.legacy_memory_dir(), "md").is_empty()
+}
+
+/// Files directly in `dir` with `extension`, sorted.
+fn files_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == extension))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Builds `repo/` from the legacy `projects/*.toml` and `memory/*.md` in one commit, moving each
+/// clone path and template folder to `machine.toml`.
+fn import(guard: &RepoLock, paths: &Paths) -> Result<Vec<String>> {
+    let mut report = Vec::new();
+    create(paths, "Import existing config", |dir| {
+        let mut machine = MachineConfig::read(paths)?;
+        let mut folders: Vec<String> = Vec::new();
+        let mut unstaged = Vec::new();
+        for file in files_with_extension(&paths.legacy_projects_dir(), "toml") {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| is_project_name(s));
+            let (folder, out) = match (import_project(&text, &mut machine), stem) {
+                (Ok((name, _)), _) if folders.contains(&name) => {
+                    report.push(format!(
+                        "left {} in the backup: project {name} was already imported",
+                        file.display()
+                    ));
+                    continue;
+                }
+                (Ok((name, out)), _) => {
+                    report.push(format!("imported {} as project {name}", file.display()));
+                    (name, out)
+                }
+                (Err(e), Some(stem)) if !folders.iter().any(|f| f == stem) => {
+                    report.push(format!(
+                        "copied {} as it is to projects/{stem}, uncommitted: {e:#}",
+                        file.display()
+                    ));
+                    unstaged.push(format!("projects/{stem}/project.toml"));
+                    (stem.to_string(), text)
+                }
+                (Err(e), _) => {
+                    report.push(format!("left {} in the backup: {e:#}", file.display()));
+                    continue;
+                }
+            };
+            let target = dir.join("projects").join(&folder);
+            std::fs::create_dir_all(&target)?;
+            std::fs::write(target.join("project.toml"), out)?;
+            folders.push(folder);
+        }
+        for file in files_with_extension(&paths.legacy_memory_dir(), "md") {
+            let name = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if folders.iter().any(|f| f == name) {
+                std::fs::copy(&file, dir.join("projects").join(name).join("memory.md"))
+                    .with_context(|| format!("copying {}", file.display()))?;
+            } else {
+                report.push(format!(
+                    "left {} in the backup: no project is called {name}",
+                    file.display()
+                ));
+            }
+        }
+        write_machine(guard, paths, &toml::to_string(&machine)?)?;
+        Ok(unstaged)
+    })?;
+    report.push(format!(
+        "imported the config into {}",
+        paths.repo_dir().display()
+    ));
+    Ok(report)
+}
+
+/// The project's name and its file for the repo: each repo's `source` and the `template_dir` move
+/// to `machine` when they exist on this machine, and each repo gets a `repo` from its clone's
+/// origin, else from the one `match.repos` entry with its name.
+fn import_project(text: &str, machine: &mut MachineConfig) -> Result<(String, String)> {
+    use toml_edit::{DocumentMut, TableLike, value};
+    let parsed: ProjectConfig = toml::from_str(text)?;
+    let name = parsed.name.clone();
+    if !is_project_name(&name) {
+        bail!("project name '{name}' may only contain letters, digits, '-' and '_'");
+    }
+    let mut doc: DocumentMut = text.parse()?;
+    if let Some(dir) = doc.remove("template_dir")
+        && let Some(dir) = dir.as_str().map(PathBuf::from)
+        && dir.exists()
+    {
+        machine.set_template_dir(&name, dir);
+    }
+    let mut repos: Vec<&mut dyn TableLike> = Vec::new();
+    match doc.get_mut("repos") {
+        Some(toml_edit::Item::ArrayOfTables(tables)) => {
+            repos.extend(tables.iter_mut().map(|t| t as &mut dyn TableLike))
+        }
+        Some(toml_edit::Item::Value(toml_edit::Value::Array(array))) => repos.extend(
+            array
+                .iter_mut()
+                .filter_map(|v| v.as_inline_table_mut())
+                .map(|t| t as &mut dyn TableLike),
+        ),
+        _ => {}
+    }
+    for table in repos {
+        let Some(repo) = table.get("name").and_then(|n| n.as_str()).map(String::from) else {
+            continue;
+        };
+        let source = table
+            .remove("source")
+            .and_then(|s| s.as_str().map(PathBuf::from));
+        if let Some(source) = source.as_ref().filter(|s| s.exists()) {
+            machine.set_source(&name, &repo, source.clone());
+        }
+        if table.get("repo").is_none()
+            && let Some(nwo) = guess_repo(source.as_deref(), &repo, &parsed.match_rule.repos)
+        {
+            table.insert("repo", value(nwo));
+        }
+    }
+    let out = doc.to_string();
+    toml::from_str::<ProjectConfig>(&out).context("the imported project config")?;
+    Ok((name, out))
+}
+
+fn guess_repo(source: Option<&Path>, repo: &str, matched: &[String]) -> Option<String> {
+    if let Some(nwo) = source
+        .filter(|s| s.exists())
+        .and_then(|s| crate::git::origin_name_with_owner(s).ok())
+    {
+        return Some(nwo);
+    }
+    let named: Vec<&String> = matched
+        .iter()
+        .filter(|m| crate::config::short_name(m).eq_ignore_ascii_case(repo))
+        .collect();
+    match named.as_slice() {
+        [only] => Some(only.to_string()),
+        _ => None,
+    }
+}
+
+fn is_project_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Renames the legacy `projects/` and `memory/` to `*.pre-repo` once the repo exists, so older
+/// builds and this one never read both.
+fn rename_legacy(paths: &Paths) -> Result<Vec<String>> {
+    let mut done = Vec::new();
+    for dir in [paths.legacy_projects_dir(), paths.legacy_memory_dir()] {
+        if !dir.exists() {
+            continue;
+        }
+        let name = dir.file_name().unwrap_or_default().to_string_lossy();
+        let backup = std::iter::once(format!("{name}.pre-repo"))
+            .chain((2..).map(|n| format!("{name}.pre-repo-{n}")))
+            .map(|b| dir.with_file_name(b))
+            .find(|b| !b.exists())
+            .expect("an unused name exists");
+        match rename_retrying(&dir, &backup) {
+            Ok(()) => done.push(format!("moved {} to {}", dir.display(), backup.display())),
+            Err(_) if !dir.exists() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(done)
 }
 
 /// On Windows a scanner or indexer can briefly hold a file in the new repo open, which makes the
@@ -214,6 +451,14 @@ pub fn commit(
         relatives.push(relative);
     }
     commit_paths(paths, &repo, &relatives, message)
+}
+
+/// [`commit`], but a failure is only logged: the file is already written, and the next sweep
+/// commits it.
+pub fn commit_logged(guard: &RepoLock, paths: &Paths, files: &[impl AsRef<Path>], message: &str) {
+    if let Err(e) = commit(guard, paths, files, message) {
+        eprintln!("config repo: couldn't commit \"{message}\": {e:#}");
+    }
 }
 
 /// Commits `relatives` (allowlisted, `/`-separated) as they are in the working tree.
@@ -439,6 +684,49 @@ pub(crate) fn isolate_git_for_tests(dir: &Path) {
     let global = dir.join("gitconfig");
     std::fs::write(&global, "").unwrap();
     tests::use_global_config(global);
+}
+
+/// A config home in `dir` with git isolated for this thread and an empty repo.
+#[cfg(test)]
+pub(crate) fn test_home(dir: &Path) -> Paths {
+    isolate_git_for_tests(dir);
+    let paths = Paths {
+        config_dir: dir.join("config"),
+        data_dir: dir.join("data"),
+    };
+    init(&with_lock(&paths).unwrap(), &paths).unwrap();
+    paths
+}
+
+/// The repo's commit subjects, newest first.
+#[cfg(test)]
+pub(crate) fn log_for_tests(paths: &Paths) -> Vec<String> {
+    git(
+        paths,
+        &paths.repo_dir(),
+        &["log", "--format=%s"],
+        LOCAL_TIMEOUT,
+    )
+    .unwrap()
+    .lines()
+    .map(String::from)
+    .collect()
+}
+
+/// The files the newest commit changed.
+#[cfg(test)]
+pub(crate) fn last_commit_files_for_tests(paths: &Paths) -> Vec<String> {
+    git(
+        paths,
+        &paths.repo_dir(),
+        &["show", "--name-only", "--format=", "HEAD"],
+        LOCAL_TIMEOUT,
+    )
+    .unwrap()
+    .lines()
+    .filter(|l| !l.is_empty())
+    .map(String::from)
+    .collect()
 }
 
 #[cfg(test)]
@@ -920,6 +1208,206 @@ mod tests {
         );
         assert!(stdout.contains("1 passed"), "{stdout}");
         assert_eq!(home.log(), ["Child write", "Start the Tworky config"]);
+    }
+
+    /// A home laid out as before the config repo: a project file whose stem differs from its name,
+    /// with a real clone, a repo only `match.repos` names, one nothing names and a template folder;
+    /// a broken project; memory for both, an orphan memory and a stale lock file.
+    fn legacy_home() -> (Home, PathBuf, PathBuf) {
+        let home = Home::new("");
+        let clone = home.dir.path().join("src").join("api");
+        std::fs::create_dir_all(&clone).unwrap();
+        git(
+            &home.paths,
+            &clone,
+            &["init", "-q", "-b", "main"],
+            LOCAL_TIMEOUT,
+        )
+        .unwrap();
+        git(
+            &home.paths,
+            &clone,
+            &["remote", "add", "origin", "git@github.com:acme/api.git"],
+            LOCAL_TIMEOUT,
+        )
+        .unwrap();
+        let templates = home.dir.path().join("acme-templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        let config = &home.paths.config_dir;
+        let write = |relative: &str, text: &str| {
+            let file = config.join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        };
+        write(
+            "projects/acme-old.toml",
+            &format!(
+                "# Acme\nname = \"acme\"\ntemplate_dir = '{}'\n\n[match]\nrepos = [\"acme/api\", \"acme/web\"]\n\n\
+                 [[repos]]\nname = \"api\" # the API\nsource = '{}'\n\n\
+                 [[repos]]\nname = \"web\"\nsource = '{}'\n\n\
+                 [[repos]]\nname = \"misc\"\nsource = 'C:/nowhere/misc'\n",
+                templates.display(),
+                clone.display(),
+                home.dir.path().join("gone").display(),
+            ),
+        );
+        write("projects/beta.toml", "name = [");
+        write("projects/notes.txt", "not a project");
+        write("memory/acme.md", "# Acme memory\n");
+        write("memory/beta.md", "# Beta memory\n");
+        write("memory/orphan.md", "# Orphan\n");
+        write("memory/acme.md.lock", "");
+        write("config.toml", "port_stride = 50\n");
+        (home, clone, templates)
+    }
+
+    #[test]
+    fn migration_imports_a_legacy_home_in_one_commit() {
+        let (home, clone, templates) = legacy_home();
+        let paths = &home.paths;
+
+        let done = migrate(paths).unwrap();
+        assert!(
+            done.iter()
+                .any(|l| l.contains("orphan.md") && l.contains("no project")),
+            "{done:?}"
+        );
+        assert_eq!(home.log(), ["Import existing config"]);
+        assert!(!paths.repo_tmp_dir().exists());
+
+        let acme = std::fs::read_to_string(paths.project_file("acme")).unwrap();
+        assert!(
+            acme.contains("# Acme") && acme.contains("# the API"),
+            "{acme}"
+        );
+        assert!(
+            !acme.contains("source") && !acme.contains("template_dir"),
+            "{acme}"
+        );
+        let (project, warnings) = crate::config::parse_project(&acme).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let repos: Vec<_> = project
+            .repos
+            .iter()
+            .map(|r| (r.name.as_str(), r.repo.as_deref()))
+            .collect();
+        assert_eq!(
+            repos,
+            [
+                ("api", Some("acme/api")),
+                ("web", Some("acme/web")),
+                ("misc", None)
+            ]
+        );
+
+        let machine = MachineConfig::read(paths).unwrap();
+        assert_eq!(machine.source("acme", "api"), Some(&clone));
+        assert_eq!(machine.source("acme", "web"), None, "its clone is gone");
+        assert_eq!(machine.template_dir("acme"), Some(&templates));
+
+        assert_eq!(
+            std::fs::read_to_string(paths.memory_file("acme", None)).unwrap(),
+            "# Acme memory\n"
+        );
+        let tracked = home.lines(&["ls-files", "projects"]);
+        assert_eq!(
+            tracked,
+            [
+                "projects/acme/memory.md",
+                "projects/acme/project.toml",
+                "projects/beta/memory.md"
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.project_file("beta")).unwrap(),
+            "name = [",
+            "kept as it was, for the user to fix"
+        );
+        assert_eq!(
+            status(paths).unwrap().changes,
+            ["projects/beta/project.toml"]
+        );
+        assert!(!paths.project_dir("orphan").exists());
+
+        assert!(!paths.legacy_projects_dir().exists());
+        assert!(!paths.legacy_memory_dir().exists());
+        let backup = paths.config_dir.join("memory.pre-repo");
+        assert!(backup.join("orphan.md").exists());
+        assert!(
+            paths
+                .config_dir
+                .join("projects.pre-repo")
+                .join("acme-old.toml")
+                .exists()
+        );
+
+        let config = crate::config::Config::load_from(paths.clone()).unwrap();
+        assert_eq!(config.app.port_stride, 50);
+        let loaded = config.project("acme").unwrap();
+        assert_eq!(loaded.repos[0].source, Some(clone));
+        assert_eq!(loaded.repos[1].source, None);
+        assert_eq!(config.template_dir(loaded), templates);
+        assert!(config.project_errors.contains_key("beta"));
+
+        assert!(migrate(paths).unwrap().is_empty(), "a rerun does nothing");
+        assert_eq!(home.log(), ["Import existing config"]);
+    }
+
+    #[test]
+    fn a_failed_import_leaves_the_legacy_layout_and_retries_next_time() {
+        let (home, _, _) = legacy_home();
+        let paths = &home.paths;
+        FAIL.set(Some("commit"));
+        let e = migrate(paths).unwrap_err();
+        assert!(format!("{e:#}").contains("injected failure"), "{e:#}");
+        assert!(!paths.repo_dir().exists());
+        assert!(!paths.repo_tmp_dir().exists());
+        assert!(paths.legacy_projects_dir().join("acme-old.toml").exists());
+        assert!(paths.legacy_memory_dir().join("acme.md").exists());
+
+        FAIL.set(None);
+        migrate(paths).unwrap();
+        assert_eq!(home.log(), ["Import existing config"]);
+        assert!(!paths.legacy_projects_dir().exists());
+    }
+
+    #[test]
+    fn a_crash_before_the_legacy_rename_is_finished_next_time() {
+        let (home, _, _) = legacy_home();
+        let paths = &home.paths;
+        import(&with_lock(paths).unwrap(), paths).unwrap();
+        std::fs::rename(
+            paths.legacy_projects_dir(),
+            paths.config_dir.join("projects.pre-repo"),
+        )
+        .unwrap();
+        assert!(paths.legacy_memory_dir().exists());
+
+        let done = migrate(paths).unwrap();
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert!(!paths.legacy_memory_dir().exists());
+        assert!(
+            paths
+                .config_dir
+                .join("memory.pre-repo")
+                .join("acme.md")
+                .exists()
+        );
+        assert_eq!(home.log(), ["Import existing config"]);
+    }
+
+    #[test]
+    fn a_home_with_only_config_toml_gets_an_empty_repo() {
+        let home = Home::new("");
+        std::fs::create_dir_all(&home.paths.config_dir).unwrap();
+        std::fs::write(home.paths.app_config(), "port_stride = 50\n").unwrap();
+        std::fs::create_dir_all(home.paths.legacy_projects_dir()).unwrap();
+
+        let done = migrate(&home.paths).unwrap();
+        assert!(done[0].starts_with("created the config repo"), "{done:?}");
+        assert_eq!(home.log(), ["Start the Tworky config"]);
+        assert!(!home.paths.legacy_projects_dir().exists());
+        assert!(migrate(&home.paths).unwrap().is_empty());
     }
 
     /// The other process in `writers_in_two_processes_take_turns_on_the_lock`; does nothing in a

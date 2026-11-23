@@ -15,6 +15,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tworky_core::activity::{self, AccountRequest, Activity, Handover, Phase, Session};
 use tworky_core::config::Paths;
+use tworky_core::config_repo;
 use tworky_core::existing::WorkSubject;
 use tworky_core::github;
 use tworky_core::hierarchy::IssueIndex;
@@ -354,7 +355,7 @@ async fn list_memories() -> CmdResult<Vec<ProjectMemory>> {
             .projects
             .iter()
             .map(|p| {
-                let path = ws.config.paths.memory_file(&p.name);
+                let path = ws.config.paths.memory_file(&p.name, None);
                 let text = memory::read(&path).map_err(err)?;
                 Ok(ProjectMemory {
                     project: p.name.clone(),
@@ -373,7 +374,7 @@ async fn save_memory(project: String, base: String, text: String) -> CmdResult<(
     blocking(move || {
         let ws = workspace()?;
         ws.config.project(&project).ok_or("no such project")?;
-        memory::save(&ws.config.paths.memory_file(&project), &base, &text).map_err(err)
+        memory::save(&ws.config.paths, &project, &base, &text).map_err(err)
     })
     .await
 }
@@ -622,7 +623,7 @@ async fn list_projects(app: AppHandle) -> CmdResult<Vec<ProjectSummary>> {
                 Ok(ProjectSummary {
                     config: p.clone(),
                     file: p.file.clone(),
-                    memory_file: ws.config.paths.memory_file(&p.name),
+                    memory_file: ws.config.paths.memory_file(&p.name, None),
                     setup_alive: sessions.is_alive(&setup_session),
                     setup_started: ws
                         .state
@@ -633,6 +634,33 @@ async fn list_projects(app: AppHandle) -> CmdResult<Vec<ProjectSummary>> {
                 })
             })
             .collect()
+    })
+    .await
+}
+
+/// Projects that didn't load, by their folder in the config repo, with why.
+#[tauri::command]
+async fn list_project_errors() -> CmdResult<BTreeMap<String, String>> {
+    blocking(|| Ok(workspace()?.config.project_errors)).await
+}
+
+/// Clones a repo of the project that isn't cloned on this machine. Returns where it went.
+#[tauri::command]
+async fn clone_project_repo(project: String, repo: String) -> CmdResult<PathBuf> {
+    blocking(move || {
+        workspace()?
+            .clone_project_repo(&project, &repo)
+            .map_err(err)
+    })
+    .await
+}
+
+/// Looks under the source roots for clones of the project's repos that have no source here.
+#[tauri::command]
+async fn find_project_clones(project: String) -> CmdResult<Vec<tworky_core::config::FoundSource>> {
+    blocking(move || {
+        let ws = workspace()?;
+        tworky_core::config::find_sources(&ws.config, Some(&project)).map_err(err)
     })
     .await
 }
@@ -694,8 +722,10 @@ async fn save_account(
     account: tworky_core::config::AccountConfig,
 ) -> CmdResult<()> {
     blocking(move || {
-        let p = project_named(&workspace()?, &project)?;
-        tworky_core::accounts::save_account(&p, previous.as_deref(), &account).map_err(err)
+        let ws = workspace()?;
+        let p = project_named(&ws, &project)?;
+        tworky_core::accounts::save_account(&ws.config.paths, &p, previous.as_deref(), &account)
+            .map_err(err)
     })
     .await
 }
@@ -703,8 +733,9 @@ async fn save_account(
 #[tauri::command]
 async fn remove_account(project: String, name: String) -> CmdResult<()> {
     blocking(move || {
-        let p = project_named(&workspace()?, &project)?;
-        tworky_core::accounts::remove_account(&p, &name).map_err(err)
+        let ws = workspace()?;
+        let p = project_named(&ws, &project)?;
+        tworky_core::accounts::remove_account(&ws.config.paths, &p, &name).map_err(err)
     })
     .await
 }
@@ -1203,18 +1234,73 @@ fn memory_change_names(paths: &Paths) -> BTreeSet<String> {
 /// Each memory file's modified time and size, so an edit from anywhere refreshes open diffs.
 fn memory_file_stamps(paths: &Paths) -> BTreeMap<String, (Option<std::time::SystemTime>, u64)> {
     let mut stamps = BTreeMap::new();
-    let Ok(files) = std::fs::read_dir(paths.config_dir.join("memory")) else {
+    let Ok(projects) = std::fs::read_dir(paths.repo_projects_dir()) else {
         return stamps;
     };
-    for file in files.flatten() {
-        let name = file.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".md")
-            && let Ok(meta) = file.metadata()
-        {
-            stamps.insert(name, (meta.modified().ok(), meta.len()));
+    for project in projects.flatten() {
+        let Ok(files) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            if name.starts_with("memory")
+                && name.ends_with(".md")
+                && let Ok(meta) = file.metadata()
+            {
+                let key = format!("{}/{name}", project.file_name().to_string_lossy());
+                stamps.insert(key, (meta.modified().ok(), meta.len()));
+            }
         }
     }
     stamps
+}
+
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+static SWEEPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Commits edits made to the config repo outside Tworky, such as by a setup session. Skipped while
+/// another sweep runs.
+fn sweep_config() {
+    use std::sync::atomic::Ordering;
+    if SWEEPING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let swept = Paths::resolve().and_then(|paths| {
+        let guard = config_repo::with_lock(&paths)?;
+        config_repo::sweep(&guard, &paths)
+    });
+    SWEEPING.store(false, Ordering::Release);
+    match swept {
+        Ok(swept) => {
+            for file in swept.held_back {
+                eprintln!(
+                    "config repo: not committing {}: it doesn't parse",
+                    file.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("config repo: sweep failed: {e:#}"),
+    }
+}
+
+/// Once per start, looks for clones of repos that have no source on this machine.
+fn find_missing_sources() {
+    let found = tworky_core::config::Config::load()
+        .and_then(|config| tworky_core::config::find_sources(&config, None));
+    match found {
+        Ok(found) => {
+            for f in found {
+                eprintln!(
+                    "found {} of {} at {}",
+                    f.repo,
+                    f.project,
+                    f.source.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("looking for clones: {e:#}"),
+    }
 }
 
 #[tauri::command]
@@ -1398,6 +1484,10 @@ fn main() {
         Ok(copied) => copied.iter().for_each(|line| eprintln!("{line}")),
         Err(e) => eprintln!("could not migrate work-app folders: {e:#}"),
     }
+    match tworky_core::config::Paths::resolve().and_then(|p| p.migrate_to_repo()) {
+        Ok(lines) => lines.iter().for_each(|line| eprintln!("{line}")),
+        Err(e) => eprintln!("could not set up the config repo: {e:#}"),
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(
@@ -1426,7 +1516,19 @@ fn main() {
             let keep_awake_handle = handle.clone();
             std::thread::spawn(move || watch_activity(handle));
             std::thread::spawn(move || keep_awake::run(keep_awake_handle));
+            std::thread::spawn(find_missing_sources);
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(SWEEP_INTERVAL);
+                    sweep_config();
+                }
+            });
             Ok(())
+        })
+        .on_window_event(|_, event| {
+            if let tauri::WindowEvent::Focused(true) = event {
+                std::thread::spawn(sweep_config);
+            }
         })
         .register_asynchronous_uri_scheme_protocol("ghimg", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
@@ -1444,6 +1546,9 @@ fn main() {
             approve_memory_changes,
             reject_memory_changes,
             list_projects,
+            list_project_errors,
+            clone_project_repo,
+            find_project_clones,
             search_repos,
             list_items,
             create_item,

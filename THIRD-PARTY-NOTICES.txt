@@ -5546,6 +5546,8 @@ Used by:
   https://crates.io/crates/serde_derive_internals/0.29.1
 - serde_derive_internals 0.30.0
   https://crates.io/crates/serde_derive_internals/0.30.0
+- serde_ignored 0.1.14
+  https://crates.io/crates/serde_ignored/0.1.14
 - serde_json 1.0.154
   https://crates.io/crates/serde_json/1.0.154
 - serde_path_to_error 0.1.20

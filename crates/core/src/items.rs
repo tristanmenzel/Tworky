@@ -11,8 +11,6 @@ use crate::hierarchy::IssueIndex;
 use crate::state::{IssueRef, Item, ItemSource, PrRef, WorkerRecord};
 use crate::worker::{Workspace, worker_claude_md};
 
-const CLONE_SEARCH_DEPTH: usize = 3;
-
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoCandidate {
     pub name_with_owner: String,
@@ -153,7 +151,7 @@ impl Workspace {
     /// Repos no project covers yet: local clones matching `query` first, then GitHub results.
     pub fn repo_candidates(&self, query: &str) -> RepoSearch {
         let needle = query.trim().to_ascii_lowercase();
-        let clones = git::find_clones(&self.config.app.source_roots, CLONE_SEARCH_DEPTH);
+        let clones = git::find_clones(&self.config.app.source_roots, config::CLONE_SEARCH_DEPTH);
         let mut candidates: Vec<RepoCandidate> = first_clone_of_each(&clones)
             .into_iter()
             .filter(|(nwo, _)| !self.is_covered(nwo))
@@ -224,6 +222,43 @@ impl Workspace {
         })
     }
 
+    /// Clones a repo of `project` that isn't cloned on this machine into the first source root,
+    /// or takes the clone already there, and records it in `machine.toml`. Returns where it is.
+    pub fn clone_project_repo(&self, project: &str, repo: &str) -> Result<PathBuf> {
+        let project = self
+            .config
+            .project(project)
+            .with_context(|| format!("no project named '{project}'"))?;
+        let repo = project
+            .repos
+            .iter()
+            .find(|r| r.name == repo)
+            .with_context(|| format!("{} has no repo called {repo}", project.name))?;
+        let nwo = repo.repo.as_deref().with_context(|| {
+            format!(
+                "{} has no `repo = \"owner/name\"` in {}, so Tworky can't tell what to clone",
+                repo.name,
+                project.file.display()
+            )
+        })?;
+        let root = self
+            .config
+            .app
+            .source_roots
+            .first()
+            .context("no source_roots configured to clone into")?;
+        let dest = nwo.split('/').fold(root.clone(), |p, part| p.join(part));
+        if dest.exists() {
+            if !git::origin_name_with_owner(&dest).is_ok_and(|o| o.eq_ignore_ascii_case(nwo)) {
+                bail!("{} exists but isn't a clone of {nwo}", dest.display());
+            }
+        } else {
+            github::clone_repo(nwo, &dest)?;
+        }
+        config::set_source(&self.config.paths, &project.name, &repo.name, &dest)?;
+        Ok(dest)
+    }
+
     /// Makes a project for repos with no project config, cloning any that aren't under a source
     /// root yet. Returns its name; reopen the workspace to see it.
     pub fn create_repo_project(
@@ -231,7 +266,7 @@ impl Workspace {
         names_with_owner: &[String],
         name: Option<&str>,
     ) -> Result<String> {
-        let clones = git::find_clones(&self.config.app.source_roots, CLONE_SEARCH_DEPTH);
+        let clones = git::find_clones(&self.config.app.source_roots, config::CLONE_SEARCH_DEPTH);
         let repos = names_with_owner
             .iter()
             .map(|nwo| self.new_repo(nwo, &clones))
@@ -251,9 +286,9 @@ impl Workspace {
             .config
             .project(project)
             .with_context(|| format!("no project named '{project}'"))?;
-        let clones = git::find_clones(&self.config.app.source_roots, CLONE_SEARCH_DEPTH);
+        let clones = git::find_clones(&self.config.app.source_roots, config::CLONE_SEARCH_DEPTH);
         let repo = self.new_repo(name_with_owner, &clones)?;
-        config::add_repo_to_project(&project.file, &repo)
+        config::add_repo_to_project(&self.config.paths, &project.name, &repo)
     }
 
     /// The project a new item for `repo` goes in, adding the repo to it or making it as `choice`
@@ -293,7 +328,7 @@ impl Workspace {
             p.match_rule.repos.iter().cloned().for_each(&mut add);
             p.repos
                 .iter()
-                .filter_map(|r| git::origin_name_with_owner(&r.source).ok())
+                .filter_map(|r| r.name_with_owner().ok())
                 .for_each(&mut add);
         }
         for item in self.state.list_items().unwrap_or_default() {
@@ -544,7 +579,7 @@ impl Workspace {
                 w.pr = None;
                 self.state.save(&w)?;
                 if w.dir.is_dir() {
-                    let memory = self.config.paths.memory_file(&project.name);
+                    let memory = self.config.paths.memory_file(&project.name, None);
                     std::fs::write(
                         w.dir.join("CLAUDE.md"),
                         worker_claude_md(&w, project, index, &memory),

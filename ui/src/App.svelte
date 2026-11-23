@@ -119,6 +119,7 @@
   let items = $state<Item[]>([])
   let itemsLoaded = $state(false)
   let projects = $state<ProjectSummary[]>([])
+  let projectErrors = $state<Record<string, string>>({})
   let anonymousFor = $state<Worker | null>(null)
   let createProfileFor = $state<{ worker: Worker; request: AccountRequest | null } | null>(null)
   let selectedProject = $state<string | null>(null)
@@ -395,7 +396,9 @@
 
   async function loadProjects() {
     try {
-      projects = await api.projects()
+      const [loaded, errors] = await Promise.all([api.projects(), api.projectErrors()])
+      projects = loaded
+      projectErrors = errors
       if (!projects.some((p) => p.name === selectedProject)) selectedProject = projects[0]?.name ?? null
     } catch (e) {
       showError(String(e))
@@ -942,7 +945,13 @@
               </button>
             </li>
           {:else}
-            <li class="muted pad">No projects configured.</li>
+            {#if !Object.keys(projectErrors).length}<li class="muted pad">No projects configured.</li>{/if}
+          {/each}
+          {#each Object.entries(projectErrors) as [folder, error] (folder)}
+            <li class="project broken">
+              <strong>{folder}</strong>
+              <span class="error-text">doesn't load: {error}</span>
+            </li>
           {/each}
         </ul>
       </aside>
@@ -1093,6 +1102,7 @@
                 items={items.filter((i) => i.project === project.name)}
                 onShowWorker={showProjectWorker}
                 onOpenSetup={() => openProjectSetup(project.name)}
+                onChanged={loadProjects}
                 onError={showError}
               />
             {/key}
@@ -1434,6 +1444,17 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+  }
+  .project.broken {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    border-left-color: var(--bad);
+  }
+  .error-text {
+    color: var(--bad);
+    font-size: 12px;
+    overflow-wrap: anywhere;
   }
   .setup-badge {
     flex: none;

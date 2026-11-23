@@ -434,7 +434,7 @@ impl Workspace {
                 &w,
                 project,
                 index,
-                &self.config.paths.memory_file(&project.name),
+                &self.config.paths.memory_file(&project.name, None),
             ),
         )?;
         write_graft_settings(&w.dir)?;
@@ -494,15 +494,16 @@ impl Workspace {
                 origin: BranchOrigin::Existing,
             }
         } else {
+            let source = repo.source.as_deref().ok_or_else(|| repo.not_cloned())?;
             log(&format!("▸ {}: fetching", repo.name));
-            if let Err(e) = git::fetch(&repo.source) {
+            if let Err(e) = git::fetch(source) {
                 log(&format!(
                     "  fetch failed, continuing with local refs: {e:#}"
                 ));
             }
             let branch = branch.unwrap_or(&w.branch).to_string();
             let base = base.unwrap_or(&repo.base);
-            let origin = git::worktree_add(&repo.source, &path, &branch, base)
+            let origin = git::worktree_add(source, &path, &branch, base)
                 .with_context(|| format!("worktree for {}", repo.name))?;
             let how = match origin {
                 BranchOrigin::New => format!("new branch from {base}"),
@@ -551,27 +552,30 @@ impl Workspace {
     fn drop_worktree(&self, w: &WorkerRecord, repo: &RepoConfig, log: Log) -> Result<()> {
         let path = w.dir.join(&repo.name);
         let record = w.worktrees.iter().find(|t| t.repo == repo.name);
-        if !repo.source.is_dir() {
+        let Some(source) = repo.source.as_deref().filter(|s| s.is_dir()) else {
             if path.exists() {
+                let gone = match &repo.source {
+                    Some(source) => format!("the clone at {} is gone", source.display()),
+                    None => "it isn't cloned on this machine".into(),
+                };
                 log(&format!(
-                    "▸ {}: the clone at {} is gone, so removing the worktree folder without git",
-                    repo.name,
-                    repo.source.display()
+                    "▸ {}: {gone}, so removing the worktree folder without git",
+                    repo.name
                 ));
                 remove_dir(&path)?;
             }
             return Ok(());
-        }
+        };
         if git::is_worktree(&path) || record.is_some() {
             log(&format!("▸ {}: removing worktree", repo.name));
-            git::worktree_remove(&repo.source, &path)?;
+            git::worktree_remove(source, &path)?;
         }
         if let Some(t) = record.filter(|t| t.origin.created_by_tworky()) {
             log(&format!(
                 "▸ {}: deleting local branch {}",
                 repo.name, t.branch
             ));
-            git::branch_delete(&repo.source, &t.branch)?;
+            git::branch_delete(source, &t.branch)?;
         }
         Ok(())
     }
@@ -734,7 +738,7 @@ impl Workspace {
     ) -> Result<String> {
         let project = self.project_of(w)?;
         let saved = self.login_origin_for_worker(w, origin)?;
-        accounts::add_login_origin(project, account, &saved)?;
+        accounts::add_login_origin(&self.config.paths, project, account, &saved)?;
         Ok(saved)
     }
 
@@ -839,7 +843,7 @@ impl Workspace {
             replaced_missing = true;
         }
         let mut args: Vec<String> = self.config.app.claude[1..].to_vec();
-        let memory = self.config.paths.memory_file(&project.name);
+        let memory = self.config.paths.memory_file(&project.name, None);
         args.extend([
             "--settings".into(),
             session_settings(&project.name, &memory, w.stopped, mcp.is_some(), None),
@@ -897,7 +901,8 @@ impl Workspace {
                 status: git::status(&w.dir.join(&t.repo)).ok(),
                 error: None,
             };
-            match git::origin_name_with_owner(&repo.source)
+            match repo
+                .name_with_owner()
                 .and_then(|nwo| github::pull_requests(&nwo, &t.branch).map(|prs| (nwo, prs)))
             {
                 Ok((nwo, prs)) => {
@@ -1408,15 +1413,19 @@ pub fn worker_claude_md(
         "No worktrees exist until you ask for them. These repos are available:\n",
     );
     for r in &project.repos {
-        push(
-            &mut md,
-            &format!(
+        let line = match &r.source {
+            Some(source) => format!(
                 "- `{}` — main checkout `{}`, base `{}`",
                 r.name,
-                r.source.display(),
+                source.display(),
                 r.base
             ),
-        );
+            None => format!(
+                "- `{}` — not cloned on this machine, so `tw worktree add` can't use it until the user clones it from the project Overview",
+                r.name
+            ),
+        };
+        push(&mut md, &line);
     }
     push(
         &mut md,
@@ -2041,7 +2050,7 @@ start_url = "http://localhost:5173/home"
         let (_d, ws) = workspace();
         let idx = index();
         let w = ws.plan(&idx, "T").unwrap();
-        let memory = ws.config.paths.memory_file("acme");
+        let memory = ws.config.paths.memory_file("acme", None);
         let md = worker_claude_md(&w, &project(), &idx, &memory);
         assert!(md.contains("## Working alongside other Claudes"));
         assert!(
@@ -2088,7 +2097,7 @@ start_url = "http://localhost:5173/home"
         git(&source, &["commit", "-q", "-m", "init"]);
         git(&source, &["branch", "someone-elses"]);
         let project = &mut ws.config.projects[0];
-        project.repos[0].source = source.clone();
+        project.repos[0].source = Some(source.clone());
         project.repos[0].base = "main".into();
         let template = dir.path().join("c/templates/acme/platform");
         std::fs::create_dir_all(&template).unwrap();
@@ -2135,11 +2144,38 @@ start_url = "http://localhost:5173/home"
         ws.add_worktree(&id, "platform", None, None, &mut |_| {})
             .unwrap();
         let dir = ws.state.get(&id).unwrap().unwrap().dir;
-        ws.config.projects[0].repos[0].source = d.path().join("deleted-clone");
+        ws.config.projects[0].repos[0].source = Some(d.path().join("deleted-clone"));
 
         ws.cleanup(&id, None, &mut |_| {}).unwrap();
         assert!(!dir.exists());
         assert!(ws.state.get(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_repo_not_cloned_here_gets_no_worktree_and_is_listed_as_not_cloned() {
+        let (_d, mut ws) = workspace();
+        ws.config.projects[0].repos[0].source = None;
+        let w = ws.plan(&index(), "T").unwrap();
+        let err = ws
+            .add_worktree(&w.id, "platform", None, None, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("platform isn't cloned on this machine")
+                && err.contains("tw project set-source"),
+            "{err}"
+        );
+        let md = worker_claude_md(
+            &w,
+            &ws.config.projects[0],
+            &index(),
+            &ws.config.paths.memory_file("acme", None),
+        );
+        assert!(
+            md.contains("- `platform` — not cloned on this machine"),
+            "{md}"
+        );
+        ws.remove_worktree(&w.id, "platform", &mut |_| {}).unwrap();
     }
 
     #[test]
@@ -2741,7 +2777,7 @@ run = "{sleep}"
         };
         let running = hooks(&again);
         assert_eq!(running.len(), 2, "memory and the feedback note");
-        let memory = ws.config.paths.memory_file("acme");
+        let memory = ws.config.paths.memory_file("acme", None);
         assert!(running[0].contains(&memory.to_string_lossy().replace('\\', "/")));
         assert!(running[0].contains("Run tw memory changes first"));
         assert!(running[1].contains("tw issue bug|friction"));

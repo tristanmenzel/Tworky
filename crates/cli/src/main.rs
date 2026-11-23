@@ -157,6 +157,21 @@ enum ProjectCommand {
     },
     /// Mark a new project as set up, once its config has been tested on a scratch item
     Done(NamedProject),
+    /// Record where a repo of the project is cloned on this machine, in machine.toml
+    SetSource {
+        /// The repo's name in [[repos]]
+        #[arg(required_unless_present = "scan")]
+        repo: Option<String>,
+        /// Its clone on this machine
+        #[arg(required_unless_present = "scan")]
+        path: Option<std::path::PathBuf>,
+        /// Instead, look under the source roots for clones of repos with no source, in PROJECT or
+        /// every project
+        #[arg(long, value_name = "PROJECT", num_args = 0..=1, conflicts_with_all = ["repo", "path"])]
+        scan: Option<Option<String>>,
+        #[command(flatten)]
+        project: ProjectArg,
+    },
 }
 
 /// A project named as an argument, or by `--project` and its defaults.
@@ -422,18 +437,25 @@ fn main() -> Result<()> {
         // SAFETY: no other threads exist yet.
         unsafe { std::env::set_var("TW_WORKER_ID", id) };
     }
-    for line in Paths::resolve()?.migrate_legacy()? {
+    let paths = Paths::resolve()?;
+    for line in paths.migrate_legacy()? {
         eprintln!("{line}");
+    }
+    match paths.migrate_to_repo() {
+        Ok(lines) => lines.iter().for_each(|line| eprintln!("{line}")),
+        Err(e) => eprintln!("could not set up the config repo: {e:#}"),
     }
     match Cli::parse().command {
         Command::Issues { json } => issues(json),
         Command::Paths => {
             let p = Paths::resolve()?;
             println!("config:    {}", p.app_config().display());
-            println!("projects:  {}", p.projects_dir().display());
+            println!("repo:      {}", p.repo_dir().display());
+            println!("machine:   {}", p.machine_file().display());
+            println!("projects:  {}", p.project_dir("<project>").display());
             println!("templates: {}", p.templates_dir().display());
             println!("state:     {}", p.state_db().display());
-            println!("memory:    {}", p.memory_file("<project>").display());
+            println!("memory:    {}", p.memory_file("<project>", None).display());
             Ok(())
         }
         Command::Work { url, fetch, json } => work(&url, fetch, json),
@@ -566,6 +588,9 @@ fn project(cmd: ProjectCommand) -> Result<()> {
     let ws = Workspace::open()?;
     let named = |arg: &ProjectArg| -> Result<tworky_core::config::ProjectConfig> {
         let name = project_name(&ws, arg)?;
+        if let Some(error) = ws.config.project_errors.get(&name) {
+            anyhow::bail!("{name} doesn't load: {error}");
+        }
         ws.config
             .project(&name)
             .cloned()
@@ -582,6 +607,9 @@ fn project(cmd: ProjectCommand) -> Result<()> {
                 };
                 println!("{:<16} {}{state}", p.name, repos.join(", "));
             }
+            for (folder, error) in &ws.config.project_errors {
+                println!("{folder:<16} doesn't load: {error}");
+            }
         }
         ProjectCommand::Show(arg) => {
             let arg = arg.into_arg();
@@ -590,17 +618,27 @@ fn project(cmd: ProjectCommand) -> Result<()> {
                 println!("{label:<14} {value}");
             }
             for r in &p.repos {
+                let at = match &r.source {
+                    Some(source) => format!("at {}", source.display()),
+                    None => "not cloned".into(),
+                };
+                let github = r.repo.as_deref().unwrap_or("no repo");
                 println!(
-                    "repo           {} at {} (base {})",
-                    r.name,
-                    r.source.display(),
-                    r.base
+                    "repo           {} ({github}) {at} (base {})",
+                    r.name, r.base
                 );
             }
         }
         ProjectCommand::Check(arg) => {
             let arg = arg.into_arg();
             let p = named(&arg)?;
+            let reloaded;
+            let ws = if report_found_sources(&ws, Some(&p.name))? {
+                reloaded = Workspace::open()?;
+                &reloaded
+            } else {
+                &ws
+            };
             let findings = ws.check_project(&p.name)?;
             for f in &findings {
                 let tag = match f.level {
@@ -620,6 +658,50 @@ fn project(cmd: ProjectCommand) -> Result<()> {
             ws.add_repo_to_project(&p.name, &repo)?;
             println!("added {repo} to {}", p.name);
         }
+        ProjectCommand::SetSource {
+            repo,
+            path,
+            scan,
+            project,
+        } => match (scan, repo, path) {
+            (Some(only), _, _) => {
+                if let Some(name) = &only
+                    && ws.config.project(name).is_none()
+                {
+                    anyhow::bail!("no project called {name}");
+                }
+                if !report_found_sources(&ws, only.as_deref())? {
+                    println!("found no new clones under the source roots");
+                }
+            }
+            (None, Some(repo), Some(path)) => {
+                let p = named(&project)?;
+                let entry = p
+                    .repos
+                    .iter()
+                    .find(|r| r.name.eq_ignore_ascii_case(&repo))
+                    .with_context(|| format!("{} has no repo called {repo}", p.name))?;
+                let path = std::path::absolute(&path)?;
+                if !path.is_dir() {
+                    anyhow::bail!("{} isn't a folder", path.display());
+                }
+                if let Some(nwo) = &entry.repo {
+                    match tworky_core::git::origin_name_with_owner(&path) {
+                        Ok(origin) if origin.eq_ignore_ascii_case(nwo) => {}
+                        Ok(origin) => {
+                            eprintln!(
+                                "warning: {} is a clone of {origin}, not {nwo}",
+                                path.display()
+                            )
+                        }
+                        Err(e) => eprintln!("warning: {e:#}"),
+                    }
+                }
+                tworky_core::config::set_source(&ws.config.paths, &p.name, &entry.name, &path)?;
+                println!("{} of {} is at {}", entry.name, p.name, path.display());
+            }
+            _ => anyhow::bail!("give a repo and its path, or --scan"),
+        },
         ProjectCommand::Done(arg) => {
             let arg = arg.into_arg();
             let p = named(&arg)?;
@@ -628,6 +710,21 @@ fn project(cmd: ProjectCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Looks for clones of repos with no source, prints each one found and records it. Returns whether
+/// it found any.
+fn report_found_sources(ws: &Workspace, project: Option<&str>) -> Result<bool> {
+    let found = tworky_core::config::find_sources(&ws.config, project)?;
+    for f in &found {
+        println!(
+            "found {} of {} at {}",
+            f.repo,
+            f.project,
+            f.source.display()
+        );
+    }
+    Ok(!found.is_empty())
 }
 
 fn item(cmd: ItemCommand) -> Result<()> {
@@ -815,7 +912,7 @@ fn accounts(cmd: AccountsCommand) -> Result<()> {
                 login_origins,
                 color,
             };
-            accounts::save_account(p, previous, &account)?;
+            accounts::save_account(&ws.config.paths, p, previous, &account)?;
             println!("saved {name} in {}", p.file.display());
         }
         AccountsCommand::Rm { name, project: arg } => {
@@ -823,7 +920,7 @@ fn accounts(cmd: AccountsCommand) -> Result<()> {
             if !p.accounts.iter().any(|a| a.name == name) {
                 anyhow::bail!("{} has no account called {name}", p.name);
             }
-            accounts::remove_account(p, &name)?;
+            accounts::remove_account(&ws.config.paths, p, &name)?;
             println!("removed {name}");
         }
         AccountsCommand::SetPassword { name, project: arg } => {
@@ -849,7 +946,7 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
     let ws = Workspace::open()?;
     match cmd {
         MemoryCommand::Show(arg) => {
-            let path = ws.config.paths.memory_file(&project_name(&ws, &arg)?);
+            let path = ws.config.paths.memory_file(&project_name(&ws, &arg)?, None);
             let text = memory::read(&path)?;
             if text.is_empty() {
                 eprintln!("{} is empty", path.display());
@@ -910,7 +1007,7 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
                 "{}",
                 ws.config
                     .paths
-                    .memory_file(&project_name(&ws, &arg)?)
+                    .memory_file(&project_name(&ws, &arg)?, None)
                     .display()
             );
         }

@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::config_repo::{self, RepoLock};
+use crate::git;
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub config_dir: PathBuf,
@@ -72,6 +75,13 @@ impl Paths {
         Ok(copied)
     }
 
+    /// Makes sure the config repo exists: imports the legacy `projects/` and `memory/` into it, or
+    /// creates an empty one, then renames the legacy folders to `*.pre-repo`. Re-running it finishes
+    /// whatever an earlier run left undone. Returns a line per thing done.
+    pub fn migrate_to_repo(&self) -> Result<Vec<String>> {
+        crate::config_repo::migrate(self)
+    }
+
     /// Where debug builds of the app keep config and data, so in-progress code never rewrites
     /// what the installed app reads. Inside a worker each dev build gets its own home, so several
     /// can run side by side. `None` when `TWORKY_HOME` already picks a home.
@@ -119,8 +129,16 @@ impl Paths {
         self.config_dir.join("config.toml")
     }
 
-    pub fn projects_dir(&self) -> PathBuf {
+    /// Where project TOMLs lived before the config repo; renamed to `projects.pre-repo` once
+    /// they're imported.
+    pub fn legacy_projects_dir(&self) -> PathBuf {
         self.config_dir.join("projects")
+    }
+
+    /// Where shared memory lived before the config repo; renamed to `memory.pre-repo` once it's
+    /// imported.
+    pub fn legacy_memory_dir(&self) -> PathBuf {
+        self.config_dir.join("memory")
     }
 
     pub fn templates_dir(&self) -> PathBuf {
@@ -131,8 +149,13 @@ impl Paths {
         self.config_dir.join("settings.toml")
     }
 
-    pub fn memory_file(&self, project: &str) -> PathBuf {
-        self.config_dir.join("memory").join(format!("{project}.md"))
+    /// The project's shared memory, or with `os` its refinement for that OS.
+    pub fn memory_file(&self, project: &str, os: Option<Os>) -> PathBuf {
+        let name = match os {
+            Some(os) => format!("memory.{}.md", os.name()),
+            None => "memory.md".into(),
+        };
+        self.project_dir(project).join(name)
     }
 
     pub fn memory_changes_dir(&self, project: &str) -> PathBuf {
@@ -180,8 +203,12 @@ impl Paths {
         ]
     }
 
+    pub fn repo_projects_dir(&self) -> PathBuf {
+        self.repo_dir().join("projects")
+    }
+
     pub fn project_dir(&self, name: &str) -> PathBuf {
-        self.repo_dir().join("projects").join(name)
+        self.repo_projects_dir().join(name)
     }
 
     pub fn project_file(&self, name: &str) -> PathBuf {
@@ -226,7 +253,7 @@ pub struct NewRepo {
     pub base: String,
 }
 
-fn short_name(name_with_owner: &str) -> &str {
+pub(crate) fn short_name(name_with_owner: &str) -> &str {
     name_with_owner
         .rsplit('/')
         .next()
@@ -247,9 +274,10 @@ pub fn project_slug(name: &str) -> String {
         .collect()
 }
 
-/// Writes a minimal `projects/<name>.toml` (match, repos; no ports, stack or hooks) for repos no
-/// project covers yet, so items, worktrees and memory work for them, and marks it as still to be
-/// set up. Never overwrites a file. `name` defaults to the first repo's. Returns the project's name.
+/// Writes a minimal `project.toml` (match, repos; no ports, stack or hooks) for repos no project
+/// covers yet, so items, worktrees and memory work for them, and marks it as still to be set up.
+/// The clones go in `machine.toml`. Never overwrites a project. `name` defaults to the first
+/// repo's. Returns the project's name.
 pub fn create_repo_project(
     paths: &Paths,
     taken: &[String],
@@ -261,10 +289,10 @@ pub fn create_repo_project(
     if base_name.trim_matches('-').is_empty() {
         bail!("a project needs a name");
     }
-    let dir = paths.projects_dir();
+    let guard = config_repo::with_lock(paths)?;
     let name = std::iter::once(base_name.clone())
         .chain((2..).map(|n| format!("{base_name}-{n}")))
-        .find(|n| !taken.contains(n) && !dir.join(format!("{n}.toml")).exists())
+        .find(|n| !taken.contains(n) && !paths.project_dir(n).exists())
         .expect("an unused name exists");
     let short = |nwo: &str| short_name(nwo).to_string();
 
@@ -288,10 +316,7 @@ pub fn create_repo_project(
             .map(|r| {
                 let mut t = toml::Table::new();
                 t.insert("name".into(), short(&r.name_with_owner).into());
-                t.insert(
-                    "source".into(),
-                    r.source.to_string_lossy().into_owned().into(),
-                );
+                t.insert("repo".into(), r.name_with_owner.clone().into());
                 t.insert("base".into(), r.base.clone().into());
                 toml::Value::from(t)
             })
@@ -303,21 +328,27 @@ pub fn create_repo_project(
         toml::to_string(&table)?
     );
     let parsed: ProjectConfig = toml::from_str(&text).context("generated project config")?;
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{name}.toml"));
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+    let file = paths.project_file(&name);
+    std::fs::create_dir_all(paths.project_dir(&name))?;
+    crate::memory::write_atomic(&file, text.as_bytes())?;
+    MachineConfig::update(&guard, paths, |m| {
+        for r in repos {
+            m.set_source(&name, &short(&r.name_with_owner), r.source.clone());
+        }
+    })?;
+    config_repo::commit_logged(&guard, paths, &[&file], &format!("Create project {name}"));
     Ok(parsed.name)
 }
 
-/// Adds `repo` to the project in `file`: to `match.repos`, so its issues and PRs route here, and to
-/// `[[repos]]`, so workers can add worktrees for it. Comments and layout survive, and the file is
-/// written only if the result still parses.
-pub fn add_repo_to_project(file: &Path, repo: &NewRepo) -> Result<()> {
+/// Adds `repo` to `project`: to `match.repos`, so its issues and PRs route here, and to
+/// `[[repos]]`, so workers can add worktrees for it, with its clone in `machine.toml`. Comments
+/// and layout survive, and the file is written only if the result still parses.
+pub fn add_repo_to_project(paths: &Paths, project: &str, repo: &NewRepo) -> Result<()> {
     use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
+    let guard = config_repo::with_lock(paths)?;
+    let file = paths.project_file(project);
     let text =
-        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     let mut doc: DocumentMut = text
         .parse()
         .with_context(|| format!("{} does not parse", file.display()))?;
@@ -351,27 +382,179 @@ pub fn add_repo_to_project(file: &Path, repo: &NewRepo) -> Result<()> {
     } else {
         short.to_string()
     };
-    let has_worktree_entry = current.repos.iter().any(|r| r.source == repo.source)
-        || taken.iter().any(|t| t.eq_ignore_ascii_case(&name));
-    if !has_worktree_entry {
-        if !doc.contains_key("repos") {
-            doc.insert("repos", Item::ArrayOfTables(ArrayOfTables::new()));
+    let same_repo = current.repos.iter().find(|r| {
+        r.repo
+            .as_deref()
+            .is_some_and(|r| r.eq_ignore_ascii_case(&repo.name_with_owner))
+    });
+    let entry = match same_repo {
+        Some(r) => Some(r.name.clone()),
+        None if taken.iter().any(|t| t.eq_ignore_ascii_case(&name)) => None,
+        None => {
+            if !doc.contains_key("repos") {
+                doc.insert("repos", Item::ArrayOfTables(ArrayOfTables::new()));
+            }
+            let mut t = Table::new();
+            t.insert("name", value(&name));
+            t.insert("repo", value(&repo.name_with_owner));
+            t.insert("base", value(repo.base.as_str()));
+            doc["repos"]
+                .as_array_of_tables_mut()
+                .with_context(|| format!("repos in {} is not a list of tables", file.display()))?
+                .push(t);
+            Some(name)
         }
-        let mut t = Table::new();
-        t.insert("name", value(name));
-        t.insert("source", value(repo.source.to_string_lossy().into_owned()));
-        t.insert("base", value(repo.base.as_str()));
-        doc["repos"]
-            .as_array_of_tables_mut()
-            .with_context(|| format!("repos in {} is not a list of tables", file.display()))?
-            .push(t);
-    }
+    };
 
     let out = doc.to_string();
     toml::from_str::<ProjectConfig>(&out).context("the edited project config")?;
-    let tmp = file.with_extension("toml.tmp");
-    std::fs::write(&tmp, &out)?;
-    std::fs::rename(&tmp, file).with_context(|| format!("writing {}", file.display()))
+    crate::memory::write_atomic(&file, out.as_bytes())?;
+    if let Some(entry) = entry {
+        MachineConfig::update(&guard, paths, |m| {
+            if m.source(project, &entry).is_none() {
+                m.set_source(project, &entry, repo.source.clone());
+            }
+        })?;
+    }
+    config_repo::commit_logged(
+        &guard,
+        paths,
+        &[&file],
+        &format!("Add {} to {project}", repo.name_with_owner),
+    );
+    Ok(())
+}
+
+/// Records where `repo` of `project` is cloned on this machine.
+pub fn set_source(paths: &Paths, project: &str, repo: &str, source: &Path) -> Result<()> {
+    let guard = config_repo::with_lock(paths)?;
+    MachineConfig::update(&guard, paths, |m| {
+        m.set_source(project, repo, source.to_path_buf())
+    })
+}
+
+/// A clone found for a repo that had no source on this machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FoundSource {
+    pub project: String,
+    pub repo: String,
+    pub source: PathBuf,
+}
+
+/// Looks under `source_roots` for clones of the repos with no source on this machine (of
+/// `project`, or of every project), matching each clone's origin to the repo's `repo`, and records
+/// the ones found in `machine.toml`. Reload the config to see them.
+pub fn find_sources(config: &Config, project: Option<&str>) -> Result<Vec<FoundSource>> {
+    let missing: Vec<(&str, &str, &str)> = config
+        .projects
+        .iter()
+        .filter(|p| project.is_none_or(|name| p.name == name))
+        .flat_map(|p| {
+            p.repos
+                .iter()
+                .filter(|r| r.source.is_none())
+                .filter_map(|r| Some((p.name.as_str(), r.name.as_str(), r.repo.as_deref()?)))
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(vec![]);
+    }
+    let clones = git::find_clones(&config.app.source_roots, CLONE_SEARCH_DEPTH);
+    let found: Vec<FoundSource> = missing
+        .into_iter()
+        .filter_map(|(project, repo, nwo)| {
+            let (_, source) = clones.iter().find(|(c, _)| c.eq_ignore_ascii_case(nwo))?;
+            Some(FoundSource {
+                project: project.into(),
+                repo: repo.into(),
+                source: source.clone(),
+            })
+        })
+        .collect();
+    if !found.is_empty() {
+        let guard = config_repo::with_lock(&config.paths)?;
+        MachineConfig::update(&guard, &config.paths, |m| {
+            for f in &found {
+                if m.source(&f.project, &f.repo).is_none() {
+                    m.set_source(&f.project, &f.repo, f.source.clone());
+                }
+            }
+        })?;
+    }
+    Ok(found)
+}
+
+/// How many folders deep under each source root clones are looked for.
+pub const CLONE_SEARCH_DEPTH: usize = 3;
+
+/// `machine.toml`: where this machine keeps each project's clones and templates. It's never
+/// synced, so the shared `project.toml` names repos by `owner/name` only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MachineConfig {
+    pub projects: BTreeMap<String, MachineProject>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MachineProject {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub repos: BTreeMap<String, MachineRepo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MachineRepo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<PathBuf>,
+}
+
+impl MachineConfig {
+    pub fn read(paths: &Paths) -> Result<Self> {
+        let file = paths.machine_file();
+        match std::fs::read_to_string(&file) {
+            Ok(text) => {
+                toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
+        }
+    }
+
+    /// Reads `machine.toml`, applies `change` and writes it back, so writers holding the lock in
+    /// turn never lose each other's entries.
+    pub fn update(guard: &RepoLock, paths: &Paths, change: impl FnOnce(&mut Self)) -> Result<()> {
+        let mut machine = Self::read(paths)?;
+        change(&mut machine);
+        config_repo::write_machine(guard, paths, &toml::to_string(&machine)?)
+    }
+
+    pub fn source(&self, project: &str, repo: &str) -> Option<&PathBuf> {
+        self.projects.get(project)?.repos.get(repo)?.source.as_ref()
+    }
+
+    pub fn set_source(&mut self, project: &str, repo: &str, source: PathBuf) {
+        self.projects
+            .entry(project.into())
+            .or_default()
+            .repos
+            .entry(repo.into())
+            .or_default()
+            .source = Some(source);
+    }
+
+    pub fn template_dir(&self, project: &str) -> Option<&PathBuf> {
+        self.projects.get(project)?.template_dir.as_ref()
+    }
+
+    pub fn set_template_dir(&mut self, project: &str, dir: PathBuf) {
+        self.projects
+            .entry(project.into())
+            .or_default()
+            .template_dir = Some(dir);
+    }
 }
 
 fn dev_home_under(local_base: &Path, worker: Option<&str>) -> PathBuf {
@@ -457,7 +640,6 @@ fn default_shell() -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub name: String,
     #[serde(rename = "match")]
@@ -496,6 +678,9 @@ pub struct ProjectConfig {
     pub onboarding: bool,
     #[serde(skip)]
     pub file: PathBuf,
+    /// Keys this build doesn't know, which a newer build on another machine may have written.
+    #[serde(skip_deserializing)]
+    pub warnings: Vec<String>,
 }
 
 fn default_no_rollup_into() -> Vec<String> {
@@ -511,7 +696,6 @@ fn default_session_cwd() -> String {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MatchRule {
     pub owner: Option<String>,
     #[serde(default)]
@@ -519,10 +703,15 @@ pub struct MatchRule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RepoConfig {
     pub name: String,
-    pub source: PathBuf,
+    /// The GitHub repo, `owner/name`.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// The main clone on this machine, from `machine.toml` (or a legacy `source` in the project
+    /// file that exists here). `None` when the repo isn't cloned on this machine.
+    #[serde(default)]
+    pub source: Option<PathBuf>,
     #[serde(default = "default_base")]
     pub base: String,
 }
@@ -531,8 +720,31 @@ fn default_base() -> String {
     "origin/main".into()
 }
 
+impl RepoConfig {
+    /// `owner/name` from the clone's origin, else the configured `repo`.
+    pub fn name_with_owner(&self) -> Result<String> {
+        let configured = || {
+            self.repo
+                .clone()
+                .with_context(|| format!("{} isn't cloned on this machine", self.name))
+        };
+        match &self.source {
+            Some(source) => {
+                git::origin_name_with_owner(source).or_else(|e| configured().or(Err(e)))
+            }
+            None => configured(),
+        }
+    }
+
+    pub fn not_cloned(&self) -> anyhow::Error {
+        anyhow::anyhow!(
+            "{} isn't cloned on this machine; clone it from the project Overview or run `tw project set-source`",
+            self.name
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StackConfig {
     pub compose_dir: String,
     #[serde(default)]
@@ -543,7 +755,6 @@ pub struct StackConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Hooks {
     #[serde(default)]
     pub setup: Vec<Hook>,
@@ -552,7 +763,6 @@ pub struct Hooks {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Hook {
     #[serde(default = "default_session_cwd")]
     pub cwd: String,
@@ -562,7 +772,6 @@ pub struct Hook {
 /// A long-running process a worker needs, such as a dev server, which Tworky starts on demand:
 /// opening a browser tab for an account whose start URL is on `port` starts it first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub name: String,
     #[serde(default = "default_session_cwd")]
@@ -593,7 +802,6 @@ pub enum HookCommand {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PerOsCommand {
     pub windows: Option<String>,
     pub unix: Option<String>,
@@ -632,7 +840,6 @@ impl HookCommand {
 /// A test account (persona) a session's browser can sign in as. Its password is in the OS
 /// credential store (`accounts::set_password`), never in the file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AccountConfig {
     pub name: String,
     #[serde(default)]
@@ -658,7 +865,11 @@ pub struct AccountConfig {
 pub struct Config {
     pub paths: Paths,
     pub app: AppConfig,
+    pub machine: MachineConfig,
     pub projects: Vec<ProjectConfig>,
+    /// Projects that didn't load, by their folder in the repo, so one broken project hides only
+    /// itself.
+    pub project_errors: BTreeMap<String, String>,
 }
 
 impl Config {
@@ -666,48 +877,41 @@ impl Config {
         Self::load_from(Paths::resolve()?)
     }
 
+    /// Fails only when `config.toml` can't be read or is invalid. A project that doesn't load is
+    /// left out and listed in `project_errors`.
     pub fn load_from(paths: Paths) -> Result<Self> {
-        let app = match std::fs::read_to_string(paths.app_config()) {
+        let app: AppConfig = match std::fs::read_to_string(paths.app_config()) {
             Ok(text) => toml::from_str(&text)
                 .with_context(|| format!("parsing {}", paths.app_config().display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppConfig::default(),
             Err(e) => return Err(e).context("reading app config"),
         };
+        validate_app(&app)?;
+        let machine = MachineConfig::read(&paths).unwrap_or_else(|e| {
+            eprintln!("ignoring machine.toml: {e:#}");
+            MachineConfig::default()
+        });
         let mut projects = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(paths.projects_dir()) {
-            let mut files: Vec<PathBuf> = entries
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-                .collect();
-            files.sort();
-            for file in files {
-                projects.push(load_project(&file)?);
+        let mut project_errors = BTreeMap::new();
+        for folder in project_folders(&paths) {
+            let file = paths.project_file(&folder);
+            if !file.exists() {
+                continue;
+            }
+            match load_project(&file, &folder, &machine, &app) {
+                Ok(project) => projects.push(project),
+                Err(e) => {
+                    project_errors.insert(folder, format!("{e:#}"));
+                }
             }
         }
-        let config = Self {
+        Ok(Self {
             paths,
             app,
+            machine,
             projects,
-        };
-        config.validate()?;
-        Ok(config)
-    }
-
-    fn validate(&self) -> Result<()> {
-        if self.app.port_stride == 0 || self.app.max_slots == 0 {
-            bail!("port_stride and max_slots must be greater than zero");
-        }
-        if self.app.shell.is_empty() || self.app.claude.is_empty() {
-            bail!("shell and claude commands must not be empty");
-        }
-        let mut names = std::collections::HashSet::new();
-        for p in &self.projects {
-            if !names.insert(p.name.as_str()) {
-                bail!("duplicate project name '{}'", p.name);
-            }
-            p.validate(&self.app)?;
-        }
-        Ok(())
+            project_errors,
+        })
     }
 
     pub fn project(&self, name: &str) -> Option<&ProjectConfig> {
@@ -743,21 +947,77 @@ impl Config {
         )
     }
 
+    /// `machine.toml`'s, else a legacy `template_dir` in the project file that exists on this
+    /// machine, else the project's folder under `templates/`.
     pub fn template_dir(&self, project: &ProjectConfig) -> PathBuf {
-        project
-            .template_dir
-            .clone()
+        self.machine
+            .template_dir(&project.name)
+            .cloned()
+            .or_else(|| project.template_dir.clone().filter(|d| d.exists()))
             .unwrap_or_else(|| self.paths.templates_dir().join(&project.name))
     }
 }
 
-fn load_project(path: &Path) -> Result<ProjectConfig> {
+fn validate_app(app: &AppConfig) -> Result<()> {
+    if app.port_stride == 0 || app.max_slots == 0 {
+        bail!("port_stride and max_slots must be greater than zero");
+    }
+    if app.shell.is_empty() || app.claude.is_empty() {
+        bail!("shell and claude commands must not be empty");
+    }
+    Ok(())
+}
+
+/// The folders under `repo/projects`, sorted.
+fn project_folders(paths: &Paths) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(paths.repo_projects_dir()) else {
+        return vec![];
+    };
+    let mut folders: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    folders.sort();
+    folders
+}
+
+fn load_project(
+    file: &Path,
+    folder: &str,
+    machine: &MachineConfig,
+    app: &AppConfig,
+) -> Result<ProjectConfig> {
     let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut project: ProjectConfig =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    project.file = path.to_path_buf();
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let (mut project, warnings) =
+        parse_project(&text).with_context(|| format!("parsing {}", file.display()))?;
+    if project.name != folder {
+        bail!(
+            "{} names the project '{}', but its folder is '{folder}'; rename one to match",
+            file.display(),
+            project.name
+        );
+    }
+    project.file = file.to_path_buf();
+    project.warnings = warnings;
+    for repo in &mut project.repos {
+        repo.source = machine
+            .source(&project.name, &repo.name)
+            .cloned()
+            .or_else(|| repo.source.take().filter(|s| s.exists()));
+    }
+    project.validate(app)?;
     Ok(project)
+}
+
+/// The project, plus a warning per key this build doesn't know.
+pub fn parse_project(text: &str) -> Result<(ProjectConfig, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let project = serde_ignored::deserialize(toml::Deserializer::parse(text)?, |key| {
+        warnings.push(format!("unknown key `{key}`, ignored"))
+    })?;
+    Ok((project, warnings))
 }
 
 impl ProjectConfig {
@@ -888,6 +1148,15 @@ pub fn is_subtask_type(project: Option<&ProjectConfig>, issue_type: Option<&str>
     }
 }
 
+/// Writes `toml` as project `name`'s `project.toml` in the config repo.
+#[cfg(test)]
+pub(crate) fn write_project(paths: &Paths, name: &str, toml: &str) -> PathBuf {
+    let file = paths.project_file(name);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, toml).unwrap();
+    file
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,10 +1174,19 @@ mod tests {
         }
     }
 
+    /// Project `acme`, or why it didn't load.
+    fn load_acme(paths: &Paths) -> Result<ProjectConfig> {
+        let config = Config::load_from(paths.clone())?;
+        match config.project("acme") {
+            Some(p) => Ok(p.clone()),
+            None => bail!("{}", config.project_errors["acme"]),
+        }
+    }
+
     #[test]
     fn creates_minimal_repo_projects_without_overwriting() {
         let dir = tempfile::tempdir().unwrap();
-        let p = paths(dir.path());
+        let p = config_repo::test_home(dir.path());
         let repo = |nwo: &str| NewRepo {
             name_with_owner: nwo.into(),
             source: dir.path().join("src").join(nwo),
@@ -922,6 +1200,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(name, "admin-portal");
+        assert_eq!(
+            config_repo::log_for_tests(&p)[0],
+            "Create project admin-portal"
+        );
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&p),
+            ["projects/admin-portal/project.toml"]
+        );
         let again = create_repo_project(&p, &[], &[repo("acme/Admin.Portal")], None).unwrap();
         assert_eq!(again, "admin-portal-2");
         assert_eq!(
@@ -934,46 +1220,228 @@ mod tests {
         );
         assert!(create_repo_project(&p, &[], &[repo("o/z")], Some(" / ")).is_err());
 
-        let config = Config::load_from(p).unwrap();
+        let text = std::fs::read_to_string(p.project_file("admin-portal")).unwrap();
+        assert!(!text.contains("source"), "{text}");
+        let config = Config::load_from(p.clone()).unwrap();
         let project = config.project_for_repo("acme/shared").unwrap();
         assert_eq!(project.name, "admin-portal");
         assert!(project.onboarding);
         assert_eq!(project.repos.len(), 2);
         assert_eq!(project.repos[1].name, "shared");
+        assert_eq!(project.repos[1].repo.as_deref(), Some("acme/shared"));
+        assert_eq!(
+            project.repos[1].source,
+            Some(dir.path().join("src").join("acme/shared"))
+        );
         assert_eq!(project.repos[0].base, "origin/develop");
         assert!(project.ports.is_empty() && project.stack.is_none());
-        assert!(create_repo_project(&paths(dir.path()), &[], &[], None).is_err());
+        assert!(create_repo_project(&p, &[], &[], None).is_err());
     }
 
     #[test]
     fn adds_a_repo_to_a_project_keeping_comments() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("acme.toml");
+        let p = config_repo::test_home(dir.path());
         let original = "# Acme\nname = \"acme\" # the name\n\n[match]\nowner = \"acme\"\n\n\
-                        [[repos]]\nname = \"api\" # main api\nsource = \"C:/src/api\"\n";
-        std::fs::write(&file, original).unwrap();
+                        [[repos]]\nname = \"api\" # main api\nrepo = \"acme/api\"\n";
+        let file = write_project(&p, "acme", original);
         let repo = |nwo: &str| NewRepo {
             name_with_owner: nwo.into(),
             source: PathBuf::from(format!("C:/src/{nwo}")),
             base: "origin/main".into(),
         };
-        add_repo_to_project(&file, &repo("other/web")).unwrap();
-        add_repo_to_project(&file, &repo("other/api")).unwrap();
-        add_repo_to_project(&file, &repo("other/web")).unwrap();
+        add_repo_to_project(&p, "acme", &repo("other/web")).unwrap();
+        assert_eq!(config_repo::log_for_tests(&p)[0], "Add other/web to acme");
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&p),
+            ["projects/acme/project.toml"]
+        );
+        add_repo_to_project(&p, "acme", &repo("other/api")).unwrap();
+        add_repo_to_project(&p, "acme", &repo("other/web")).unwrap();
+        add_repo_to_project(&p, "acme", &repo("acme/api")).unwrap();
 
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(
             text.contains("# Acme") && text.contains("# main api"),
             "{text}"
         );
-        let p: ProjectConfig = toml::from_str(&text).unwrap();
-        assert_eq!(p.match_rule.repos, ["other/web", "other/api"]);
-        let names: Vec<_> = p.repos.iter().map(|r| r.name.as_str()).collect();
+        assert!(!text.contains("source"), "{text}");
+        let project: ProjectConfig = toml::from_str(&text).unwrap();
+        assert_eq!(
+            project.match_rule.repos,
+            ["other/web", "other/api", "acme/api"]
+        );
+        let names: Vec<_> = project.repos.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["api", "web", "other-api"]);
+        let machine = MachineConfig::read(&p).unwrap();
+        assert_eq!(
+            machine.source("acme", "web"),
+            Some(&PathBuf::from("C:/src/other/web"))
+        );
+        assert_eq!(
+            machine.source("acme", "api"),
+            Some(&PathBuf::from("C:/src/acme/api")),
+            "a repo already listed but not cloned here gets the clone"
+        );
 
         std::fs::write(&file, "name = [").unwrap();
-        assert!(add_repo_to_project(&file, &repo("o/x")).is_err());
+        assert!(add_repo_to_project(&p, "acme", &repo("o/x")).is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "name = [");
+    }
+
+    #[test]
+    fn resolves_sources_from_machine_toml_then_an_existing_legacy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let here = dir.path().join("here");
+        let legacy_templates = dir.path().join("legacy-templates");
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&legacy_templates).unwrap();
+        let gone = dir.path().join("gone");
+        let toml = format!(
+            "name = \"acme\"\nmatch = {{ owner = \"acme\" }}\ntemplate_dir = '{}'\n\
+             [[repos]]\nname = \"mapped\"\nrepo = \"acme/mapped\"\nsource = '{}'\n\
+             [[repos]]\nname = \"legacy\"\nsource = '{}'\n\
+             [[repos]]\nname = \"moved\"\nsource = '{}'\n\
+             [[repos]]\nname = \"missing\"\nrepo = \"acme/missing\"\n",
+            legacy_templates.display(),
+            gone.display(),
+            here.display(),
+            gone.display(),
+        );
+        write_project(&p, "acme", &toml);
+        let machine_clone = dir.path().join("machine-clone");
+        std::fs::write(
+            p.machine_file(),
+            format!(
+                "[projects.acme.repos.mapped]\nsource = '{}'\n",
+                machine_clone.display()
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load_from(p.clone()).unwrap();
+        let acme = config.project("acme").unwrap();
+        let source = |name: &str| {
+            acme.repos
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .source
+                .clone()
+        };
+        assert_eq!(source("mapped"), Some(machine_clone), "machine.toml wins");
+        assert_eq!(source("legacy"), Some(here), "a legacy path that exists");
+        assert_eq!(source("moved"), None, "a legacy path that doesn't exist");
+        assert_eq!(source("missing"), None);
+        assert_eq!(config.template_dir(acme), legacy_templates);
+
+        let machine_templates = dir.path().join("machine-templates");
+        let guard = config_repo::with_lock(&p).unwrap();
+        MachineConfig::update(&guard, &p, |m| {
+            m.set_template_dir("acme", machine_templates.clone())
+        })
+        .unwrap();
+        drop(guard);
+        let config = Config::load_from(p.clone()).unwrap();
+        assert_eq!(
+            config.template_dir(config.project("acme").unwrap()),
+            machine_templates
+        );
+        assert!(
+            Config::load_from(p.clone())
+                .unwrap()
+                .project("acme")
+                .unwrap()
+                .repos[0]
+                .source
+                .is_some(),
+            "update kept the source it didn't touch"
+        );
+
+        std::fs::remove_dir_all(&legacy_templates).unwrap();
+        let toml = toml.replace(
+            &format!("template_dir = '{}'\n", legacy_templates.display()),
+            "",
+        );
+        write_project(&p, "acme", &toml);
+        std::fs::remove_file(p.machine_file()).unwrap();
+        let config = Config::load_from(p.clone()).unwrap();
+        assert_eq!(
+            config.template_dir(config.project("acme").unwrap()),
+            p.templates_dir().join("acme")
+        );
+    }
+
+    #[test]
+    fn a_broken_project_hides_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        write_project(&p, "acme", ACME);
+        write_project(&p, "beta", "name = [");
+        write_project(&p, "gamma", &ACME.replace("\"acme\"", "\"delta\""));
+        write_project(
+            &p,
+            "ports",
+            &ACME
+                .replace("\"acme\"", "\"ports\"")
+                .replace("4000", "65000"),
+        );
+        std::fs::create_dir_all(p.project_dir("memory-only")).unwrap();
+
+        let config = Config::load_from(p).unwrap();
+        let names: Vec<_> = config.projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["acme"]);
+        let errors: Vec<_> = config.project_errors.keys().map(String::as_str).collect();
+        assert_eq!(errors, ["beta", "gamma", "ports"]);
+        assert!(config.project_errors["beta"].contains("parsing"));
+        assert!(
+            config.project_errors["gamma"].contains("its folder is 'gamma'"),
+            "{}",
+            config.project_errors["gamma"]
+        );
+        assert!(config.project_errors["ports"].contains("overflows"));
+    }
+
+    #[test]
+    fn finds_clones_of_repos_with_no_source() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::config_repo::isolate_git_for_tests(dir.path());
+        let p = paths(dir.path());
+        let roots = dir.path().join("Source");
+        let clone = roots.join("acme").join("api");
+        std::fs::create_dir_all(&clone).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["remote", "add", "origin", "https://github.com/acme/api.git"],
+        ] {
+            crate::process::run("git", args, Some(&clone)).unwrap();
+        }
+        write(
+            &p.config_dir,
+            "config.toml",
+            &format!("source_roots = ['{}']\n", roots.display()),
+        );
+        write_project(
+            &p,
+            "acme",
+            "name = \"acme\"\nmatch = { owner = \"acme\" }\n\
+             [[repos]]\nname = \"api\"\nrepo = \"Acme/API\"\n\
+             [[repos]]\nname = \"web\"\nrepo = \"acme/web\"\n",
+        );
+        let config = Config::load_from(p.clone()).unwrap();
+        let found = find_sources(&config, None).unwrap();
+        assert_eq!(
+            found,
+            [FoundSource {
+                project: "acme".into(),
+                repo: "api".into(),
+                source: clone.clone(),
+            }]
+        );
+        let config = Config::load_from(p).unwrap();
+        assert_eq!(config.project("acme").unwrap().repos[0].source, Some(clone));
+        assert!(find_sources(&config, Some("acme")).unwrap().is_empty());
     }
 
     #[test]
@@ -992,23 +1460,23 @@ mod tests {
             .unwrap();
         assert_eq!(copied.len(), 2, "{copied:?}");
         assert_eq!(
-            std::fs::read_to_string(p.memory_file("acme")).unwrap(),
+            std::fs::read_to_string(p.legacy_memory_dir().join("acme.md")).unwrap(),
             "# Acme"
         );
-        assert!(p.projects_dir().join("acme.toml").exists());
+        assert!(p.legacy_projects_dir().join("acme.toml").exists());
         assert_eq!(std::fs::read_to_string(p.state_db()).unwrap(), "db");
         assert!(
             roaming.join("work-app/memory/acme.md").exists(),
             "kept as backup"
         );
 
-        std::fs::write(p.memory_file("acme"), "# edited").unwrap();
+        std::fs::write(p.legacy_memory_dir().join("acme.md"), "# edited").unwrap();
         let again = p
             .migrate_from(&roaming.join("work-app"), &local.join("work-app/state.db"))
             .unwrap();
         assert!(again.is_empty());
         assert_eq!(
-            std::fs::read_to_string(p.memory_file("acme")).unwrap(),
+            std::fs::read_to_string(p.legacy_memory_dir().join("acme.md")).unwrap(),
             "# edited"
         );
     }
@@ -1032,7 +1500,7 @@ mod tests {
         assert_eq!(cfg.app.workers_root, PathBuf::from("D:\\w-dev"));
         assert_eq!(cfg.app.port_stride, 50);
         assert!(cfg.project("acme").is_none());
-        assert!(!dev.projects_dir().exists());
+        assert!(!dev.repo_dir().exists());
         assert!(!dev.state_db().exists());
 
         std::fs::write(dev.app_config(), "port_stride = 7\n").unwrap();
@@ -1084,7 +1552,7 @@ api = 4000
     #[test]
     fn loads_defaults_and_projects() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "config/projects/acme.toml", ACME);
+        write_project(&paths(dir.path()), "acme", ACME);
         let cfg = Config::load_from(paths(dir.path())).unwrap();
         assert_eq!(cfg.app.port_stride, 100);
         let p = cfg.project("acme").unwrap();
@@ -1113,12 +1581,8 @@ run = "npm run worker"
 "#;
         let load = |extra: &str| {
             let dir = tempfile::tempdir().unwrap();
-            write(
-                dir.path(),
-                "config/projects/acme.toml",
-                &format!("{ACME}{extra}"),
-            );
-            Config::load_from(paths(dir.path())).map(|c| c.project("acme").unwrap().clone())
+            write_project(&paths(dir.path()), "acme", &format!("{ACME}{extra}"));
+            load_acme(&paths(dir.path()))
         };
         let p = load(services).unwrap();
         let order: Vec<_> = p
@@ -1144,10 +1608,10 @@ run = "npm run worker"
     #[test]
     fn routes_by_repo_before_owner() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "config/projects/acme.toml", ACME);
-        write(
-            dir.path(),
-            "config/projects/ops.toml",
+        write_project(&paths(dir.path()), "acme", ACME);
+        write_project(
+            &paths(dir.path()),
+            "ops",
             "name = \"ops\"\nmatch = { repos = [\"acme/operations\"] }\n[[repos]]\nname = \"ops\"\nsource = 'C:\\ops'\n",
         );
         let cfg = Config::load_from(paths(dir.path())).unwrap();
@@ -1159,14 +1623,16 @@ run = "npm run worker"
     #[test]
     fn example_projects_load() {
         let dir = tempfile::tempdir().unwrap();
-        write(
-            dir.path(),
-            "config/projects/acme.toml",
+        write_project(
+            &paths(dir.path()),
+            "acme",
             include_str!("../../../examples/acme/acme.toml"),
         );
         let cfg = Config::load_from(paths(dir.path())).unwrap();
         let acme = cfg.project("acme").unwrap();
         assert_eq!(acme.repos.len(), 2);
+        assert!(acme.warnings.is_empty(), "{:?}", acme.warnings);
+        assert_eq!(acme.repos[0].repo.as_deref(), Some("acme/acme-api"));
         assert_eq!(acme.stack.as_ref().unwrap().compose_dir, "acme-api");
         assert_eq!(acme.accounts[0].start_service.as_deref(), Some("web"));
         let service = |name: &str| acme.services.iter().find(|s| s.name == name).unwrap();
@@ -1193,13 +1659,15 @@ run = "npm run worker"
     #[test]
     fn tworky_example_loads() {
         let dir = tempfile::tempdir().unwrap();
-        write(
-            dir.path(),
-            "config/projects/tworky.toml",
+        write_project(
+            &paths(dir.path()),
+            "tworky",
             include_str!("../../../examples/tworky/tworky.toml"),
         );
         let cfg = Config::load_from(paths(dir.path())).unwrap();
         let p = cfg.project("tworky").unwrap();
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(p.repos[0].repo.as_deref(), Some("tristanmenzel/Tworky"));
         assert_eq!(p.ports["vite"], 1420);
         assert_eq!(p.services[0].port.as_deref(), Some("vite"));
         for os in ["windows", "macos", "linux"] {
@@ -1212,20 +1680,28 @@ run = "npm run worker"
     }
 
     #[test]
-    fn rejects_overflowing_ports_and_unknown_keys() {
+    fn reports_overflowing_ports_and_warns_about_unknown_keys() {
         let dir = tempfile::tempdir().unwrap();
-        write(
-            dir.path(),
-            "config/projects/acme.toml",
-            &ACME.replace("4000", "65000"),
+        let p = paths(dir.path());
+        write_project(&p, "acme", &ACME.replace("4000", "65000"));
+        let err = load_acme(&p).unwrap_err();
+        assert!(err.to_string().contains("overflows"), "{err:#}");
+
+        write_project(
+            &p,
+            "acme",
+            &format!(
+                "bogus = 1\n{ACME}[[services]]\nname = \"web\"\nrun = \"vite\"\nfuture = true\n"
+            ),
         );
-        assert!(Config::load_from(paths(dir.path())).is_err());
-        write(
-            dir.path(),
-            "config/projects/acme.toml",
-            &format!("bogus = 1\n{ACME}"),
+        let acme = load_acme(&p).unwrap();
+        assert_eq!(
+            acme.warnings,
+            [
+                "unknown key `bogus`, ignored",
+                "unknown key `services.0.future`, ignored"
+            ]
         );
-        assert!(Config::load_from(paths(dir.path())).is_err());
     }
 
     #[test]
@@ -1240,11 +1716,7 @@ run = { windows = "npm ci; if ($LASTEXITCODE) { exit $LASTEXITCODE }", unix = "n
 [[hooks.teardown]]
 run = { windows = "echo bye" }
 "#;
-        write(
-            dir.path(),
-            "config/projects/acme.toml",
-            &format!("{ACME}{hooks}"),
-        );
+        write_project(&paths(dir.path()), "acme", &format!("{ACME}{hooks}"));
         let cfg = Config::load_from(paths(dir.path())).unwrap();
         let h = &cfg.project("acme").unwrap().hooks;
         assert_eq!(h.setup[0].run.for_os("linux"), Some("npm ci"));
@@ -1264,12 +1736,12 @@ run = { windows = "echo bye" }
         assert_eq!(h.teardown[0].run.for_os("macos"), None);
 
         for bad in ["run = {}", "run = { solaris = \"x\" }", "run = \"  \""] {
-            write(
-                dir.path(),
-                "config/projects/acme.toml",
+            write_project(
+                &paths(dir.path()),
+                "acme",
                 &format!("{ACME}[[hooks.setup]]\n{bad}\n"),
             );
-            assert!(Config::load_from(paths(dir.path())).is_err(), "{bad}");
+            assert!(load_acme(&paths(dir.path())).is_err(), "{bad}");
         }
     }
 }

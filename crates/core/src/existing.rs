@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -195,6 +196,7 @@ pub(crate) fn plan_lookups(
 
 fn branch_work(
     repo: &RepoConfig,
+    source: &Path,
     name_with_owner: Option<String>,
     branch: String,
     at: BranchRefs,
@@ -207,23 +209,23 @@ fn branch_work(
     } else {
         remote_rev.clone()
     };
-    let (mut ahead, behind) = git::ahead_behind(&repo.source, &repo.base, &rev)
+    let (mut ahead, behind) = git::ahead_behind(source, &repo.base, &rev)
         .map(|(a, b)| (Some(a), Some(b)))
         .unwrap_or((None, None));
     if at.local
         && at.remote
-        && let Ok((remote_ahead, _)) = git::ahead_behind(&repo.source, &repo.base, &remote_rev)
+        && let Ok((remote_ahead, _)) = git::ahead_behind(source, &repo.base, &remote_rev)
     {
         ahead = Some(ahead.map_or(remote_ahead, |a| a.max(remote_ahead)));
     }
     let unpushed = (at.local && at.remote)
-        .then(|| git::count(&repo.source, &format!("origin/{branch}..{branch}")).ok())
+        .then(|| git::count(source, &format!("origin/{branch}..{branch}")).ok())
         .flatten();
     BranchWork {
         repo: repo.name.clone(),
         name_with_owner,
         worker,
-        last_commit: git::last_commit(&repo.source, &rev).ok(),
+        last_commit: git::last_commit(source, &rev).ok(),
         branch,
         local: at.local,
         remote: at.remote,
@@ -284,17 +286,22 @@ pub fn existing_work(
         }
     };
 
-    let configs = project.map(|p| p.repos.as_slice()).unwrap_or_default();
+    let configs: Vec<(&RepoConfig, &Path)> = project
+        .map(|p| p.repos.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| Some((r, r.source.as_deref()?)))
+        .collect();
     let repos: Vec<RepoBranches> = configs
         .iter()
-        .map(|repo| {
+        .map(|(repo, source)| {
             if fetch {
-                let _ = git::fetch(&repo.source);
+                let _ = git::fetch(source);
             }
             RepoBranches {
                 name: repo.name.clone(),
-                name_with_owner: git::origin_name_with_owner(&repo.source).ok(),
-                branches: git::branches(&repo.source).unwrap_or_default(),
+                name_with_owner: git::origin_name_with_owner(source).ok(),
+                branches: git::branches(source).unwrap_or_default(),
             }
         })
         .collect();
@@ -329,7 +336,8 @@ pub fn existing_work(
             .get(&(repo_name.as_str(), branch.as_str()))
             .map(|w| w.to_string());
         let b = branch_work(
-            &configs[i],
+            configs[i].0,
+            configs[i].1,
             repos[i].name_with_owner.clone(),
             branch.clone(),
             repos[i].branches[&branch],
@@ -424,18 +432,19 @@ pub fn delete_branch(
     if branch == base {
         bail!("{branch} is the base branch of {repo_name}");
     }
-    if let Some((path, _)) = git::checked_out_branches(&repo.source)?
+    let source = repo.source.as_deref().ok_or_else(|| repo.not_cloned())?;
+    if let Some((path, _)) = git::checked_out_branches(source)?
         .into_iter()
         .find(|(_, b)| b == branch)
     {
         bail!("{branch} is checked out in {path}; switch that worktree away from it first");
     }
-    let at = git::branches(&repo.source)?
+    let at = git::branches(source)?
         .get(branch)
         .copied()
         .with_context(|| format!("{branch} no longer exists in {repo_name}"))?;
     if at.remote
-        && let Ok(nwo) = git::origin_name_with_owner(&repo.source)
+        && let Ok(nwo) = git::origin_name_with_owner(source)
         && let Some(number) = open_pr(&nwo, branch)?
     {
         bail!(
@@ -444,11 +453,11 @@ pub fn delete_branch(
     }
     let mut deleted = Vec::new();
     if at.remote {
-        git::delete_remote_branch(&repo.source, branch)?;
+        git::delete_remote_branch(source, branch)?;
         deleted.push(format!("origin/{branch}"));
     }
     if at.local {
-        git::delete_local_branch(&repo.source, branch)?;
+        git::delete_local_branch(source, branch)?;
         deleted.push(format!("local {branch}"));
     }
     Ok(deleted)
@@ -1176,6 +1185,7 @@ mod tests {
         };
         let b = branch_work(
             &project.repos[0],
+            &repo,
             None,
             "feat/x-318".into(),
             at,

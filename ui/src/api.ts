@@ -307,7 +307,8 @@ export interface ProjectSummary {
   context_types: string[]
   branch: string
   session_cwd: string
-  repos: { name: string; source: string; base: string }[]
+  /** `repo` is the GitHub `owner/name`; `source` is null when the repo isn't cloned on this machine. */
+  repos: { name: string; repo: string | null; source: string | null; base: string }[]
   ports: Record<string, number>
   stack: { compose_dir: string; compose_files: string[]; env_file: string | null; profiles: string[] } | null
   hooks: { setup: { cwd: string; run: Command }[]; teardown: { cwd: string; run: Command }[] }
@@ -317,6 +318,8 @@ export interface ProjectSummary {
   notes: string
   status_board: number | null
   onboarding: boolean
+  /** Keys in the project file this build doesn't know. */
+  warnings: string[]
   /** The id its setup session's terminal runs under. */
   setup_session: string
   setup_alive: boolean
@@ -325,6 +328,12 @@ export interface ProjectSummary {
 
 /** A command for every OS, or one per OS. */
 export type Command = string | Partial<Record<'windows' | 'unix' | 'macos' | 'linux', string>>
+
+export interface FoundSource {
+  project: string
+  repo: string
+  source: string
+}
 
 export interface Service {
   name: string
@@ -474,6 +483,10 @@ export const api = {
   keepAwakeStatus: () => invoke<KeepAwakeStatus>('keep_awake_status'),
   setKeepAwake: (mode: KeepAwakeMode) => invoke<void>('set_keep_awake', { mode }),
   projects: () => invoke<ProjectSummary[]>('list_projects'),
+  /** Projects that didn't load, by folder, with why. */
+  projectErrors: () => invoke<Record<string, string>>('list_project_errors'),
+  cloneProjectRepo: (project: string, repo: string) => invoke<string>('clone_project_repo', { project, repo }),
+  findProjectClones: (project: string) => invoke<FoundSource[]>('find_project_clones', { project }),
   browserTabs: () => invoke<BrowserTabView[]>('browser_tabs'),
   browserOpen: (worker: string, account: string | null, url: string | null = null) =>
     invoke<number>('browser_open', { worker, account, url }),
