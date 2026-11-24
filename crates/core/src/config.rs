@@ -160,8 +160,10 @@ pub fn notify_issues_changed(paths: &Paths) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    std::fs::write(&marker, stamp.to_string())
-        .with_context(|| format!("writing {}", marker.display()))
+    let temp = marker.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, stamp.to_string())
+        .with_context(|| format!("writing {}", temp.display()))?;
+    std::fs::rename(&temp, &marker).with_context(|| format!("replacing {}", marker.display()))
 }
 
 /// A repo for a project made from the Repositories picker.

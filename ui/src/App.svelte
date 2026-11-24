@@ -619,9 +619,24 @@
     }
   }
 
+  async function applyIssuesWrite(write: () => Promise<IssuesPayload>) {
+    const request = ++issuesRequest
+    const overlapped = issuesRunning !== null
+    try {
+      const loaded = await write()
+      if (request > issuesApplied) {
+        issuesApplied = request
+        payload = loaded
+      }
+    } finally {
+      // The running refresh read GitHub before the write and will store that in the backend's index.
+      if (overlapped) loadIssues(true, false)
+    }
+  }
+
   async function assign(issueId: string) {
     try {
-      payload = await api.assign(issueId)
+      await applyIssuesWrite(() => api.assign(issueId))
     } catch (e) {
       showError(String(e))
     }
@@ -629,7 +644,7 @@
 
   async function setBoardStatus(issueId: string, projectId: string, optionId: string) {
     try {
-      payload = await api.setBoardStatus(issueId, projectId, optionId)
+      await applyIssuesWrite(() => api.setBoardStatus(issueId, projectId, optionId))
     } catch (e) {
       showError(String(e))
       throw e
@@ -638,7 +653,7 @@
 
   async function setIssueState(issueId: string, state: IssueState) {
     try {
-      payload = await api.setIssueState(issueId, state)
+      await applyIssuesWrite(() => api.setIssueState(issueId, state))
     } catch (e) {
       showError(String(e))
       throw e
