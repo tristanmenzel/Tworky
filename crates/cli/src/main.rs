@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
-use tworky_core::config::Paths;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use tworky_core::config::{Os, Paths};
 use tworky_core::feedback;
 use tworky_core::github;
 use tworky_core::hierarchy::{IssueIndex, IssueNode};
@@ -60,6 +60,9 @@ enum Command {
     /// Configured projects, and the checks a project setup session runs
     #[command(subcommand)]
     Project(ProjectCommand),
+    /// The config repo, and its sync with a remote
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// Record what this worker's Claude is doing (working, idle or waiting). Run by session hooks.
     SessionState {
         activity: tworky_core::activity::Activity,
@@ -157,6 +160,21 @@ enum ProjectCommand {
     },
     /// Mark a new project as set up, once its config has been tested on a scratch item
     Done(NamedProject),
+    /// Record where a repo of the project is cloned on this machine, in machine.toml
+    SetSource {
+        /// The repo's name in [[repos]]
+        #[arg(required_unless_present = "scan")]
+        repo: Option<String>,
+        /// Its clone on this machine
+        #[arg(required_unless_present = "scan")]
+        path: Option<std::path::PathBuf>,
+        /// Instead, look under the source roots for clones of repos with no source, in PROJECT or
+        /// every project
+        #[arg(long, value_name = "PROJECT", num_args = 0..=1, conflicts_with_all = ["repo", "path"])]
+        scan: Option<Option<String>>,
+        #[command(flatten)]
+        project: ProjectArg,
+    },
 }
 
 /// A project named as an argument, or by `--project` and its defaults.
@@ -229,9 +247,32 @@ enum AccountsCommand {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum OsName {
+    Windows,
+    Macos,
+    Linux,
+}
+
+impl From<OsName> for Os {
+    fn from(os: OsName) -> Self {
+        match os {
+            OsName::Windows => Os::Windows,
+            OsName::Macos => Os::Macos,
+            OsName::Linux => Os::Linux,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum MemoryCommand {
-    Show(ProjectArg),
+    Show {
+        /// Show that OS's memory instead of the shared one
+        #[arg(long, value_enum)]
+        os: Option<OsName>,
+        #[command(flatten)]
+        project: ProjectArg,
+    },
     /// Propose a fact, attributed to this session and dated. It lands once approved in Tworky.
     Add {
         #[arg(allow_hyphen_values = true)]
@@ -239,6 +280,9 @@ enum MemoryCommand {
         /// Heading to file it under
         #[arg(long, short, default_value = tworky_core::memory::DEFAULT_SECTION)]
         section: String,
+        /// Target that OS's memory instead of the shared one
+        #[arg(long, value_enum)]
+        os: Option<OsName>,
         #[command(flatten)]
         project: ProjectArg,
     },
@@ -255,6 +299,9 @@ enum MemoryCommand {
         /// Read the replacement from a file, or from stdin with `-`
         #[arg(long)]
         new_file: Option<String>,
+        /// Target that OS's memory instead of the shared one
+        #[arg(long, value_enum)]
+        os: Option<OsName>,
         #[command(flatten)]
         project: ProjectArg,
     },
@@ -263,6 +310,9 @@ enum MemoryCommand {
     Remove {
         #[arg(allow_hyphen_values = true)]
         text: String,
+        /// Target that OS's memory instead of the shared one
+        #[arg(long, value_enum)]
+        os: Option<OsName>,
         #[command(flatten)]
         project: ProjectArg,
     },
@@ -393,6 +443,41 @@ enum ServiceCommand {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommand {
+    /// Show the config repo's state and its sync with the remote
+    Status,
+    /// Sync with the remote now, resuming a sync that stopped once it's fixed in the sync worktree
+    Sync,
+    /// Abort the rebase or merge a stopped sync left in the sync worktree. Background syncs then
+    /// wait for the next `tw config sync`, which starts over and discards anything else left
+    /// uncommitted there
+    Abort,
+    #[command(subcommand)]
+    Remote(RemoteCommand),
+}
+
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// Sync with this remote: a URL, path or GitHub owner/name. A config repo with no history of
+    /// its own takes the remote's; one with history joins it, merging the two.
+    Set {
+        url: String,
+        /// Use a public repo, or one whose visibility can't be checked, without asking
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Create a private tworky-config repo on GitHub (tworky-config-dev for a debug build), then
+    /// sync with it
+    Create {
+        /// The account or organisation to create it under; defaults to yours
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Stop syncing and forget the remote
+    Rm,
+}
+
+#[derive(Subcommand)]
 enum WorktreeCommand {
     /// Add a worktree for a project repo and render its worker config
     Add {
@@ -422,18 +507,31 @@ fn main() -> Result<()> {
         // SAFETY: no other threads exist yet.
         unsafe { std::env::set_var("TW_WORKER_ID", id) };
     }
-    for line in Paths::resolve()?.migrate_legacy()? {
+    let paths = Paths::resolve()?;
+    for line in paths.migrate_legacy()? {
         eprintln!("{line}");
     }
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    if !matches!(
+        command,
+        Command::SessionState { .. } | Command::SessionPhase { .. }
+    ) {
+        match paths.migrate_to_repo() {
+            Ok(lines) => lines.iter().for_each(|line| eprintln!("{line}")),
+            Err(e) => eprintln!("{e:#}"),
+        }
+    }
+    match command {
         Command::Issues { json } => issues(json),
         Command::Paths => {
             let p = Paths::resolve()?;
             println!("config:    {}", p.app_config().display());
-            println!("projects:  {}", p.projects_dir().display());
+            println!("repo:      {}", p.repo_dir().display());
+            println!("machine:   {}", p.machine_file().display());
+            println!("projects:  {}", p.project_dir("<project>").display());
             println!("templates: {}", p.templates_dir().display());
             println!("state:     {}", p.state_db().display());
-            println!("memory:    {}", p.memory_file("<project>").display());
+            println!("memory:    {}", p.memory_file("<project>", None).display());
             Ok(())
         }
         Command::Work { url, fetch, json } => work(&url, fetch, json),
@@ -477,6 +575,7 @@ fn main() -> Result<()> {
         Command::Issue(cmd) => issue(cmd),
         Command::Item(cmd) => item(cmd),
         Command::Project(cmd) => project(cmd),
+        Command::Config(cmd) => config(&paths, cmd),
     }
 }
 
@@ -561,16 +660,242 @@ fn apply_session_change(paths: &Paths, id: &str, change: SessionChange) -> Resul
     }
 }
 
+fn config(paths: &Paths, cmd: ConfigCommand) -> Result<()> {
+    use tworky_core::config_repo::{self, Trigger};
+    refuse_config_in_session(&cmd, |var| std::env::var_os(var).is_some())?;
+    let status = matches!(cmd, ConfigCommand::Status);
+    let record = match cmd {
+        ConfigCommand::Status => {
+            let status = config_repo::status(paths)?;
+            println!("repo:    {}", paths.repo_dir().display());
+            println!(
+                "remote:  {}",
+                config_repo::remote_url(paths)
+                    .map(|url| config_repo::redact_url(&url))
+                    .unwrap_or_else(|| "none".into())
+            );
+            if let Some(visibility) = status.sync.visibility {
+                println!(
+                    "visible: {} when it was set",
+                    format!("{visibility:?}").to_lowercase()
+                );
+            }
+            if let Some((ahead, behind)) = status.ahead_behind {
+                println!("main:    {ahead} ahead, {behind} behind the remote");
+            }
+            if !status.changes.is_empty() {
+                println!("uncommitted: {}", status.changes.join(", "));
+            }
+            if status.stale_index_lock {
+                println!(
+                    "warning: a git command that was stopped left an index.lock behind in the config repo or its sync worktree; delete it if no git is running there"
+                );
+            }
+            status.sync
+        }
+        ConfigCommand::Sync => config_repo::sync(paths, Trigger::User)?,
+        ConfigCommand::Abort => config_repo::abort(paths)?,
+        ConfigCommand::Remote(RemoteCommand::Set { url, yes }) => {
+            let check = config_repo::check_remote(&config_repo::Gh, &url)?;
+            print_warnings(&check.warnings);
+            if check.needs_confirmation
+                && !yes
+                && !confirm(&format!(
+                    "{}. Sync your config with it anyway?",
+                    check.risk()
+                ))?
+            {
+                anyhow::bail!("not syncing with {}", config_repo::redact_url(&check.url));
+            }
+            config_repo::connect_remote(
+                paths,
+                &config_repo::Gh,
+                &check.url,
+                Some(config_repo::Seen::of(&check)),
+            )?
+            .sync
+        }
+        ConfigCommand::Remote(RemoteCommand::Create { owner }) => {
+            let created = config_repo::create_remote(paths, &config_repo::Gh, owner.as_deref())?;
+            println!("remote:  {}", config_repo::redact_url(&created.check.url));
+            print_warnings(&created.check.warnings);
+            created.sync
+        }
+        ConfigCommand::Remote(RemoteCommand::Rm) => config_repo::remove_remote(paths)?,
+    };
+    let stopped = print_sync(paths, &record);
+    anyhow::ensure!(status || !stopped, "the config sync is stopped");
+    Ok(())
+}
+
+fn print_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+fn refuse_config_in_session(cmd: &ConfigCommand, is_set: impl Fn(&str) -> bool) -> Result<()> {
+    match cmd {
+        ConfigCommand::Remote(_) => refuse_in_session(
+            "change the config's remote",
+            "the user changes it in Tworky's Settings › Remote",
+            is_set,
+        ),
+        ConfigCommand::Abort => refuse_in_session(
+            "abort the config sync",
+            "the user aborts it in Tworky's Settings › Sync",
+            is_set,
+        ),
+        ConfigCommand::Status | ConfigCommand::Sync => Ok(()),
+    }
+}
+
+/// Stops a Claude in a Tworky session doing what only the user should, such as changing the
+/// config's remote or aborting a sync the user is resolving.
+fn refuse_in_session(action: &str, instead: &str, is_set: impl Fn(&str) -> bool) -> Result<()> {
+    let session = [
+        "TW_WORKER_ID",
+        "WA_WORKER_ID",
+        "TW_SETUP_SESSION",
+        tworky_core::settings_session::ENV_MARKER,
+    ]
+    .iter()
+    .any(|var| is_set(var));
+    anyhow::ensure!(!session, "a Tworky session can't {action}; {instead}");
+    Ok(())
+}
+
+/// Fails when there's no terminal to ask on.
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("{question} This needs confirming, and there's no terminal to ask on");
+    }
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Returns whether the sync is stopped.
+fn print_sync(paths: &Paths, record: &tworky_core::config_repo::SyncRecord) -> bool {
+    use tworky_core::config_repo::{HeldBackCause, SyncState};
+    let files = |files: &[String]| files.join(", ");
+    let worktree = paths.repo_sync_dir();
+    let (line, stopped) = match &record.state {
+        SyncState::Idle if record.paused => (
+            "paused: the last sync was aborted; `tw config sync` starts over".to_string(),
+            false,
+        ),
+        SyncState::Idle => ("idle".to_string(), false),
+        SyncState::Syncing => ("syncing".to_string(), false),
+        SyncState::NoRemote => ("no remote".to_string(), false),
+        SyncState::UnconfirmedRemote { url } => (
+            format!(
+                "stopped: the remote {url} wasn't connected through Tworky, so nothing syncs with it; connect it in Tworky's Settings › Remote, or remove it"
+            ),
+            true,
+        ),
+        SyncState::Conflict { files: f } if record.paused => (
+            format!(
+                "paused after a conflict in {}; `tw config sync` starts over",
+                files(f)
+            ),
+            true,
+        ),
+        SyncState::Conflict { files: f } => (
+            format!(
+                "conflict in {}; resolve it in {} and run `tw config sync`",
+                files(f),
+                worktree.display()
+            ),
+            true,
+        ),
+        SyncState::HeldBack {
+            files: f,
+            cause: HeldBackCause::Unrecognised,
+        } => (
+            format!(
+                "held back: the remote's {} are valid TOML but not project config this tw understands, most likely written by a newer Tworky; update Tworky, or fix and commit them in {} if they're wrong, then run `tw config sync`",
+                files(f),
+                worktree.display()
+            ),
+            true,
+        ),
+        SyncState::HeldBack { files: f, .. } => (
+            format!(
+                "held back: the remote's {} don't parse; fix and commit them in {}, then run `tw config sync`",
+                files(f),
+                worktree.display()
+            ),
+            true,
+        ),
+        SyncState::BlockedByLocal { files: f } => (
+            format!(
+                "blocked: uncommitted local {} would be overwritten by incoming changes; fix or remove them",
+                files(f)
+            ),
+            true,
+        ),
+        SyncState::HeldInSyncWorktree { files: f } => (
+            format!(
+                "held: {} in {} have uncommitted changes; commit them to carry on, or run `tw config abort` and `tw config sync` to discard them",
+                files(f),
+                worktree.display()
+            ),
+            true,
+        ),
+        SyncState::Error { message } => (format!("failed: {message}"), true),
+    };
+    println!("sync:    {line}");
+    if let Some(secs) = record.last_sync {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(secs);
+        println!("last:    {} min ago", now.saturating_sub(secs) / 60);
+    }
+    if !record.incoming.hooks_or_services.is_empty() {
+        println!(
+            "incoming hooks or services in: {}",
+            record.incoming.hooks_or_services.join(", ")
+        );
+    }
+    if !record.incoming.guidance.is_empty() {
+        println!(
+            "incoming guidance or memory: {}",
+            record.incoming.guidance.join(", ")
+        );
+    }
+    if !record.incoming.dropped.is_empty() {
+        println!(
+            "warning: resolving a conflict left out this machine's commits: {}",
+            record.incoming.dropped.join("; ")
+        );
+    }
+    stopped
+}
+
 fn project(cmd: ProjectCommand) -> Result<()> {
     use tworky_core::project_setup::{self, Level};
     let ws = Workspace::open()?;
     let named = |arg: &ProjectArg| -> Result<tworky_core::config::ProjectConfig> {
         let name = project_name(&ws, arg)?;
+        if let Some(error) = ws.config.project_errors.get(&name) {
+            anyhow::bail!("{name} doesn't load: {error}");
+        }
         ws.config
             .project(&name)
             .cloned()
             .with_context(|| format!("no project called {name}"))
     };
+    if matches!(cmd, ProjectCommand::Ls | ProjectCommand::Check(_)) {
+        report_config_problems(&ws.config);
+    }
     match cmd {
         ProjectCommand::Ls => {
             for p in &ws.config.projects {
@@ -582,6 +907,9 @@ fn project(cmd: ProjectCommand) -> Result<()> {
                 };
                 println!("{:<16} {}{state}", p.name, repos.join(", "));
             }
+            for (folder, error) in &ws.config.project_errors {
+                println!("{folder:<16} doesn't load: {error}");
+            }
         }
         ProjectCommand::Show(arg) => {
             let arg = arg.into_arg();
@@ -590,17 +918,27 @@ fn project(cmd: ProjectCommand) -> Result<()> {
                 println!("{label:<14} {value}");
             }
             for r in &p.repos {
+                let at = match &r.source {
+                    Some(source) => format!("at {}", source.display()),
+                    None => "not cloned".into(),
+                };
+                let github = r.repo.as_deref().unwrap_or("no repo");
                 println!(
-                    "repo           {} at {} (base {})",
-                    r.name,
-                    r.source.display(),
-                    r.base
+                    "repo           {} ({github}) {at} (base {})",
+                    r.name, r.base
                 );
             }
         }
         ProjectCommand::Check(arg) => {
             let arg = arg.into_arg();
             let p = named(&arg)?;
+            let reloaded;
+            let ws = if report_found_sources(&ws, Some(&p.name))? {
+                reloaded = Workspace::open()?;
+                &reloaded
+            } else {
+                &ws
+            };
             let findings = ws.check_project(&p.name)?;
             for f in &findings {
                 let tag = match f.level {
@@ -620,6 +958,50 @@ fn project(cmd: ProjectCommand) -> Result<()> {
             ws.add_repo_to_project(&p.name, &repo)?;
             println!("added {repo} to {}", p.name);
         }
+        ProjectCommand::SetSource {
+            repo,
+            path,
+            scan,
+            project,
+        } => match (scan, repo, path) {
+            (Some(only), _, _) => {
+                if let Some(name) = &only
+                    && ws.config.project(name).is_none()
+                {
+                    anyhow::bail!("no project called {name}");
+                }
+                if !report_found_sources(&ws, only.as_deref())? {
+                    println!("found no new clones under the source roots");
+                }
+            }
+            (None, Some(repo), Some(path)) => {
+                let p = named(&project)?;
+                let entry = p
+                    .repos
+                    .iter()
+                    .find(|r| r.name.eq_ignore_ascii_case(&repo))
+                    .with_context(|| format!("{} has no repo called {repo}", p.name))?;
+                let path = std::path::absolute(&path)?;
+                if !path.is_dir() {
+                    anyhow::bail!("{} isn't a folder", path.display());
+                }
+                if let Some(nwo) = &entry.repo {
+                    match tworky_core::git::origin_name_with_owner(&path) {
+                        Ok(origin) if origin.eq_ignore_ascii_case(nwo) => {}
+                        Ok(origin) => {
+                            eprintln!(
+                                "warning: {} is a clone of {origin}, not {nwo}",
+                                path.display()
+                            )
+                        }
+                        Err(e) => eprintln!("warning: {e:#}"),
+                    }
+                }
+                tworky_core::config::set_source(&ws.config.paths, &p.name, &entry.name, &path)?;
+                println!("{} of {} is at {}", entry.name, p.name, path.display());
+            }
+            _ => anyhow::bail!("give a repo and its path, or --scan"),
+        },
         ProjectCommand::Done(arg) => {
             let arg = arg.into_arg();
             let p = named(&arg)?;
@@ -628,6 +1010,51 @@ fn project(cmd: ProjectCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn report_config_problems(config: &tworky_core::config::Config) {
+    for error in &config.load_errors {
+        println!("error: {error}");
+    }
+    if !config.paths.has_repo() {
+        return;
+    }
+    match tworky_core::config_repo::status(&config.paths) {
+        Ok(status) => {
+            if status.stale_index_lock {
+                println!(
+                    "error: {} is left from a git command that was stopped, and stops every commit to the config repo; delete it if no git is running there",
+                    config
+                        .paths
+                        .repo_dir()
+                        .join(".git")
+                        .join("index.lock")
+                        .display()
+                );
+            }
+            if !status.changes.is_empty() {
+                println!(
+                    "warning: uncommitted changes in the config repo: {} (Tworky commits them on its next sweep, unless a project.toml doesn't parse)",
+                    status.changes.join(", ")
+                );
+            }
+        }
+        Err(e) => println!("error: couldn't read the config repo's status: {e:#}"),
+    }
+}
+
+/// Also records each clone found. Returns whether it found any.
+fn report_found_sources(ws: &Workspace, project: Option<&str>) -> Result<bool> {
+    let found = tworky_core::config::find_sources(&ws.config, project)?;
+    for f in &found {
+        println!(
+            "found {} of {} at {}",
+            f.repo,
+            f.project,
+            f.source.display()
+        );
+    }
+    Ok(!found.is_empty())
 }
 
 fn item(cmd: ItemCommand) -> Result<()> {
@@ -815,7 +1242,7 @@ fn accounts(cmd: AccountsCommand) -> Result<()> {
                 login_origins,
                 color,
             };
-            accounts::save_account(p, previous, &account)?;
+            accounts::save_account(&ws.config.paths, p, previous, &account)?;
             println!("saved {name} in {}", p.file.display());
         }
         AccountsCommand::Rm { name, project: arg } => {
@@ -823,7 +1250,7 @@ fn accounts(cmd: AccountsCommand) -> Result<()> {
             if !p.accounts.iter().any(|a| a.name == name) {
                 anyhow::bail!("{} has no account called {name}", p.name);
             }
-            accounts::remove_account(p, &name)?;
+            accounts::remove_account(&ws.config.paths, p, &name)?;
             println!("removed {name}");
         }
         AccountsCommand::SetPassword { name, project: arg } => {
@@ -848,8 +1275,11 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
     use tworky_core::memory;
     let ws = Workspace::open()?;
     match cmd {
-        MemoryCommand::Show(arg) => {
-            let path = ws.config.paths.memory_file(&project_name(&ws, &arg)?);
+        MemoryCommand::Show { os, project } => {
+            let path = ws
+                .config
+                .paths
+                .memory_file(&project_name(&ws, &project)?, os.map(Os::from));
             let text = memory::read(&path)?;
             if text.is_empty() {
                 eprintln!("{} is empty", path.display());
@@ -866,12 +1296,14 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
         MemoryCommand::Add {
             text,
             section,
+            os,
             project,
-        } => propose(&ws, &project, memory::ChangeKind::Add { section, text })?,
+        } => propose(&ws, &project, os, memory::ChangeKind::Add { section, text })?,
         MemoryCommand::Edit {
             old,
             new,
             new_file,
+            os,
             project,
         } => {
             let new = match (new, new_file) {
@@ -879,10 +1311,10 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
                 (None, Some(path)) => read_text_file(&path)?,
                 (None, None) => unreachable!("clap requires --new or --new-file"),
             };
-            propose(&ws, &project, memory::ChangeKind::Edit { old, new })?
+            propose(&ws, &project, os, memory::ChangeKind::Edit { old, new })?
         }
-        MemoryCommand::Remove { text, project } => {
-            propose(&ws, &project, memory::ChangeKind::Remove { text })?
+        MemoryCommand::Remove { text, os, project } => {
+            propose(&ws, &project, os, memory::ChangeKind::Remove { text })?
         }
         MemoryCommand::Changes(arg) => {
             let name = project_name(&ws, &arg)?;
@@ -899,7 +1331,11 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
                 };
                 let first = text.lines().next().unwrap_or("");
                 let kind = kind_name(&c.change.kind);
-                println!("{}  {kind:<6}  {}  {first}", c.id, c.change.author);
+                let target = c.change.os.map_or("shared", Os::name);
+                println!(
+                    "{}  {kind:<6}  {target:<7}  {}  {first}",
+                    c.id, c.change.author
+                );
                 if let memory::PreviewResult::Stale { reason } = &c.preview {
                     println!("    stale: {reason}");
                 }
@@ -910,7 +1346,7 @@ fn memory(cmd: MemoryCommand) -> Result<()> {
                 "{}",
                 ws.config
                     .paths
-                    .memory_file(&project_name(&ws, &arg)?)
+                    .memory_file(&project_name(&ws, &arg)?, None)
                     .display()
             );
         }
@@ -927,7 +1363,12 @@ fn kind_name(kind: &tworky_core::memory::ChangeKind) -> &'static str {
     }
 }
 
-fn propose(ws: &Workspace, arg: &ProjectArg, kind: tworky_core::memory::ChangeKind) -> Result<()> {
+fn propose(
+    ws: &Workspace,
+    arg: &ProjectArg,
+    os: Option<OsName>,
+    kind: tworky_core::memory::ChangeKind,
+) -> Result<()> {
     let name = project_name(ws, arg)?;
     ws.config
         .project(&name)
@@ -938,9 +1379,11 @@ fn propose(ws: &Workspace, arg: &ProjectArg, kind: tworky_core::memory::ChangeKi
         None => "you".to_string(),
     };
     let kind_name = kind_name(&kind);
-    let id = tworky_core::memory::propose(&ws.config.paths, &name, kind, &author)?;
+    let os = os.map(Os::from);
+    let id = tworky_core::memory::propose(&ws.config.paths, &name, os, kind, &author)?;
+    let target = os.map_or(String::new(), |os| format!(" ({} memory)", os.label()));
     println!(
-        "proposed {kind_name} {id} for {name}; it applies once approved in Tworky (Projects › {name} › Changes)"
+        "proposed {kind_name} {id} for {name}{target}; it applies once approved in Tworky (Projects › {name} › Changes)"
     );
     Ok(())
 }
@@ -1469,6 +1912,42 @@ mod tests {
             change(Activity::Working, SessionFlags::default(), main),
             SessionChange::Record(Activity::Working)
         );
+    }
+
+    #[test]
+    fn the_remote_is_never_changed_nor_a_sync_aborted_from_a_session() {
+        for session in [
+            "TW_WORKER_ID",
+            "WA_WORKER_ID",
+            "TW_SETUP_SESSION",
+            "TW_SETTINGS_SESSION",
+        ] {
+            let e = refuse_in_session(
+                "abort the config sync",
+                "the user aborts it in Settings",
+                |var| var == session,
+            )
+            .unwrap_err();
+            let message = e.to_string();
+            assert!(
+                message.contains("abort the config sync"),
+                "{session}: {message}"
+            );
+            assert!(message.contains("Settings"), "{session}: {message}");
+            assert!(!message.contains("terminal"), "{session}: {message}");
+            assert!(!message.contains("--yes"), "{session}: {message}");
+        }
+        refuse_in_session("abort the config sync", "", |_| false).unwrap();
+
+        let in_worker = |var: &str| var == "TW_WORKER_ID";
+        let abort = refuse_config_in_session(&ConfigCommand::Abort, in_worker).unwrap_err();
+        assert!(abort.to_string().contains("abort"), "{abort:#}");
+        let remote = refuse_config_in_session(&ConfigCommand::Remote(RemoteCommand::Rm), in_worker)
+            .unwrap_err();
+        assert!(remote.to_string().contains("remote"), "{remote:#}");
+        refuse_config_in_session(&ConfigCommand::Sync, in_worker).unwrap();
+        refuse_config_in_session(&ConfigCommand::Status, in_worker).unwrap();
+        refuse_config_in_session(&ConfigCommand::Abort, |_| false).unwrap();
     }
 
     #[test]

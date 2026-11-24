@@ -6,6 +6,7 @@ use serde_json::json;
 
 use crate::claude_config;
 use crate::config::{Config, ProjectConfig};
+use crate::config_repo;
 use crate::git;
 use crate::state::{ProjectSession, WorkerRecord, WorkerStatus};
 use crate::template;
@@ -35,7 +36,9 @@ pub fn claude_md(config: &Config, project: &ProjectConfig) -> Result<String> {
         "workers_root": config.app.workers_root.to_string_lossy().replace('\\', "/"),
         "port_stride": config.app.port_stride,
         "template_dir": config.template_dir(project),
-        "memory_file": config.paths.memory_file(&project.name),
+        "project_dir": config.paths.project_dir(&project.name),
+        "machine_file": config.paths.machine_file(),
+        "memory_file": config.paths.memory_file(&project.name, None),
         "shell": config.app.shell.join(" "),
         "example_acme": include_str!("../../../examples/acme/acme.toml").trim(),
         "example_tworky": include_str!("../../../examples/tworky/tworky.toml").trim(),
@@ -57,6 +60,7 @@ impl Workspace {
             .unwrap_or_else(|| ProjectSession {
                 claude_session: uuid::Uuid::new_v4().to_string(),
                 claude_started: false,
+                prompted_for: None,
             }))
     }
 
@@ -77,16 +81,16 @@ impl Workspace {
             session = ProjectSession {
                 claude_session: uuid::Uuid::new_v4().to_string(),
                 claude_started: false,
+                prompted_for: None,
             };
             replaced_missing = true;
         }
         self.state.save_project_session(name, &session)?;
 
-        let memory = self.config.paths.memory_file(name);
         let mut args: Vec<String> = self.config.app.claude[1..].to_vec();
         let mut settings: serde_json::Value = serde_json::from_str(&session_settings(
-            name,
-            &memory,
+            &self.config.paths,
+            Some(name),
             false,
             false,
             Some(&session_id(name)),
@@ -95,15 +99,18 @@ impl Workspace {
             allow.push(json!("Bash(tw:*)"));
         }
         args.extend(["--settings".into(), settings.to_string()]);
-        let readable = [
-            self.config.paths.projects_dir(),
-            self.config.template_dir(project),
-        ]
-        .into_iter()
-        .chain(project.repos.iter().map(|r| r.source.clone()));
-        for d in readable {
+        let paths = &self.config.paths;
+        let project_dir = if paths.has_repo() {
+            paths.project_dir(name)
+        } else {
+            paths.legacy_projects_dir()
+        };
+        for d in [project_dir, self.config.template_dir(project)] {
             std::fs::create_dir_all(&d).ok();
             args.extend(["--add-dir".into(), d.to_string_lossy().into_owned()]);
+        }
+        for source in project.repos.iter().filter_map(|r| r.source.as_ref()) {
+            args.extend(["--add-dir".into(), source.to_string_lossy().into_owned()]);
         }
         if session.claude_started {
             args.extend(["--resume".into(), session.claude_session.clone()]);
@@ -146,6 +153,7 @@ impl Workspace {
             &ProjectSession {
                 claude_session: uuid::Uuid::new_v4().to_string(),
                 claude_started: false,
+                prompted_for: None,
             },
         )
     }
@@ -153,6 +161,7 @@ impl Workspace {
     /// Marks the project as set up, removing `onboarding` from its config.
     pub fn finish_onboarding(&self, name: &str) -> Result<()> {
         let project = self.configured(name)?;
+        let guard = config_repo::lock_for_write(&self.config.paths)?;
         let text = std::fs::read_to_string(&project.file)?;
         let mut doc: toml_edit::DocumentMut = text.parse()?;
         if doc.remove("onboarding").is_none() {
@@ -160,10 +169,14 @@ impl Workspace {
         }
         let out = doc.to_string();
         toml::from_str::<ProjectConfig>(&out).context("the edited project config")?;
-        let tmp = project.file.with_extension("toml.tmp");
-        std::fs::write(&tmp, &out)?;
-        std::fs::rename(&tmp, &project.file)
-            .with_context(|| format!("writing {}", project.file.display()))
+        crate::memory::write_atomic(&project.file, out.as_bytes())?;
+        config_repo::commit_logged(
+            &guard,
+            &self.config.paths,
+            &[&project.file],
+            &format!("Finish setting up {name}"),
+        );
+        Ok(())
     }
 
     /// Problems with a project's config that loading it doesn't catch, found by trying it on this
@@ -179,19 +192,60 @@ impl Workspace {
                 "no [[repos]]: workers would have nothing to check out".into(),
             );
         }
+        for warning in &project.warnings {
+            problem(Level::Warning, warning.clone());
+        }
         for repo in &project.repos {
-            if !repo.source.join(".git").exists() {
+            if repo.repo.is_none() {
+                problem(
+                    Level::Warning,
+                    format!(
+                        "repo {}: no `repo = \"owner/name\"`, so other machines can't find or clone it",
+                        repo.name
+                    ),
+                );
+            }
+            let Some(source) = &repo.source else {
+                let text = match self.config.machine.source(&project.name, &repo.name) {
+                    Some(recorded) => format!(
+                        "repo {}: its clone at {} isn't there (on a drive that isn't mounted?); {:#}",
+                        repo.name,
+                        recorded.display(),
+                        repo.not_cloned()
+                    ),
+                    None => format!("repo {}: {:#}", repo.name, repo.not_cloned()),
+                };
+                problem(Level::Error, text);
+                continue;
+            };
+            if !source.join(".git").exists() {
                 problem(
                     Level::Error,
                     format!(
                         "repo {}: {} is not a git clone",
                         repo.name,
-                        repo.source.display()
+                        source.display()
                     ),
                 );
                 continue;
             }
-            match git::origin_name_with_owner(&repo.source) {
+            match git::origin_name_with_owner(source) {
+                Ok(nwo)
+                    if repo
+                        .repo
+                        .as_deref()
+                        .is_some_and(|r| !r.eq_ignore_ascii_case(&nwo)) =>
+                {
+                    problem(
+                        Level::Warning,
+                        format!(
+                            "repo {}: the clone at {} is of {nwo}, not {}",
+                            repo.name,
+                            source.display(),
+                            repo.repo.as_deref().unwrap_or_default()
+                        ),
+                    )
+                }
                 Ok(nwo)
                     if self.config.project_for_repo(&nwo).map(|p| &p.name)
                         != Some(&project.name) =>
@@ -383,7 +437,12 @@ pub fn describe(config: &Config, project: &ProjectConfig) -> Vec<(&'static str, 
     vec![
         ("config", show(&project.file)),
         ("templates", show(&config.template_dir(project))),
-        ("memory", show(&config.paths.memory_file(&project.name))),
+        ("folder", show(&config.paths.project_dir(&project.name))),
+        (
+            "memory",
+            show(&config.paths.memory_file(&project.name, None)),
+        ),
+        ("machine", show(&config.paths.machine_file())),
         ("setup session", show(&setup_dir(config, &project.name))),
     ]
 }
@@ -401,15 +460,13 @@ mod tests {
     #[test]
     fn setup_claude_md_renders_for_a_new_project() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = crate::config::Paths {
-            config_dir: dir.path().join("config"),
-            data_dir: dir.path().join("data"),
-        };
+        let paths = crate::config_repo::test_home(dir.path());
         let repos = [crate::config::NewRepo {
             name_with_owner: "acme/portal".into(),
             source: dir.path().join("portal"),
             base: "origin/main".into(),
         }];
+        std::fs::create_dir_all(&repos[0].source).unwrap();
         crate::config::create_repo_project(&paths, &[], &repos, None).unwrap();
         let config = Config::load_from(paths).unwrap();
         let project = config.project("portal").unwrap();
@@ -428,15 +485,13 @@ mod tests {
     #[test]
     fn a_setup_session_starts_with_a_prompt_then_resumes() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = crate::config::Paths {
-            config_dir: dir.path().join("config"),
-            data_dir: dir.path().join("data"),
-        };
+        let paths = crate::config_repo::test_home(dir.path());
         let repos = [crate::config::NewRepo {
             name_with_owner: "acme/portal".into(),
             source: dir.path().join("portal"),
             base: "origin/main".into(),
         }];
+        std::fs::create_dir_all(&repos[0].source).unwrap();
         crate::config::create_repo_project(&paths, &[], &repos, None).unwrap();
         let config = Config::load_from(paths).unwrap();
         let ws = Workspace {
@@ -477,25 +532,51 @@ mod tests {
                 .contains(&"--resume".to_string())
         );
 
+        let add_dirs: Vec<&String> = first
+            .args
+            .iter()
+            .zip(first.args.iter().skip(1))
+            .filter(|(flag, _)| *flag == "--add-dir")
+            .map(|(_, dir)| dir)
+            .collect();
+        assert_eq!(
+            add_dirs,
+            [
+                &ws.config.paths.project_dir("portal").display().to_string(),
+                &ws.config
+                    .paths
+                    .templates_dir()
+                    .join("portal")
+                    .display()
+                    .to_string(),
+                &dir.path().join("portal").display().to_string(),
+            ]
+        );
+
         ws.finish_onboarding("portal").unwrap();
         let config = Config::load_from(ws.config.paths.clone()).unwrap();
         assert!(!config.project("portal").unwrap().onboarding);
+        assert_eq!(
+            crate::config_repo::log_for_tests(&config.paths)[0],
+            "Finish setting up portal"
+        );
+        assert_eq!(
+            crate::config_repo::last_commit_files_for_tests(&config.paths),
+            ["projects/portal/project.toml"]
+        );
     }
 
     #[test]
     fn check_reports_accounts_without_one_start_page_or_naming_a_bad_service() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = crate::config::Paths {
-            config_dir: dir.path().join("config"),
-            data_dir: dir.path().join("data"),
-        };
+        let paths = crate::config_repo::test_home(dir.path());
         let repos = [crate::config::NewRepo {
             name_with_owner: "acme/portal".into(),
             source: dir.path().join("portal"),
             base: "origin/main".into(),
         }];
         crate::config::create_repo_project(&paths, &[], &repos, None).unwrap();
-        let file = paths.projects_dir().join("portal.toml");
+        let file = paths.project_file("portal");
         let mut text = std::fs::read_to_string(&file).unwrap();
         text.push_str(
             r#"
@@ -553,17 +634,14 @@ start_service = "web"
     #[test]
     fn check_warns_about_ports_without_services() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = crate::config::Paths {
-            config_dir: dir.path().join("config"),
-            data_dir: dir.path().join("data"),
-        };
+        let paths = crate::config_repo::test_home(dir.path());
         let repos = [crate::config::NewRepo {
             name_with_owner: "acme/portal".into(),
             source: dir.path().join("portal"),
             base: "origin/main".into(),
         }];
         crate::config::create_repo_project(&paths, &[], &repos, None).unwrap();
-        let file = paths.projects_dir().join("portal.toml");
+        let file = paths.project_file("portal");
         let base = std::fs::read_to_string(&file).unwrap();
         let open = |extra: &str| {
             std::fs::write(&file, base.clone() + extra).unwrap();
@@ -598,17 +676,14 @@ start_service = "web"
     #[test]
     fn check_warns_about_browser_blocked_base_ports() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = crate::config::Paths {
-            config_dir: dir.path().join("config"),
-            data_dir: dir.path().join("data"),
-        };
+        let paths = crate::config_repo::test_home(dir.path());
         let repos = [crate::config::NewRepo {
             name_with_owner: "acme/portal".into(),
             source: dir.path().join("portal"),
             base: "origin/main".into(),
         }];
         crate::config::create_repo_project(&paths, &[], &repos, None).unwrap();
-        let file = paths.projects_dir().join("portal.toml");
+        let file = paths.project_file("portal");
         let base = std::fs::read_to_string(&file).unwrap();
         std::fs::write(&file, base + "\n[ports]\nvite = 6000\napi = 4000\n").unwrap();
         let config = Config::load_from(paths).unwrap();
@@ -630,6 +705,82 @@ start_service = "web"
                 "port vite = 6000 is blocked by browsers (ERR_UNSAFE_PORT), so if it serves pages, the main checkout can't be opened on it in a browser tab"
             ]
         );
+    }
+
+    #[test]
+    fn a_repo_not_cloned_here_is_left_out_of_the_launch_and_reported_by_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        crate::config::write_project(
+            &paths,
+            "portal",
+            "name = \"portal\"\nmatch = { owner = \"acme\" }\n\
+             [[repos]]\nname = \"web\"\nrepo = \"acme/web\"\n\
+             [[repos]]\nname = \"old\"\n",
+        );
+        let config = Config::load_from(paths).unwrap();
+        let ws = Workspace {
+            state: crate::state::State::open(&config.paths.state_db()).unwrap(),
+            config,
+            claude_home: None,
+        };
+        let launch = ws.launch_project_setup("portal").unwrap();
+        assert_eq!(
+            launch.args.iter().filter(|a| *a == "--add-dir").count(),
+            2,
+            "only the project folder and templates: {:?}",
+            launch.args
+        );
+        let md = claude_md(&ws.config, ws.config.project("portal").unwrap()).unwrap();
+        assert!(md.contains("`web`, not cloned on this machine"), "{md}");
+
+        let texts: Vec<String> = ws
+            .check_project("portal")
+            .unwrap()
+            .into_iter()
+            .map(|f| format!("{:?}: {}", f.level, f.text))
+            .collect();
+        assert!(
+            texts.contains(&"Error: repo web: web isn't cloned on this machine; clone it from the project Overview or run `tw project set-source`".to_string()),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("Warning: repo old: no `repo")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_setup_launch_in_the_legacy_layout_adds_the_legacy_projects_folder_and_makes_no_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        std::fs::create_dir_all(paths.legacy_projects_dir()).unwrap();
+        std::fs::write(
+            paths.legacy_projects_dir().join("portal.toml"),
+            "name = \"portal\"\nmatch = { owner = \"acme\" }\n[[repos]]\nname = \"web\"\n",
+        )
+        .unwrap();
+        let config = Config::load_from(paths).unwrap();
+        let ws = Workspace {
+            state: crate::state::State::open(&config.paths.state_db()).unwrap(),
+            config,
+            claude_home: None,
+        };
+        let launch = ws.launch_project_setup("portal").unwrap();
+        let first_dir = launch.args.iter().position(|a| a == "--add-dir").unwrap() + 1;
+        assert_eq!(
+            launch.args[first_dir],
+            ws.config.paths.legacy_projects_dir().display().to_string()
+        );
+        assert!(!ws.config.paths.repo_dir().exists());
     }
 
     #[test]

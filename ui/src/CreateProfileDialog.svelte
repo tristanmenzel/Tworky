@@ -39,7 +39,7 @@
   const ready = $derived(name.trim() !== '' && email.trim() !== '' && picked !== null && !saving)
 
   $effect(() => {
-    overlay.open++
+    untrack(() => overlay.open++)
     return () => overlay.open--
   })
 

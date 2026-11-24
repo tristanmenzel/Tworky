@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import Dialog from './Dialog.svelte'
   import { overlay } from './overlay.svelte'
 
@@ -15,7 +16,7 @@
   let error = $state<string | null>(null)
 
   $effect(() => {
-    overlay.open++
+    untrack(() => overlay.open++)
     return () => overlay.open--
   })
 

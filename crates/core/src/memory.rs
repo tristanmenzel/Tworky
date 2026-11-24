@@ -1,10 +1,13 @@
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Paths;
+use crate::config::{Os, Paths};
+use crate::config_repo;
 
 pub const DEFAULT_SECTION: &str = "Learned";
 
@@ -28,6 +31,16 @@ pub struct Change {
     pub author: String,
     /// UTC date the change was filed, as YYYY-MM-DD.
     pub date: String,
+    /// The OS-specific memory the change targets; `None` is the shared memory.
+    #[serde(default)]
+    pub os: Option<Os>,
+}
+
+/// The hash of a target memory file that the diffs for its changes were built from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Base {
+    pub os: Option<Os>,
+    pub hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,13 +123,20 @@ pub fn hash(text: &str) -> String {
     format!("{h:016x}")
 }
 
-pub fn propose(paths: &Paths, project: &str, kind: ChangeKind, author: &str) -> Result<String> {
+pub fn propose(
+    paths: &Paths,
+    project: &str,
+    os: Option<Os>,
+    kind: ChangeKind,
+    author: &str,
+) -> Result<String> {
     let change = Change {
         kind,
         author: author.to_string(),
         date: today(),
+        os,
     };
-    apply(&read(&paths.memory_file(project))?, &change)?;
+    apply(&read(&paths.memory_file(project, os))?, &change)?;
     let dir = paths.memory_changes_dir(project);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let json = serde_json::to_vec_pretty(&change)?;
@@ -152,7 +172,8 @@ fn write_new(dir: &Path, id: &str, bytes: &[u8]) -> Result<bool> {
     }
 }
 
-/// The project's pending changes in filing order, each with its preview against the current memory.
+/// The project's pending changes in filing order, each with its preview against its target memory
+/// as it is now.
 pub fn pending(paths: &Paths, project: &str) -> Result<Vec<PendingChange>> {
     let dir = paths.memory_changes_dir(project);
     let entries = match std::fs::read_dir(&dir) {
@@ -160,7 +181,7 @@ pub fn pending(paths: &Paths, project: &str) -> Result<Vec<PendingChange>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
-    let current = read(&paths.memory_file(project))?;
+    let mut targets: BTreeMap<Option<Os>, String> = BTreeMap::new();
     let mut out = Vec::new();
     for entry in entries {
         let path = entry?.path();
@@ -175,11 +196,17 @@ pub fn pending(paths: &Paths, project: &str) -> Result<Vec<PendingChange>> {
             continue;
         }
         match read_change(&path) {
-            Ok(change) => out.push(PendingChange {
-                preview: preview(&current, &change).into(),
-                id,
-                change,
-            }),
+            Ok(change) => {
+                let current = match targets.entry(change.os) {
+                    Entry::Occupied(e) => e.into_mut(),
+                    Entry::Vacant(e) => e.insert(read(&paths.memory_file(project, change.os))?),
+                };
+                out.push(PendingChange {
+                    preview: preview(current, &change).into(),
+                    id,
+                    change,
+                });
+            }
             Err(e) => eprintln!("memory changes: skipping {}: {e:#}", path.display()),
         }
     }
@@ -187,8 +214,9 @@ pub fn pending(paths: &Paths, project: &str) -> Result<Vec<PendingChange>> {
     Ok(out)
 }
 
-/// Applies the selected changes in id order as one write, or none of them.
-pub fn approve(paths: &Paths, project: &str, ids: &[String], base: &str) -> Result<()> {
+/// Applies the selected changes in id order, each to its target memory, as one write per target
+/// and one commit, or none of them. Every target must still hash to its entry in `bases`.
+pub fn approve(paths: &Paths, project: &str, ids: &[String], bases: &[Base]) -> Result<()> {
     let mut ids: Vec<&str> = ids.iter().map(String::as_str).collect();
     ids.sort_unstable();
     ids.dedup();
@@ -200,43 +228,73 @@ pub fn approve(paths: &Paths, project: &str, ids: &[String], base: &str) -> Resu
         .iter()
         .map(|id| change_file(&dir, id))
         .collect::<Result<Vec<_>>>()?;
-    locked_with(
-        &paths.memory_file(project),
-        |current| {
-            let mut claimed = Vec::new();
-            for (id, file) in ids.iter().zip(&files) {
-                let bytes = match std::fs::read(file) {
-                    Ok(bytes) => bytes,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        bail!("change {id} was already handled")
-                    }
-                    Err(e) => {
-                        return Err(e).with_context(|| format!("reading {}", file.display()));
-                    }
-                };
-                let change: Change = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("reading change {id}"))?;
-                claimed.push((id, file, bytes, change));
+    let guard = config_repo::lock_for_write(paths)?;
+    std::fs::create_dir_all(paths.project_dir(project))?;
+    let mut claimed = Vec::new();
+    for (id, file) in ids.iter().zip(&files) {
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("change {id} was already handled")
             }
-            if hash(current) != base {
-                bail!("Memory changed since this diff was shown; review it again");
+            Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
+        };
+        let change: Change =
+            serde_json::from_slice(&bytes).with_context(|| format!("reading change {id}"))?;
+        claimed.push((id, file, bytes, change));
+    }
+    let mut targets: BTreeMap<Option<Os>, Target> = BTreeMap::new();
+    for (_, _, _, change) in &claimed {
+        if let Entry::Vacant(e) = targets.entry(change.os) {
+            let file = paths.memory_file(project, change.os);
+            let current = read(&file)?;
+            let base = bases.iter().find(|b| b.os == change.os);
+            if base.is_none_or(|b| b.hash != hash(&current)) {
+                let name = file.file_name().unwrap_or_default().to_string_lossy();
+                bail!("Memory changed since this diff was shown ({name}); review it again");
             }
-            let mut next = current.to_string();
-            for (id, _, _, change) in &claimed {
-                next = apply(&next, change).with_context(|| format!("change {id}"))?;
-            }
-            let mut deleted: Vec<(PathBuf, Vec<u8>)> = Vec::new();
-            for (_, file, bytes, _) in claimed {
-                if let Err(e) = std::fs::remove_file(file) {
-                    let e = anyhow::Error::from(e).context(format!("deleting {}", file.display()));
-                    return Err(with_restore(e, &deleted));
-                }
-                deleted.push((file.clone(), bytes));
-            }
-            Ok((next, deleted))
-        },
-        |deleted, e| with_restore(e, &deleted),
-    )
+            e.insert(Target {
+                file,
+                next: current.clone(),
+                current,
+            });
+        }
+    }
+    for (id, _, _, change) in &claimed {
+        let target = targets
+            .get_mut(&change.os)
+            .expect("every change has a target");
+        target.next = apply(&target.next, change).with_context(|| format!("change {id}"))?;
+    }
+    let mut written: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    for target in targets.values() {
+        if let Err(e) = write_atomic(&target.file, target.next.as_bytes()) {
+            return Err(with_restore(e, &written));
+        }
+        written.push((target.file.clone(), target.current.clone().into_bytes()));
+    }
+    let mut deleted: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    for (_, file, bytes, _) in claimed {
+        if let Err(e) = std::fs::remove_file(file) {
+            let e = anyhow::Error::from(e).context(format!("deleting {}", file.display()));
+            return Err(with_restore(with_restore(e, &deleted), &written));
+        }
+        deleted.push((file.clone(), bytes));
+    }
+    let touched: Vec<&PathBuf> = targets.values().map(|t| &t.file).collect();
+    config_repo::commit_logged(
+        &guard,
+        paths,
+        &touched,
+        &format!("Approve memory changes for {project}"),
+    );
+    Ok(())
+}
+
+struct Target {
+    file: PathBuf,
+    current: String,
+    next: String,
 }
 
 pub fn reject(paths: &Paths, project: &str, ids: &[String]) -> Result<()> {
@@ -245,25 +303,51 @@ pub fn reject(paths: &Paths, project: &str, ids: &[String]) -> Result<()> {
         .iter()
         .map(|id| change_file(&dir, id))
         .collect::<Result<Vec<_>>>()?;
-    with_lock(&paths.memory_file(project), || {
-        for file in &files {
-            match std::fs::remove_file(file) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).with_context(|| format!("deleting {}", file.display())),
-            }
+    let _guard = config_repo::with_lock(paths)?;
+    for file in &files {
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("deleting {}", file.display())),
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
-pub fn save(path: &Path, base: &str, text: &str) -> Result<()> {
-    locked(path, |current| {
-        if hash(current) != base {
-            bail!("Memory changed since you started editing");
-        }
-        Ok(text.to_string())
-    })
+pub fn save(paths: &Paths, project: &str, os: Option<Os>, base: &str, text: &str) -> Result<()> {
+    let guard = config_repo::lock_for_write(paths)?;
+    let file = paths.memory_file(project, os);
+    std::fs::create_dir_all(paths.project_dir(project))?;
+    if hash(&read(&file)?) != base {
+        bail!("Memory changed since you started editing");
+    }
+    write_atomic(&file, text.as_bytes())?;
+    let message = match os {
+        Some(os) => format!("Save {project} {} memory", os.label()),
+        None => format!("Save {project} memory"),
+    };
+    config_repo::commit_logged(&guard, paths, &[&file], &message);
+    Ok(())
+}
+
+/// Saves the user's guidance, or with `os` its refinement for that OS, unless it changed since
+/// the text with hash `base` was read.
+pub fn save_guidance(paths: &Paths, os: Option<Os>, base: &str, text: &str) -> Result<()> {
+    let guard = config_repo::lock_for_write(paths)?;
+    let file = paths.guidance_file(os);
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if hash(&read(&file)?) != base {
+        bail!("Guidance changed since you started editing");
+    }
+    write_atomic(&file, text.as_bytes())?;
+    let message = match os {
+        Some(os) => format!("Save {} guidance", os.label()),
+        None => "Save guidance".into(),
+    };
+    config_repo::commit_logged(&guard, paths, &[&file], &message);
+    Ok(())
 }
 
 pub fn apply(current: &str, change: &Change) -> Result<String> {
@@ -311,37 +395,7 @@ pub fn preview(current: &str, change: &Change) -> Result<Preview> {
     })
 }
 
-fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let dir = path.parent().context("memory path has no folder")?;
-    std::fs::create_dir_all(dir)?;
-    let lock_path = path.with_extension("md.lock");
-    let lock = std::fs::File::create(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    lock.lock()
-        .with_context(|| format!("locking {}", lock_path.display()))?;
-    let out = f()?;
-    lock.unlock()?;
-    Ok(out)
-}
-
-fn locked(path: &Path, edit: impl FnOnce(&str) -> Result<String>) -> Result<()> {
-    locked_with(path, |current| Ok((edit(current)?, ())), |(), e| e)
-}
-
-/// Under the lock, `prepare` turns the current text into the next one plus whatever `undo` needs
-/// to put things back when the write fails.
-fn locked_with<S>(
-    path: &Path,
-    prepare: impl FnOnce(&str) -> Result<(String, S)>,
-    undo: impl FnOnce(S, anyhow::Error) -> anyhow::Error,
-) -> Result<()> {
-    with_lock(path, || {
-        let (next, state) = prepare(&read(path)?)?;
-        write_atomic(path, next.as_bytes()).map_err(|e| undo(state, e))
-    })
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut name = path.file_name().context("no file name")?.to_os_string();
     name.push(".tmp");
     let tmp = path.with_file_name(name);
@@ -366,7 +420,7 @@ fn with_restore(e: anyhow::Error, files: &[(PathBuf, Vec<u8>)]) -> anyhow::Error
         e
     } else {
         e.context(format!(
-            "restoring change files also failed: {}",
+            "restoring files also failed: {}",
             failures.join("; ")
         ))
     }
@@ -735,6 +789,7 @@ mod tests {
             kind,
             author: "w2".into(),
             date: "2026-02-02".into(),
+            os: None,
         }
     }
 
@@ -760,24 +815,17 @@ mod tests {
         format!("{:#}", apply(current, change).unwrap_err())
     }
 
-    fn paths(dir: &Path) -> Paths {
-        Paths {
-            config_dir: dir.join("config"),
-            data_dir: dir.join("data"),
-        }
-    }
-
     fn seeded(text: &str) -> (tempfile::TempDir, Paths) {
         let dir = tempfile::tempdir().unwrap();
-        let paths = paths(dir.path());
-        let file = paths.memory_file("p");
+        let paths = config_repo::test_home(dir.path());
+        let file = paths.memory_file("p", None);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, text).unwrap();
         (dir, paths)
     }
 
     fn memory(paths: &Paths) -> String {
-        read(&paths.memory_file("p")).unwrap()
+        read(&paths.memory_file("p", None)).unwrap()
     }
 
     fn change_files(paths: &Paths) -> Vec<String> {
@@ -789,6 +837,10 @@ mod tests {
             .unwrap_or_default();
         names.sort();
         names
+    }
+
+    fn shared(hash: String) -> Vec<Base> {
+        vec![Base { os: None, hash }]
     }
 
     fn ids(list: &[&str]) -> Vec<String> {
@@ -1170,6 +1222,7 @@ mod tests {
         let err = propose(
             &paths,
             "p",
+            None,
             ChangeKind::Remove {
                 text: "missing".into(),
             },
@@ -1180,6 +1233,7 @@ mod tests {
         let a = propose(
             &paths,
             "p",
+            None,
             ChangeKind::Add {
                 section: DEFAULT_SECTION.into(),
                 text: "fact".into(),
@@ -1187,7 +1241,14 @@ mod tests {
             "w",
         )
         .unwrap();
-        let b = propose(&paths, "p", ChangeKind::Remove { text: "old".into() }, "w").unwrap();
+        let b = propose(
+            &paths,
+            "p",
+            None,
+            ChangeKind::Remove { text: "old".into() },
+            "w",
+        )
+        .unwrap();
         assert_eq!(memory(&paths), SEED);
         std::fs::write(paths.memory_changes_dir("p").join("x.json.tmp"), "{").unwrap();
         std::fs::write(paths.memory_changes_dir("p").join("0-bad.json"), "{").unwrap();
@@ -1214,6 +1275,7 @@ mod tests {
         propose(
             paths,
             "p",
+            None,
             ChangeKind::Edit {
                 old: old.into(),
                 new: new.into(),
@@ -1260,14 +1322,44 @@ mod tests {
     fn approve_applies_one_change_and_deletes_its_file() {
         let (_dir, paths) = seeded(SEED);
         let id = propose_edit(&paths, "old", "new");
-        approve(&paths, "p", &ids(&[&id]), &hash(SEED)).unwrap();
+        approve(&paths, "p", &ids(&[&id]), &shared(hash(SEED))).unwrap();
         assert!(memory(&paths).contains("- new _(w, "));
         assert!(change_files(&paths).is_empty());
-        let err = approve(&paths, "p", &ids(&[&id]), &hash(&memory(&paths))).unwrap_err();
+        assert_eq!(
+            config_repo::log_for_tests(&paths)[0],
+            "Approve memory changes for p"
+        );
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&paths),
+            ["projects/p/memory.md"]
+        );
+        let err = approve(&paths, "p", &ids(&[&id]), &shared(hash(&memory(&paths)))).unwrap_err();
         assert_eq!(
             format!("{err:#}"),
             format!("change {id} was already handled")
         );
+    }
+
+    #[test]
+    fn approve_keeps_the_change_files_when_the_project_folder_cant_be_made() {
+        let (_dir, paths) = seeded("");
+        let id = propose(
+            &paths,
+            "p",
+            None,
+            ChangeKind::Add {
+                section: DEFAULT_SECTION.into(),
+                text: "added".into(),
+            },
+            "w",
+        )
+        .unwrap();
+        let folder = paths.project_dir("p");
+        std::fs::remove_dir_all(&folder).unwrap();
+        std::fs::write(&folder, "not a folder").unwrap();
+
+        approve(&paths, "p", &ids(&[&id]), &shared(hash(""))).unwrap_err();
+        assert_eq!(change_files(&paths), [format!("{id}.json")]);
     }
 
     #[test]
@@ -1276,6 +1368,7 @@ mod tests {
         let add = propose(
             &paths,
             "p",
+            None,
             ChangeKind::Add {
                 section: DEFAULT_SECTION.into(),
                 text: "added".into(),
@@ -1284,8 +1377,21 @@ mod tests {
         )
         .unwrap();
         let edit = propose_edit(&paths, "Clone it.", "Clone it twice.");
-        let remove = propose(&paths, "p", ChangeKind::Remove { text: "old".into() }, "w").unwrap();
-        approve(&paths, "p", &ids(&[&remove, &add, &edit]), &hash(SEED)).unwrap();
+        let remove = propose(
+            &paths,
+            "p",
+            None,
+            ChangeKind::Remove { text: "old".into() },
+            "w",
+        )
+        .unwrap();
+        approve(
+            &paths,
+            "p",
+            &ids(&[&remove, &add, &edit]),
+            &shared(hash(SEED)),
+        )
+        .unwrap();
         let text = memory(&paths);
         assert!(text.contains("Clone it twice."));
         assert!(!text.contains("- old"));
@@ -1303,7 +1409,7 @@ mod tests {
         pair.sort();
         let [first, second] = pair;
         let before = change_files(&paths);
-        let err = approve(&paths, "p", &ids(&[&first, &second]), &hash(SEED)).unwrap_err();
+        let err = approve(&paths, "p", &ids(&[&first, &second]), &shared(hash(SEED))).unwrap_err();
         let err = format!("{err:#}");
         assert!(
             err.starts_with(&format!("change {second}: not found")),
@@ -1314,8 +1420,14 @@ mod tests {
 
         let stale = propose_edit(&paths, "Subtasks.", "Sub-issues.");
         let changed = SEED.replace("Subtasks.", "Tasks.");
-        save(&paths.memory_file("p"), &hash(SEED), &changed).unwrap();
-        let err = approve(&paths, "p", &ids(&[&first, &stale]), &hash(&changed)).unwrap_err();
+        save(&paths, "p", None, &hash(SEED), &changed).unwrap();
+        let err = approve(
+            &paths,
+            "p",
+            &ids(&[&first, &stale]),
+            &shared(hash(&changed)),
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").starts_with(&format!("change {stale}: not found")));
         assert_eq!(memory(&paths), changed);
         assert_eq!(change_files(&paths).len(), 3);
@@ -1325,11 +1437,11 @@ mod tests {
     fn approve_refuses_a_stale_base() {
         let (_dir, paths) = seeded(SEED);
         let id = propose_edit(&paths, "old", "new");
-        let err = approve(&paths, "p", &ids(&[&id]), &hash("something else")).unwrap_err();
+        let err = approve(&paths, "p", &ids(&[&id]), &shared(hash("something else"))).unwrap_err();
         assert!(format!("{err:#}").starts_with("Memory changed since this diff was shown"));
         assert_eq!(memory(&paths), SEED);
         assert_eq!(change_files(&paths).len(), 1);
-        assert!(approve(&paths, "p", &ids(&["../x"]), &hash(SEED)).is_err());
+        assert!(approve(&paths, "p", &ids(&["../x"]), &shared(hash(SEED))).is_err());
     }
 
     #[test]
@@ -1343,6 +1455,11 @@ mod tests {
         reject(&paths, "p", &ids(&[&a, &b])).unwrap();
         assert!(change_files(&paths).is_empty());
         assert_eq!(memory(&paths), SEED);
+        assert_eq!(
+            config_repo::log_for_tests(&paths),
+            ["Start the Tworky config"],
+            "rejecting changes nothing in the repo"
+        );
     }
 
     #[test]
@@ -1355,6 +1472,7 @@ mod tests {
                     propose(
                         &paths,
                         "p",
+                        None,
                         ChangeKind::Add {
                             section: DEFAULT_SECTION.into(),
                             text: format!("fact {i}"),
@@ -1374,7 +1492,7 @@ mod tests {
 
     #[test]
     fn of_two_parallel_approves_with_one_base_exactly_one_lands() {
-        let (_dir, paths) = seeded(SEED);
+        let (dir, paths) = seeded(SEED);
         let a = propose_edit(&paths, "old", "a");
         let b = propose_edit(&paths, "Clone it.", "Clone.");
         let base = hash(SEED);
@@ -1382,7 +1500,11 @@ mod tests {
             .into_iter()
             .map(|id| {
                 let (paths, base) = (paths.clone(), base.clone());
-                std::thread::spawn(move || approve(&paths, "p", &[id], &base))
+                let home = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    config_repo::isolate_git_for_tests(&home);
+                    approve(&paths, "p", &[id], &shared(base))
+                })
             })
             .collect();
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -1397,8 +1519,8 @@ mod tests {
         let (_dir, paths) = seeded(SEED);
         let a = propose_edit(&paths, "old", "a");
         let b = propose_edit(&paths, "Clone it.", "Clone.");
-        approve(&paths, "p", &ids(&[&a]), &hash(&memory(&paths))).unwrap();
-        approve(&paths, "p", &ids(&[&b]), &hash(&memory(&paths))).unwrap();
+        approve(&paths, "p", &ids(&[&a]), &shared(hash(&memory(&paths)))).unwrap();
+        approve(&paths, "p", &ids(&[&b]), &shared(hash(&memory(&paths)))).unwrap();
         let text = memory(&paths);
         assert!(
             text.contains("- a _(w, ") && text.contains("Clone.\n"),
@@ -1407,17 +1529,246 @@ mod tests {
     }
 
     #[test]
-    fn save_refuses_a_stale_base() {
+    fn save_refuses_a_stale_base_and_commits_only_the_memory() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("memory").join("acme.md");
-        let err = save(&path, &hash("old"), "new\n").unwrap_err();
+        let paths = config_repo::test_home(dir.path());
+        let path = paths.memory_file("acme", None);
+        let err = save(&paths, "acme", None, &hash("old"), "new\n").unwrap_err();
         assert_eq!(
             format!("{err:#}"),
             "Memory changed since you started editing"
         );
         assert_eq!(read(&path).unwrap(), "");
-        save(&path, &hash(""), "new\n").unwrap();
+        crate::config::write_project(&paths, "acme", "name = \"acme\"\n");
+        save(&paths, "acme", None, &hash(""), "new\n").unwrap();
         assert_eq!(read(&path).unwrap(), "new\n");
+        assert_eq!(config_repo::log_for_tests(&paths)[0], "Save acme memory");
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&paths),
+            ["projects/acme/memory.md"]
+        );
+        assert!(!paths.project_dir("acme").join("memory.md.lock").exists());
+    }
+
+    #[test]
+    fn save_guidance_refuses_a_stale_base_and_commits_only_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config_repo::test_home(dir.path());
+        let shared = paths.guidance_file(None);
+        let linux = paths.guidance_file(Some(Os::Linux));
+        std::fs::write(paths.guidance_file(Some(Os::Macos)), "uncommitted\n").unwrap();
+
+        let err = save_guidance(&paths, Some(Os::Linux), &hash("old"), "new\n").unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "Guidance changed since you started editing"
+        );
+        assert_eq!(read(&linux).unwrap(), "");
+
+        save_guidance(&paths, Some(Os::Linux), &hash(""), "# Linux\n").unwrap();
+        assert_eq!(read(&linux).unwrap(), "# Linux\n");
+        assert_eq!(config_repo::log_for_tests(&paths)[0], "Save Linux guidance");
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&paths),
+            ["tworky/claude.local.linux.md"]
+        );
+
+        save_guidance(&paths, None, &hash(&read(&shared).unwrap()), "Be brief.\n").unwrap();
+        assert_eq!(read(&shared).unwrap(), "Be brief.\n");
+        assert_eq!(config_repo::log_for_tests(&paths)[0], "Save guidance");
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&paths),
+            ["tworky/claude.local.md"]
+        );
+    }
+
+    fn windows_memory(paths: &Paths) -> String {
+        read(&paths.memory_file("p", Some(Os::Windows))).unwrap()
+    }
+
+    fn add_to(paths: &Paths, os: Option<Os>, text: &str) -> String {
+        propose(
+            paths,
+            "p",
+            os,
+            ChangeKind::Add {
+                section: DEFAULT_SECTION.into(),
+                text: text.into(),
+            },
+            "w",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn os_changes_preview_and_apply_against_their_own_file() {
+        let (_dir, paths) = seeded(SEED);
+        let err = propose(
+            &paths,
+            "p",
+            Some(Os::Windows),
+            ChangeKind::Remove { text: "old".into() },
+            "w",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("not found"), "{err:#}");
+        let id = add_to(&paths, Some(Os::Windows), "use pwsh");
+        let list = pending(&paths, "p").unwrap();
+        assert_eq!(list[0].change.os, Some(Os::Windows));
+        assert!(matches!(&list[0].preview, PreviewResult::Ready(p) if p.base == hash("")));
+
+        let base = Base {
+            os: Some(Os::Windows),
+            hash: hash(""),
+        };
+        approve(&paths, "p", &ids(&[&id]), &[base]).unwrap();
+        assert!(windows_memory(&paths).starts_with("## Learned\n\n- use pwsh _(w, "));
+        assert_eq!(memory(&paths), SEED);
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&paths),
+            ["projects/p/memory.windows.md"]
+        );
+    }
+
+    #[test]
+    fn a_mixed_shared_and_windows_approval_lands_in_one_commit() {
+        let (_dir, paths) = seeded(SEED);
+        let shared_id = add_to(&paths, None, "shared fact");
+        let windows_id = add_to(&paths, Some(Os::Windows), "windows fact");
+        let bases = [
+            Base {
+                os: None,
+                hash: hash(SEED),
+            },
+            Base {
+                os: Some(Os::Windows),
+                hash: hash(""),
+            },
+        ];
+        approve(&paths, "p", &ids(&[&windows_id, &shared_id]), &bases).unwrap();
+        assert!(memory(&paths).contains("- shared fact _(w, "));
+        assert!(windows_memory(&paths).contains("- windows fact _(w, "));
+        assert!(change_files(&paths).is_empty());
+        assert_eq!(
+            config_repo::log_for_tests(&paths)[0],
+            "Approve memory changes for p"
+        );
+        let mut committed = config_repo::last_commit_files_for_tests(&paths);
+        committed.sort();
+        assert_eq!(
+            committed,
+            ["projects/p/memory.md", "projects/p/memory.windows.md"]
+        );
+    }
+
+    #[test]
+    fn a_stale_base_on_one_target_refuses_the_whole_approval() {
+        let (_dir, paths) = seeded(SEED);
+        let shared_id = add_to(&paths, None, "shared fact");
+        let windows_id = add_to(&paths, Some(Os::Windows), "windows fact");
+        save(&paths, "p", Some(Os::Windows), &hash(""), "# Windows\n").unwrap();
+        let both = ids(&[&shared_id, &windows_id]);
+        let bases = [
+            Base {
+                os: None,
+                hash: hash(SEED),
+            },
+            Base {
+                os: Some(Os::Windows),
+                hash: hash(""),
+            },
+        ];
+        let err = approve(&paths, "p", &both, &bases).unwrap_err();
+        assert!(
+            format!("{err:#}").starts_with("Memory changed since this diff was shown"),
+            "{err:#}"
+        );
+        assert_eq!(memory(&paths), SEED);
+        assert_eq!(windows_memory(&paths), "# Windows\n");
+        assert_eq!(change_files(&paths).len(), 2);
+
+        let err = approve(&paths, "p", &both, &shared(hash(SEED))).unwrap_err();
+        assert!(format!("{err:#}").starts_with("Memory changed since this diff was shown"));
+        assert_eq!(memory(&paths), SEED);
+        assert_eq!(change_files(&paths).len(), 2);
+    }
+
+    fn shared_and_windows_bases() -> [Base; 2] {
+        [
+            Base {
+                os: None,
+                hash: hash(SEED),
+            },
+            Base {
+                os: Some(Os::Windows),
+                hash: hash(""),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_failed_target_write_restores_the_targets_already_written_and_keeps_the_changes() {
+        let (_dir, paths) = seeded(SEED);
+        let shared_id = add_to(&paths, None, "shared fact");
+        let windows_id = add_to(&paths, Some(Os::Windows), "windows fact");
+        let blocker = paths.project_dir("p").join("memory.windows.md.tmp");
+        std::fs::create_dir_all(blocker.join("x")).unwrap();
+
+        let both = ids(&[&shared_id, &windows_id]);
+        approve(&paths, "p", &both, &shared_and_windows_bases()).unwrap_err();
+        assert_eq!(memory(&paths), SEED);
+        assert_eq!(windows_memory(&paths), "");
+        assert_eq!(change_files(&paths).len(), 2);
+
+        std::fs::remove_dir_all(&blocker).unwrap();
+        approve(&paths, "p", &both, &shared_and_windows_bases()).unwrap();
+        assert!(memory(&paths).contains("- shared fact _(w, "));
+        assert!(windows_memory(&paths).contains("- windows fact _(w, "));
+        assert!(change_files(&paths).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_change_file_delete_restores_the_targets_and_the_deleted_changes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let (_dir, paths) = seeded(SEED);
+        let shared_id = add_to(&paths, None, "shared fact");
+        let windows_id = add_to(&paths, Some(Os::Windows), "windows fact");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(change_file(&paths.memory_changes_dir("p"), &windows_id).unwrap())
+            .unwrap();
+
+        let both = ids(&[&shared_id, &windows_id]);
+        let err = approve(&paths, "p", &both, &shared_and_windows_bases()).unwrap_err();
+        assert!(format!("{err:#}").starts_with("deleting "), "{err:#}");
+        assert_eq!(memory(&paths), SEED);
+        assert_eq!(windows_memory(&paths), "");
+        assert_eq!(change_files(&paths).len(), 2);
+
+        drop(held);
+        approve(&paths, "p", &both, &shared_and_windows_bases()).unwrap();
+        assert!(change_files(&paths).is_empty());
+    }
+
+    #[test]
+    fn a_change_filed_before_os_targets_loads_as_shared() {
+        let (_dir, paths) = seeded(SEED);
+        let dir = paths.memory_changes_dir("p");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("1-aaaa.json"),
+            r#"{"kind":"remove","text":"old","author":"w","date":"2026-01-01"}"#,
+        )
+        .unwrap();
+        let list = pending(&paths, "p").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].change.os, None);
+        assert!(matches!(&list[0].preview, PreviewResult::Ready(p) if p.base == hash(SEED)));
+        approve(&paths, "p", &ids(&["1-aaaa"]), &shared(hash(SEED))).unwrap();
+        assert!(!memory(&paths).contains("- old"));
     }
 
     #[test]

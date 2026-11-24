@@ -307,7 +307,8 @@ export interface ProjectSummary {
   context_types: string[]
   branch: string
   session_cwd: string
-  repos: { name: string; source: string; base: string }[]
+  /** `repo` is the GitHub `owner/name`; `source` is null when the repo isn't cloned on this machine. */
+  repos: { name: string; repo: string | null; source: string | null; base: string }[]
   ports: Record<string, number>
   stack: { compose_dir: string; compose_files: string[]; env_file: string | null; profiles: string[] } | null
   hooks: { setup: { cwd: string; run: Command }[]; teardown: { cwd: string; run: Command }[] }
@@ -317,6 +318,8 @@ export interface ProjectSummary {
   notes: string
   status_board: number | null
   onboarding: boolean
+  /** Keys in the project file this build doesn't know. */
+  warnings: string[]
   /** The id its setup session's terminal runs under. */
   setup_session: string
   setup_alive: boolean
@@ -325,6 +328,12 @@ export interface ProjectSummary {
 
 /** A command for every OS, or one per OS. */
 export type Command = string | Partial<Record<'windows' | 'unix' | 'macos' | 'linux', string>>
+
+export interface FoundSource {
+  project: string
+  repo: string
+  source: string
+}
 
 export interface Service {
   name: string
@@ -391,19 +400,61 @@ export interface RepoSearch {
   search_error: string | null
 }
 
+export type Os = 'windows' | 'macos' | 'linux'
+
+export const OS_LABEL: Record<Os, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux' }
+
+/** A project's memory file: the shared one (`os: null`) or one OS's refinement. */
 export interface ProjectMemory {
   project: string
+  os: Os | null
   path: string
   text: string
   hash: string
 }
+
+export interface SessionGuidanceSize {
+  os: Os
+  bytes: number
+  /** The project whose memory was counted. Without one asked for, the one with the most memory on this OS. */
+  project: string | null
+  /** What the session's guidance hook weighs, headers included. Past `budget`, sessions get the files' paths instead of their text. */
+  measured: number
+  budget: number
+}
+
+/** Past this, the guidance and memory a session loads are getting close to what its hook shows in full. */
+export const SESSION_GUIDANCE_LIMIT = 8192
+
+/** What happens to a session's guidance and memory at `size`, for a warning once it passes `SESSION_GUIDANCE_LIMIT`. */
+export function guidanceLimitNote(size: SessionGuidanceSize): string {
+  return size.measured > size.budget
+    ? `With their headers that's ${size.measured.toLocaleString()} bytes, past the ${size.budget.toLocaleString()} sessions are shown in full, so they get the file paths to read instead of the text. Trim it.`
+    : `That's close to the limit: once they pass ${size.budget.toLocaleString()} bytes with their headers (${size.measured.toLocaleString()} now), sessions get the file paths to read instead of the text.`
+}
+
+/** The user's guidance for every session (`os: null`) or one OS's refinement. */
+export interface GuidanceFile {
+  os: Os | null
+  path: string
+  text: string
+  hash: string
+}
+
+export const GUIDANCE_CHANGED_SINCE_EDITING = 'Guidance changed since you started editing'
 
 export type MemoryChangeKind =
   | { kind: 'add'; section: string; text: string }
   | { kind: 'edit'; old: string; new: string }
   | { kind: 'remove'; text: string }
 
-export type MemoryChange = MemoryChangeKind & { author: string; date: string }
+export type MemoryChange = MemoryChangeKind & { author: string; date: string; os: Os | null }
+
+/** The hash of a target memory file that its changes' diffs were built from. */
+export interface MemoryBase {
+  os: Os | null
+  hash: string
+}
 
 export interface HunkLine {
   tag: 'ctx' | 'del' | 'add'
@@ -465,6 +516,70 @@ export interface KeepAwakeStatus {
 const showLoad = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)
 let showSeq = 0
 
+export type Visibility = 'public' | 'private' | 'internal' | 'unknown'
+
+export type ConfigSyncState =
+  | { kind: 'idle' | 'syncing' | 'no_remote' }
+  | { kind: 'conflict' | 'blocked_by_local' | 'held_in_sync_worktree'; files: string[] }
+  | { kind: 'held_back'; files: string[]; cause: 'invalid' | 'unrecognised' }
+  | { kind: 'error'; message: string }
+  | { kind: 'unconfirmed_remote'; url: string }
+
+export interface ConfigSyncRecord {
+  state: ConfigSyncState
+  operation: 'rebase' | 'merge' | null
+  paused: boolean
+  last_sync: number | null
+  incoming: { hooks_or_services: string[]; guidance: string[]; dropped: string[] }
+  visibility: Visibility | null
+  /** Where the remote the user connected fetched from and pushed to, redacted. */
+  remote: { fetch: string[]; push: string[] } | null
+}
+
+export interface ConfigRepoStatus {
+  /** With any credentials redacted. */
+  remote: string | null
+  /** Uncommitted files, such as a project.toml that doesn't parse. */
+  changes: string[]
+  ahead_behind: [number, number] | null
+  stale_index_lock: boolean
+}
+
+/** Must match `SESSION_ID` in crates/core/src/settings_session.rs. */
+export const SETTINGS_SESSION = 'settings@tworky'
+
+export interface RemoteCheck {
+  url: string
+  visibility: Visibility
+  warnings: string[]
+  needs_confirmation: boolean
+  foreign_owner: boolean
+}
+
+/** What the user was shown of a remote's check when they chose to connect it. */
+export interface RemoteSeen {
+  /** The checked URL, redacted, as `RemoteCheck.url` carries it. */
+  url: string
+  visibility: Visibility
+  foreign_owner: boolean
+}
+
+export type ConnectOutcome =
+  | { kind: 'connected'; connected: ConfigConnected }
+  /** The remote's check found more than the user saw. */
+  | { kind: 'changed'; check: RemoteCheck }
+
+export interface ConfigConnected {
+  check: RemoteCheck
+  sync: ConfigSyncRecord
+}
+
+export interface SharedConfig {
+  owner: string
+  url: string
+  visibility: Visibility
+}
+
 export const api = {
   updateStatus: () => invoke<VersionInfo>('update_status'),
   updateProgress: () => invoke<UpdateProgress>('update_progress'),
@@ -474,6 +589,10 @@ export const api = {
   keepAwakeStatus: () => invoke<KeepAwakeStatus>('keep_awake_status'),
   setKeepAwake: (mode: KeepAwakeMode) => invoke<void>('set_keep_awake', { mode }),
   projects: () => invoke<ProjectSummary[]>('list_projects'),
+  projectErrors: () => invoke<Record<string, string>>('list_project_errors'),
+  configErrors: () => invoke<string[]>('list_config_errors'),
+  cloneProjectRepo: (project: string, repo: string) => invoke<string>('clone_project_repo', { project, repo }),
+  findProjectClones: (project: string) => invoke<FoundSource[]>('find_project_clones', { project }),
   browserTabs: () => invoke<BrowserTabView[]>('browser_tabs'),
   browserOpen: (worker: string, account: string | null, url: string | null = null) =>
     invoke<number>('browser_open', { worker, account, url }),
@@ -516,10 +635,15 @@ export const api = {
   linkItem: (name: string, issueUrl: string) => invoke<void>('link_item', { name, issueUrl }),
   removeItem: (name: string) => invoke<void>('remove_item', { name }),
   memories: () => invoke<ProjectMemory[]>('list_memories'),
-  saveMemory: (project: string, base: string, text: string) => invoke<void>('save_memory', { project, base, text }),
+  /** Without a project, counts the project with the most memory. */
+  sessionGuidanceSize: (project: string | null) => invoke<SessionGuidanceSize>('session_guidance_size', { project }),
+  guidance: () => invoke<GuidanceFile[]>('list_guidance'),
+  saveGuidance: (os: Os | null, base: string, text: string) => invoke<void>('save_guidance', { os, base, text }),
+  saveMemory: (project: string, os: Os | null, base: string, text: string) =>
+    invoke<void>('save_memory', { project, os, base, text }),
   memoryChanges: () => invoke<ProjectMemoryChanges[]>('list_memory_changes'),
-  approveMemoryChanges: (project: string, ids: string[], base: string) =>
-    invoke<void>('approve_memory_changes', { project, ids, base }),
+  approveMemoryChanges: (project: string, ids: string[], bases: MemoryBase[]) =>
+    invoke<void>('approve_memory_changes', { project, ids, bases }),
   rejectMemoryChanges: (project: string, ids: string[]) => invoke<void>('reject_memory_changes', { project, ids }),
   existingWork: (subject: WorkSubject, refresh: boolean) => invoke<BranchWork[]>('existing_work', { subject, refresh }),
   deleteBranch: (subject: WorkSubject, repo: string, branch: string) =>
@@ -553,5 +677,26 @@ export const api = {
   dismissHandover: (id: string) => invoke<void>('dismiss_handover', { id }),
   dismissAccountRequest: (id: string, name: string) => invoke<void>('dismiss_account_request', { id, name }),
   dismissAccountRequests: (id: string) => invoke<void>('dismiss_account_requests', { id }),
+  configFirstRun: () => invoke<boolean>('config_first_run'),
+  startFreshConfig: () => invoke<void>('start_fresh_config'),
+  findSharedConfigs: () => invoke<SharedConfig[]>('find_shared_configs'),
+  useSharedConfig: (remote: string, seen: RemoteSeen | null) =>
+    invoke<ConnectOutcome>('use_shared_config', { remote, seen }),
+  configSyncStatus: () => invoke<ConfigSyncRecord>('config_sync_status'),
+  configRepoStatus: () => invoke<ConfigRepoStatus>('config_repo_status'),
+  syncConfigNow: () => invoke<ConfigSyncRecord>('sync_config_now'),
+  abortConfigSync: () => invoke<ConfigSyncRecord>('abort_config_sync'),
+  /** Readies the settings session to resolve the stopped sync. True when it was restarted for a new conversation. */
+  prepareSettingsResolve: () => invoke<boolean>('prepare_settings_resolve'),
+  dismissConfigIncoming: () => invoke<void>('dismiss_config_incoming'),
+  configGithubOwners: () => invoke<string[]>('config_github_owners'),
+  /** Checks `remote`, or with null the config repo's current remote. */
+  checkConfigRemote: (remote: string | null) => invoke<RemoteCheck>('check_config_remote', { remote }),
+  setConfigRemote: (remote: string, seen: RemoteSeen | null) =>
+    invoke<ConnectOutcome>('set_config_remote', { remote, seen }),
+  /** Connects the config repo's current remote, which was added outside Tworky. */
+  confirmConfigRemote: (seen: RemoteSeen) => invoke<ConnectOutcome>('confirm_config_remote', { seen }),
+  createConfigRemote: (owner: string | null) => invoke<ConfigConnected>('create_config_remote', { owner }),
+  removeConfigRemote: () => invoke<ConfigSyncRecord>('remove_config_remote'),
   openProjectConfig: (name: string) => invoke<void>('open_project_config', { name }),
 }

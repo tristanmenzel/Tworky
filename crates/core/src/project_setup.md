@@ -20,13 +20,14 @@ Everything that varies between workers is a **port**. Slot N gets each base port
 
 ## Files
 
-- Project config: `{{ project_file }}` (TOML, described below). Edit it directly. Tworky reloads it on every command, and refuses one that doesn't parse, so run `tw project check {{ project.name }}` after each change.
+- Project config: `{{ project_file }}` (TOML, described below), in the project's folder `{{ project_dir }}` in Tworky's config repo. Edit it directly, and write no other files in that folder. Tworky reloads it on every command, refuses one that doesn't parse, and commits your edits, so run `tw project check {{ project.name }}` after each change. The user's other machines share it, so it names each repo by `owner/name` and holds no paths.
+- Clones on this machine: `{{ machine_file }}`. Set one with `tw project set-source <repo> <path>`, or find them under the source roots with `tw project set-source --scan {{ project.name }}`.
 - Templates: `{{ template_dir }}`. This mirrors the worker layout: `{{ template_dir }}/<repo name>/<path in repo>`. Each file is rendered with minijinja and written into the worktree when it's added. Use it for gitignored per-machine files such as `.env`, `appsettings.Development.json` or `local.settings.json`, with the worker's ports substituted. **It holds secrets and lives outside every git repo.** Never copy its contents into the project config, the memory or a repo.
-- Shared memory: `{{ memory_file }}`. Every Claude on the project reads it at session start. Add to it only with `tw memory add "<fact>" --project {{ project.name }}`, which files the entry for the user to approve in Projects › {{ project.name }} › Changes.
+- Shared memory: `{{ memory_file }}`. Every Claude on the project reads it at session start. Add to it only with `tw memory add "<fact>" --project {{ project.name }}`, which files the entry for the user to approve in Projects › {{ project.name }} › Changes. A fact that holds on one OS only goes in that OS's memory: add `--os windows|macos|linux`.
 
 Repos so far:
 {% for r in project.repos %}
-- `{{ r.name }}` at `{{ r.source }}`, base `{{ r.base }}`
+- `{{ r.name }}`{% if r.source %} at `{{ r.source }}`{% else %}, not cloned on this machine{% endif %}, base `{{ r.base }}`
 {%- else %}
 - none
 {%- endfor %}
@@ -35,7 +36,7 @@ You can read each repo's files directly (they're added to this session). Don't m
 
 ## Procedure
 
-1. **Find the whole project.** Ask the user which other repos make up {{ project.name }} (an API and a frontend are often separate). For each, find its local clone (`tw paths` shows the source roots; clones usually sit under them) and add it with `tw project add-repo <owner/repo> --project {{ project.name }}`, which clones it if needed.
+1. **Find the whole project.** Ask the user which other repos make up {{ project.name }} (an API and a frontend are often separate). For each, find its local clone (`tw paths` shows the source roots; clones usually sit under them) and add it with `tw project add-repo <owner/repo> --project {{ project.name }}`, which clones it if needed. For a listed repo that isn't cloned here, run `tw project set-source <repo> <path>`, or use **Clone** on the project's Overview.
 2. **Learn how it runs.** In each repo, read `README.md`, `CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`, `docs/`, `docker-compose*.yml`, `.env.example` / `.env.sample`, `package.json` scripts, `Makefile`, `justfile`, launch settings and CI workflows. Work out the services, the ports each listens on, the databases and emulators, how dependencies are installed, how migrations and seeds run, and which config files are gitignored. Ask the user about anything the docs leave open, briefly, a few questions at a time.
 3. **Propose, then write.** Summarise the config you intend (ports, stack, hooks, services, templates) and get the user's agreement before writing it.
 4. **Check.** Run `tw project check {{ project.name }}` and fix what it reports.
@@ -66,7 +67,6 @@ context_types = ["Story", "Epic"]    # parent types whose body goes into the wor
 branch = "feat/{% raw %}{{ issue.number }}-{{ issue.slug }}{% endraw %}"   # minijinja; see the context below
 session_cwd = "."                    # where Claude starts, relative to the worker folder
 status_board = 5                     # GitHub Projects board number whose Status the UI shows (optional)
-template_dir = "..."                 # optional; defaults to the templates folder above
 notes = """
 Shown to every worker session in its CLAUDE.md: how to start the apps on the worker's ports, and
 anything else a session needs before it runs code. Keep it short and specific.
@@ -74,7 +74,7 @@ anything else a session needs before it runs code. Keep it short and specific.
 
 [[repos]]                            # one per repo; `name` is the worktree folder in the worker
 name = "api"
-source = 'C:\Source\acme\api'        # the main clone; worktrees are added from it
+repo = "acme/api"                    # the GitHub repo; its clone on each machine is in machine.toml
 base = "origin/main"                 # what new branches start from
 
 [ports]                              # base ports (slot 0); workers get base + slot × stride

@@ -952,6 +952,61 @@ pub fn clone_repo(name_with_owner: &str, dest: &std::path::Path) -> Result<()> {
     .map(drop)
 }
 
+/// Who can see a repo, as `gh repo view --json visibility` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    Public,
+    Private,
+    Internal,
+    /// Not on GitHub, or gh couldn't tell.
+    Unknown,
+}
+
+/// A repo as `gh repo view --json url,visibility` describes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepoView {
+    pub url: String,
+    pub visibility: Visibility,
+}
+
+pub fn parse_repo_view(json: &str) -> Result<RepoView> {
+    let value: Value = serde_json::from_str(json).context("parsing `gh repo view` output")?;
+    let url = value["url"]
+        .as_str()
+        .context("`gh repo view` gave no url")?
+        .to_string();
+    let visibility = match value["visibility"].as_str().map(str::to_ascii_uppercase) {
+        Some(v) if v == "PUBLIC" => Visibility::Public,
+        Some(v) if v == "PRIVATE" => Visibility::Private,
+        Some(v) if v == "INTERNAL" => Visibility::Internal,
+        _ => Visibility::Unknown,
+    };
+    Ok(RepoView { url, visibility })
+}
+
+/// The repo `owner/name`, or `None` when it doesn't exist or the user can't see it.
+pub fn repo_view(name_with_owner: &str) -> Result<Option<RepoView>> {
+    match process::run(
+        "gh",
+        &["repo", "view", name_with_owner, "--json", "url,visibility"],
+        None,
+    ) {
+        Ok(json) => parse_repo_view(&json).map(Some),
+        Err(e) if format!("{e:#}").contains("Could not resolve to a Repository") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn create_private_repo(name_with_owner: &str) -> Result<()> {
+    process::run(
+        "gh",
+        &["repo", "create", name_with_owner, "--private"],
+        None,
+    )
+    .map(drop)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequest {
@@ -1206,6 +1261,38 @@ mod tests {
             "https://evil.githubusercontent.com.example/x"
         ));
         assert!(!is_github_asset("https://imgur.com/x.png"));
+    }
+
+    #[test]
+    fn parses_repo_visibility() {
+        for (json, visibility) in [
+            (
+                r#"{"url":"https://github.com/me/tworky-config","visibility":"PRIVATE"}"#,
+                Visibility::Private,
+            ),
+            (
+                r#"{"url":"https://github.com/me/tworky-config","visibility":"PUBLIC"}"#,
+                Visibility::Public,
+            ),
+            (
+                r#"{"url":"https://github.com/me/tworky-config","visibility":"INTERNAL"}"#,
+                Visibility::Internal,
+            ),
+            (
+                r#"{"url":"https://github.com/me/tworky-config","visibility":"SECRET"}"#,
+                Visibility::Unknown,
+            ),
+            (
+                r#"{"url":"https://github.com/me/tworky-config"}"#,
+                Visibility::Unknown,
+            ),
+        ] {
+            let view = parse_repo_view(json).unwrap();
+            assert_eq!(view.visibility, visibility, "{json}");
+            assert_eq!(view.url, "https://github.com/me/tworky-config");
+        }
+        assert!(parse_repo_view(r#"{"visibility":"PRIVATE"}"#).is_err());
+        assert!(parse_repo_view("not json").is_err());
     }
 
     #[test]

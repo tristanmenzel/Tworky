@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::accounts;
 use crate::claude_config;
-use crate::config::{AccountConfig, Config, Hook, ProjectConfig, RepoConfig};
+use crate::config::{AccountConfig, Config, Hook, Os, Paths, ProjectConfig, RepoConfig};
 use crate::git;
 use crate::github::{self, PullRequest};
 use crate::hierarchy::{Issue, IssueIndex};
@@ -51,12 +51,121 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// The files [`guidance_command`] shows a session on `os`, in order: the user's guidance, then
+/// the project's memory, each followed by its refinement for `os`.
+pub fn session_guidance_files(paths: &Paths, project: &str, os: Os) -> [PathBuf; 4] {
+    let [guidance, os_guidance] = paths.guidance_files(os);
+    [
+        guidance,
+        os_guidance,
+        paths.memory_file(project, None),
+        paths.memory_file(project, Some(os)),
+    ]
+}
+
+/// Claude Code shows a hook's output past 10,000 characters only as a preview and a file path,
+/// which would cut the levels that take precedence, so past this the hook lists the files instead.
+pub const GUIDANCE_BUDGET: usize = 9000;
+
+/// Shows each non-empty level of [`session_guidance_files`] under its header, or, when they'd
+/// exceed [`GUIDANCE_BUDGET`], their paths for Claude to read. One command, because Claude Code
+/// runs a group's hooks in parallel and the levels must arrive in order.
+fn guidance_headers(project: &str, os: Os) -> [String; 4] {
+    let (name, label) = (os.name(), os.label());
+    let precedence = "Where it conflicts with the guidance above, it takes precedence.";
+    [
+        format!(
+            "Tworky user guidance for every session (claude.local.md, edited in Tworky's \
+             Settings). It refines Tworky's own guidance. {precedence}"
+        ),
+        format!(
+            "Tworky user guidance for sessions on {label} (claude.local.{name}.md, edited in \
+             Tworky's Settings). {precedence}"
+        ),
+        format!(
+            "Tworky shared memory for project {project}, kept by every Claude working on it \
+             (latest: tw memory show). Propose additions rarely: only a fact that cost real time, \
+             applies to most {project} work, cannot be found quickly in the repo, and is not better \
+             fixed in the repo or reported as a Tworky problem. Run tw memory changes first and don't \
+             file a change that is already pending. When an entry proves wrong or outdated, file a fix \
+             with tw memory edit or remove; don't reword correct entries. A fact that holds on one OS \
+             only goes in that OS's memory, with --os windows|macos|linux. Changes apply once the \
+             user approves them in Tworky. {precedence}"
+        ),
+        format!(
+            "Tworky shared memory for project {project} on {label} (latest: tw memory show --os \
+             {name}), under the same rules; propose changes to it with --os {name}. {precedence}"
+        ),
+    ]
+}
+
+/// What [`guidance_command`] weighs against [`GUIDANCE_BUDGET`] for a session on `os`: each
+/// non-empty level with its header. Without a project, only the user's guidance.
+pub fn guidance_hook_size(paths: &Paths, project: Option<&str>, os: Os) -> usize {
+    let headers = guidance_headers(project.unwrap_or_default(), os);
+    let files = match project {
+        Some(project) => session_guidance_files(paths, project, os).to_vec(),
+        None => paths.guidance_files(os).to_vec(),
+    };
+    files
+        .iter()
+        .zip(&headers)
+        .filter_map(|(file, header)| {
+            let len = std::fs::metadata(file).ok()?.len() as usize;
+            (len > 0).then_some(header.len() + 3 + len)
+        })
+        .sum()
+}
+
+fn guidance_command(paths: &Paths, project: &str, os: Os) -> String {
+    let headers = guidance_headers(project, os);
+    let quote = |file: &Path| sh_quote(&file.to_string_lossy().replace('\\', "/"));
+    let [guidance, os_guidance, memory, os_memory] = session_guidance_files(paths, project, os);
+    let repo_memory = paths.repo_memory_file(project, None);
+    let mut script: Vec<String> = [&guidance, &os_guidance, &repo_memory, &os_memory]
+        .iter()
+        .enumerate()
+        .map(|(i, file)| format!("f{i}={}", quote(file)))
+        .collect();
+    if memory != repo_memory {
+        script.push(format!("[ -s \"$f2\" ] || f2={}", quote(&memory)));
+    }
+    script.push("n=0".into());
+    let each = |show: &dyn Fn(usize, String) -> String| {
+        headers
+            .iter()
+            .enumerate()
+            .map(|(i, header)| {
+                format!(
+                    "if [ -s \"$f{i}\" ]; then {}; fi",
+                    show(i, sh_quote(header))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    script.push(each(&|i, _| {
+        format!("n=$((n + {} + $(wc -c < \"$f{i}\")))", headers[i].len() + 3)
+    }));
+    let intro = sh_quote(
+        "Tworky: this session's guidance and project memory are too long to show here. Before \
+         anything else, read each file below in full, in this order. Each level refines the ones \
+         before it.",
+    );
+    script.push(format!(
+        "if [ \"$n\" -gt {GUIDANCE_BUDGET} ]; then echo {intro}; {}; else {}; fi",
+        each(&|i, header| format!("echo; echo {header}; echo \"$f{i}\"")),
+        each(&|i, header| format!("echo {header}; echo; cat \"$f{i}\"; echo")),
+    ));
+    script.join("; ")
+}
+
 /// A resumed conversation re-sends the system prompt recorded on its first request, so
 /// `--append-system-prompt` would be ignored; a SessionStart hook's output is added as new context.
 /// `session` names the activity record to report to; a worker's session reports to `$TW_WORKER_ID`.
 pub(crate) fn session_settings(
-    project: &str,
-    memory: &Path,
+    paths: &Paths,
+    project: Option<&str>,
     stopped: bool,
     browser: bool,
     session: Option<&str>,
@@ -64,19 +173,15 @@ pub(crate) fn session_settings(
     let target = session
         .map(|s| format!(" --worker {}", sh_quote(s)))
         .unwrap_or_default();
-    let memory = sh_quote(&memory.to_string_lossy().replace('\\', "/"));
-    let header = sh_quote(&format!(
-        "Tworky shared memory for project {project}, kept by every Claude working on it \
-         (latest: tw memory show). Propose additions rarely: only a fact that cost real time, applies to \
-         most {project} work, cannot be found quickly in the repo, and is not better fixed in the repo or \
-         reported as a Tworky problem. Run tw memory changes first and don't file a change that is \
-         already pending. When an entry proves wrong or outdated, file a fix with tw memory \
-         edit or remove; don't reword correct entries. Changes apply once the user approves them in Tworky."
-    ));
-    let mut hooks = vec![serde_json::json!({
-        "type": "command",
-        "command": format!("if [ -s {memory} ]; then echo {header}; echo; cat {memory}; fi"),
-    })];
+    let mut hooks: Vec<serde_json::Value> = project
+        .map(|project| {
+            serde_json::json!({
+                "type": "command",
+                "command": guidance_command(paths, project, Os::current()),
+            })
+        })
+        .into_iter()
+        .collect();
     hooks.push(serde_json::json!({ "type": "command", "command": format!("echo {}", sh_quote(FEEDBACK_NOTE)) }));
     if stopped {
         hooks.push(serde_json::json!({ "type": "command", "command": format!("echo {}", sh_quote(STOPPED_NOTE)) }));
@@ -96,7 +201,7 @@ pub(crate) fn session_settings(
     let mut settings = serde_json::json!({
         "hooks": {
             "SessionStart": [
-                { "matcher": "startup|resume", "hooks": hooks },
+                { "matcher": "startup|resume|clear|compact", "hooks": hooks },
                 { "matcher": "startup|resume", "hooks": report("idle --session-start")[0]["hooks"] },
                 { "matcher": "clear", "hooks": report("idle --new-conversation")[0]["hooks"] },
             ],
@@ -430,12 +535,7 @@ impl Workspace {
         std::fs::create_dir_all(&w.dir).with_context(|| format!("creating {}", w.dir.display()))?;
         std::fs::write(
             w.dir.join("CLAUDE.md"),
-            worker_claude_md(
-                &w,
-                project,
-                index,
-                &self.config.paths.memory_file(&project.name),
-            ),
+            worker_claude_md(&w, project, index, &self.config.paths),
         )?;
         write_graft_settings(&w.dir)?;
         w.status = WorkerStatus::Ready;
@@ -494,15 +594,16 @@ impl Workspace {
                 origin: BranchOrigin::Existing,
             }
         } else {
+            let source = repo.source.as_deref().ok_or_else(|| repo.not_cloned())?;
             log(&format!("▸ {}: fetching", repo.name));
-            if let Err(e) = git::fetch(&repo.source) {
+            if let Err(e) = git::fetch(source) {
                 log(&format!(
                     "  fetch failed, continuing with local refs: {e:#}"
                 ));
             }
             let branch = branch.unwrap_or(&w.branch).to_string();
             let base = base.unwrap_or(&repo.base);
-            let origin = git::worktree_add(&repo.source, &path, &branch, base)
+            let origin = git::worktree_add(source, &path, &branch, base)
                 .with_context(|| format!("worktree for {}", repo.name))?;
             let how = match origin {
                 BranchOrigin::New => format!("new branch from {base}"),
@@ -551,27 +652,48 @@ impl Workspace {
     fn drop_worktree(&self, w: &WorkerRecord, repo: &RepoConfig, log: Log) -> Result<()> {
         let path = w.dir.join(&repo.name);
         let record = w.worktrees.iter().find(|t| t.repo == repo.name);
-        if !repo.source.is_dir() {
-            if path.exists() {
-                log(&format!(
-                    "▸ {}: the clone at {} is gone, so removing the worktree folder without git",
-                    repo.name,
-                    repo.source.display()
-                ));
-                remove_dir(&path)?;
-            }
-            return Ok(());
-        }
+        let found;
+        let source = match repo.source.as_deref().filter(|s| s.is_dir()) {
+            Some(source) => source,
+            None => match git::main_clone_of(&path) {
+                Some(clone) => {
+                    found = clone;
+                    &found
+                }
+                None => {
+                    if let Some(e) = &self.config.machine_error
+                        && (path.exists() || record.is_some())
+                    {
+                        bail!(
+                            "{}: can't tell where it's cloned, because {e}; fix it and clean up again",
+                            repo.name
+                        );
+                    }
+                    if path.exists() {
+                        let gone = match &repo.source {
+                            Some(source) => format!("the clone at {} is gone", source.display()),
+                            None => "it isn't cloned on this machine".into(),
+                        };
+                        log(&format!(
+                            "▸ {}: {gone}, so removing the worktree folder without git",
+                            repo.name
+                        ));
+                        remove_dir(&path)?;
+                    }
+                    return Ok(());
+                }
+            },
+        };
         if git::is_worktree(&path) || record.is_some() {
             log(&format!("▸ {}: removing worktree", repo.name));
-            git::worktree_remove(&repo.source, &path)?;
+            git::worktree_remove(source, &path)?;
         }
         if let Some(t) = record.filter(|t| t.origin.created_by_tworky()) {
             log(&format!(
                 "▸ {}: deleting local branch {}",
                 repo.name, t.branch
             ));
-            git::branch_delete(&repo.source, &t.branch)?;
+            git::branch_delete(source, &t.branch)?;
         }
         Ok(())
     }
@@ -734,7 +856,7 @@ impl Workspace {
     ) -> Result<String> {
         let project = self.project_of(w)?;
         let saved = self.login_origin_for_worker(w, origin)?;
-        accounts::add_login_origin(project, account, &saved)?;
+        accounts::add_login_origin(&self.config.paths, project, account, &saved)?;
         Ok(saved)
     }
 
@@ -804,6 +926,13 @@ impl Workspace {
         let sessions: Vec<(PathBuf, String)> = ids
             .iter()
             .filter_map(|id| match crate::project_setup::session_project(id) {
+                _ if id == crate::settings_session::SESSION_ID => {
+                    let s = self
+                        .state
+                        .app_session(crate::settings_session::KEY)
+                        .ok()??;
+                    Some((self.config.paths.repo_sync_dir(), s.claude_session))
+                }
                 Some(project) => {
                     let s = self.state.project_session(project).ok()??;
                     Some((
@@ -839,10 +968,15 @@ impl Workspace {
             replaced_missing = true;
         }
         let mut args: Vec<String> = self.config.app.claude[1..].to_vec();
-        let memory = self.config.paths.memory_file(&project.name);
         args.extend([
             "--settings".into(),
-            session_settings(&project.name, &memory, w.stopped, mcp.is_some(), None),
+            session_settings(
+                &self.config.paths,
+                Some(&project.name),
+                w.stopped,
+                mcp.is_some(),
+                None,
+            ),
         ]);
         if let Some(endpoint) = mcp {
             args.extend(["--mcp-config".into(), mcp_config(endpoint)]);
@@ -897,7 +1031,8 @@ impl Workspace {
                 status: git::status(&w.dir.join(&t.repo)).ok(),
                 error: None,
             };
-            match git::origin_name_with_owner(&repo.source)
+            match repo
+                .name_with_owner()
                 .and_then(|nwo| github::pull_requests(&nwo, &t.branch).map(|prs| (nwo, prs)))
             {
                 Ok((nwo, prs)) => {
@@ -1244,8 +1379,9 @@ pub fn worker_claude_md(
     w: &WorkerRecord,
     project: &ProjectConfig,
     index: &IssueIndex,
-    memory: &Path,
+    paths: &Paths,
 ) -> String {
+    let os = Os::current();
     let mut md = String::new();
     let push = |md: &mut String, s: &str| {
         md.push_str(s);
@@ -1293,10 +1429,14 @@ pub fn worker_claude_md(
              and `$`.\n  \
                - Send new text that holds quotes, backticks or `$` through `--new-file -` on stdin.\n  \
                - Don't merge or reword entries that are still correct.\n\
-             - The memory file is `{2}`. Don't edit it directly; use `tw memory`.\n",
+             - A fact that holds on one OS only goes in that OS's memory: add `--os windows|macos|linux` to \
+             `tw memory show|add|edit|remove`. Sessions on {4} get `{3}` after the shared memory.\n\
+             - The shared memory file is `{2}`. Don't edit the memory files directly; use `tw memory`.\n",
             project.name,
             w.compose_project,
-            memory.display()
+            paths.memory_file(&project.name, None).display(),
+            paths.memory_file(&project.name, Some(os)).display(),
+            os.label(),
         ),
     );
 
@@ -1408,15 +1548,19 @@ pub fn worker_claude_md(
         "No worktrees exist until you ask for them. These repos are available:\n",
     );
     for r in &project.repos {
-        push(
-            &mut md,
-            &format!(
+        let line = match &r.source {
+            Some(source) => format!(
                 "- `{}` — main checkout `{}`, base `{}`",
                 r.name,
-                r.source.display(),
+                source.display(),
                 r.base
             ),
-        );
+            None => format!(
+                "- `{}` — not cloned on this machine, so `tw worktree add` can't use it until the user clones it from the project Overview",
+                r.name
+            ),
+        };
+        push(&mut md, &line);
     }
     push(
         &mut md,
@@ -2041,8 +2185,8 @@ start_url = "http://localhost:5173/home"
         let (_d, ws) = workspace();
         let idx = index();
         let w = ws.plan(&idx, "T").unwrap();
-        let memory = ws.config.paths.memory_file("acme");
-        let md = worker_claude_md(&w, &project(), &idx, &memory);
+        let memory = ws.config.paths.memory_file("acme", None);
+        let md = worker_claude_md(&w, &project(), &idx, &ws.config.paths);
         assert!(md.contains("## Working alongside other Claudes"));
         assert!(
             md.contains("Propose a fact only when all of these hold:\n  - It cost you real time")
@@ -2055,6 +2199,9 @@ start_url = "http://localhost:5173/home"
         assert!(md.contains("run `tw memory changes` and don't file one that is already pending"));
         assert!(!md.contains("Only after the user agrees"));
         assert!(md.contains(&memory.display().to_string()));
+        let os_memory = ws.config.paths.memory_file("acme", Some(Os::current()));
+        assert!(md.contains(&os_memory.display().to_string()));
+        assert!(md.contains("add `--os windows|macos|linux` to `tw memory show|add|edit|remove`"));
         assert!(md.contains(&format!("except with `-p {}`", w.compose_project)));
         assert!(md.contains("Story #318: Header layout"));
         assert!(md.contains("fit on my phone"));
@@ -2066,7 +2213,7 @@ start_url = "http://localhost:5173/home"
         assert!(!md.contains("## Sub-issues"));
 
         let story = ws.plan(&idx, "S").unwrap();
-        let md = worker_claude_md(&story, &project(), &idx, &memory);
+        let md = worker_claude_md(&story, &project(), &idx, &ws.config.paths);
         assert!(md.contains("## Sub-issues"));
         assert!(md.contains("Subtask #327: Implement - Web (open, assigned to me)"));
     }
@@ -2088,7 +2235,7 @@ start_url = "http://localhost:5173/home"
         git(&source, &["commit", "-q", "-m", "init"]);
         git(&source, &["branch", "someone-elses"]);
         let project = &mut ws.config.projects[0];
-        project.repos[0].source = source.clone();
+        project.repos[0].source = Some(source.clone());
         project.repos[0].base = "main".into();
         let template = dir.path().join("c/templates/acme/platform");
         std::fs::create_dir_all(&template).unwrap();
@@ -2135,11 +2282,69 @@ start_url = "http://localhost:5173/home"
         ws.add_worktree(&id, "platform", None, None, &mut |_| {})
             .unwrap();
         let dir = ws.state.get(&id).unwrap().unwrap().dir;
-        ws.config.projects[0].repos[0].source = d.path().join("deleted-clone");
+        ws.config.projects[0].repos[0].source = Some(d.path().join("deleted-clone"));
 
         ws.cleanup(&id, None, &mut |_| {}).unwrap();
         assert!(!dir.exists());
         assert!(ws.state.get(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn removing_a_worktree_finds_its_clone_when_the_source_is_unknown() {
+        let (_d, mut ws, source, id) = git_workspace();
+        ws.add_worktree(&id, "platform", None, None, &mut |_| {})
+            .unwrap();
+        let wt = ws.state.get(&id).unwrap().unwrap().dir.join("platform");
+        ws.config.projects[0].repos[0].source = None;
+        ws.config.machine_error = Some("parsing machine.toml".into());
+
+        ws.remove_worktree(&id, "platform", &mut |_| {}).unwrap();
+        assert!(!wt.exists());
+        assert!(!git::local_branch_exists(&source, "feat/header-layout-327"));
+        assert_eq!(git(&source, &["worktree", "list"]).lines().count(), 1);
+    }
+
+    #[test]
+    fn cleanup_refuses_to_guess_while_machine_toml_doesnt_load() {
+        let (_d, mut ws, source, id) = git_workspace();
+        ws.config.projects[0].stack = None;
+        ws.add_worktree(&id, "platform", None, None, &mut |_| {})
+            .unwrap();
+        let wt = ws.state.get(&id).unwrap().unwrap().dir.join("platform");
+        std::fs::write(wt.join(".git"), "gitdir: nowhere").unwrap();
+        ws.config.projects[0].repos[0].source = None;
+        ws.config.machine_error = Some("parsing machine.toml".into());
+
+        let e = ws
+            .remove_worktree(&id, "platform", &mut |_| {})
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("machine.toml"), "{e:#}");
+        assert!(wt.exists());
+        assert!(git::local_branch_exists(&source, "feat/header-layout-327"));
+        assert!(ws.cleanup(&id, None, &mut |_| {}).is_err());
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn a_repo_not_cloned_here_gets_no_worktree_and_is_listed_as_not_cloned() {
+        let (_d, mut ws) = workspace();
+        ws.config.projects[0].repos[0].source = None;
+        let w = ws.plan(&index(), "T").unwrap();
+        let err = ws
+            .add_worktree(&w.id, "platform", None, None, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("platform isn't cloned on this machine")
+                && err.contains("tw project set-source"),
+            "{err}"
+        );
+        let md = worker_claude_md(&w, &ws.config.projects[0], &index(), &ws.config.paths);
+        assert!(
+            md.contains("- `platform` — not cloned on this machine"),
+            "{md}"
+        );
+        ws.remove_worktree(&w.id, "platform", &mut |_| {}).unwrap();
     }
 
     #[test]
@@ -2731,7 +2936,11 @@ run = "{sleep}"
                 );
             }
             let start = &settings["hooks"]["SessionStart"][0];
-            assert_eq!(start["matcher"], "startup|resume");
+            assert_eq!(start["matcher"], "startup|resume|clear|compact");
+            assert_eq!(
+                settings["hooks"]["SessionStart"].as_array().unwrap().len(),
+                3
+            );
             start["hooks"]
                 .as_array()
                 .unwrap()
@@ -2740,10 +2949,15 @@ run = "{sleep}"
                 .collect()
         };
         let running = hooks(&again);
-        assert_eq!(running.len(), 2, "memory and the feedback note");
-        let memory = ws.config.paths.memory_file("acme");
-        assert!(running[0].contains(&memory.to_string_lossy().replace('\\', "/")));
-        assert!(running[0].contains("Run tw memory changes first"));
+        assert_eq!(
+            running.len(),
+            2,
+            "guidance and memory, and the feedback note"
+        );
+        assert_eq!(
+            running[0],
+            guidance_command(&ws.config.paths, "acme", Os::current())
+        );
         assert!(running[1].contains("tw issue bug|friction"));
 
         let mut stopped = ws.state.get(&w.id).unwrap().unwrap();
@@ -2756,9 +2970,13 @@ run = "{sleep}"
 
     #[test]
     fn session_hooks_record_the_graft_phase() {
+        let paths = Paths {
+            config_dir: "config".into(),
+            data_dir: "data".into(),
+        };
         let settings: Value = serde_json::from_str(&session_settings(
-            "acme",
-            Path::new("m.md"),
+            &paths,
+            Some("acme"),
             false,
             false,
             Some("setup@acme"),
@@ -2791,6 +3009,197 @@ run = "{sleep}"
         assert!(command(&post[0]).contains("tw session-state working"));
         assert_eq!(post[1]["matcher"], "ExitPlanMode");
         assert_eq!(command(&post[1]), phase);
+    }
+
+    fn quoted(file: &Path) -> String {
+        sh_quote(&file.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// Where each `$f<i>` level starts in `branch`, which must be in order.
+    fn level_starts(branch: &str) -> Vec<usize> {
+        let starts: Vec<usize> = (0..4)
+            .map(|i| {
+                branch
+                    .find(&format!("if [ -s \"$f{i}\" ]; then "))
+                    .unwrap_or_else(|| panic!("level {i} in {branch}"))
+            })
+            .collect();
+        assert!(starts.is_sorted(), "{branch}");
+        starts
+    }
+
+    #[test]
+    fn guidance_hook_shows_each_level_in_order_or_lists_the_files_when_too_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config_repo::test_home(dir.path());
+        for os in Os::ALL {
+            let command = guidance_command(&paths, "acme", os);
+            for (i, file) in session_guidance_files(&paths, "acme", os)
+                .iter()
+                .enumerate()
+            {
+                assert!(
+                    command.contains(&format!("f{i}={}", quoted(file))),
+                    "{command}"
+                );
+            }
+            assert!(!command.contains("|| f2="), "no legacy fallback: {command}");
+            let (sizes, branches) = command
+                .split_once(&format!("; if [ \"$n\" -gt {GUIDANCE_BUDGET} ]; then "))
+                .expect(&command);
+            for i in 0..4 {
+                assert!(
+                    sizes.contains(&format!("+ $(wc -c < \"$f{i}\")))")),
+                    "{sizes}"
+                );
+            }
+            let (over, under) = branches.split_once("; else ").expect(branches);
+            assert!(over.contains("too long to show here"), "{over}");
+            for (branch, shows) in [(over, "echo \"$f"), (under, "cat \"$f")] {
+                let starts = level_starts(branch);
+                let levels: Vec<&str> = (0..4)
+                    .map(|i| &branch[starts[i]..starts.get(i + 1).copied().unwrap_or(branch.len())])
+                    .collect();
+                for (i, level) in levels.iter().enumerate() {
+                    assert!(level.contains(&format!("{shows}{i}\"")), "{level}");
+                    assert!(level.contains("it takes precedence"), "{level}");
+                }
+                assert!(levels[1].contains(&format!("sessions on {}", os.label())));
+                assert!(levels[2].contains("Run tw memory changes first"));
+                assert!(levels[3].contains(&format!("tw memory show --os {}", os.name())));
+            }
+            assert!(!over.contains("cat "), "{over}");
+        }
+    }
+
+    #[test]
+    fn guidance_hook_falls_back_to_legacy_memory_only_while_the_repo_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        std::fs::create_dir_all(paths.legacy_memory_dir()).unwrap();
+        let legacy = paths.memory_file("acme", None);
+        assert!(legacy.starts_with(paths.legacy_memory_dir()));
+        let command = guidance_command(&paths, "acme", Os::current());
+        let repo_memory = quoted(&paths.repo_memory_file("acme", None));
+        assert!(
+            command.contains(&format!(
+                "f2={repo_memory}; f3={}; [ -s \"$f2\" ] || f2={}; n=0",
+                quoted(&paths.repo_memory_file("acme", Some(Os::current()))),
+                quoted(&legacy)
+            )),
+            "{command}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guidance_hook_skips_empty_and_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config_repo::test_home(dir.path());
+        let os = Os::current();
+        let [guidance, os_guidance, memory, os_memory] = session_guidance_files(&paths, "acme", os);
+        std::fs::create_dir_all(guidance.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(memory.parent().unwrap()).unwrap();
+        std::fs::write(&guidance, "guidance line\n").unwrap();
+        std::fs::write(&os_guidance, "").unwrap();
+        std::fs::write(&os_memory, "os memory line").unwrap();
+        let _ = std::fs::remove_file(&memory);
+        let out =
+            process::run("bash", &["-c", &guidance_command(&paths, "acme", os)], None).unwrap();
+        let guidance_at = out.find("guidance line").unwrap();
+        let os_memory_at = out.find("os memory line").unwrap();
+        assert!(guidance_at < os_memory_at, "{out}");
+        assert!(out.contains("Tworky user guidance for every session"));
+        assert!(
+            !out.contains(&format!("sessions on {}", os.label())),
+            "{out}"
+        );
+        assert!(!out.contains("Run tw memory changes first"), "{out}");
+        assert!(out.contains(&format!("project acme on {}", os.label())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guidance_hook_lists_the_files_instead_of_their_text_when_too_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config_repo::test_home(dir.path());
+        let os = Os::current();
+        let [guidance, os_guidance, memory, os_memory] = session_guidance_files(&paths, "acme", os);
+        std::fs::create_dir_all(memory.parent().unwrap()).unwrap();
+        std::fs::write(&guidance, "guidance line\n").unwrap();
+        std::fs::write(&os_guidance, "").unwrap();
+        std::fs::write(&memory, "memory line\n".repeat(700)).unwrap();
+        std::fs::write(&os_memory, "os memory line").unwrap();
+        let out =
+            process::run("bash", &["-c", &guidance_command(&paths, "acme", os)], None).unwrap();
+        assert!(out.len() < GUIDANCE_BUDGET, "{out}");
+        assert!(guidance_hook_size(&paths, Some("acme"), os) > GUIDANCE_BUDGET);
+        assert!(out.starts_with("Tworky: this session's guidance"), "{out}");
+        assert!(!out.contains("guidance line"), "{out}");
+        assert!(!out.contains("memory line"), "{out}");
+        let listed: Vec<usize> = [&guidance, &memory, &os_memory]
+            .iter()
+            .map(|f| out.find(&*f.to_string_lossy()).expect(&out))
+            .collect();
+        assert!(listed.is_sorted(), "{out}");
+        assert!(!out.contains(&*os_guidance.to_string_lossy()), "{out}");
+        assert!(
+            !out.contains(&format!("sessions on {}", os.label())),
+            "{out}"
+        );
+
+        std::fs::write(&memory, "memory line\n").unwrap();
+        let out =
+            process::run("bash", &["-c", &guidance_command(&paths, "acme", os)], None).unwrap();
+        assert!(!out.contains("too long to show here"), "{out}");
+        assert!(out.contains("memory line"), "{out}");
+        assert!(guidance_hook_size(&paths, Some("acme"), os) <= GUIDANCE_BUDGET);
+    }
+
+    #[test]
+    fn the_guidance_hook_size_counts_each_non_empty_level_with_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config_repo::test_home(dir.path());
+        let os = Os::current();
+        let [guidance, os_guidance, memory, _] = session_guidance_files(&paths, "acme", os);
+        std::fs::create_dir_all(memory.parent().unwrap()).unwrap();
+        std::fs::write(&guidance, "abc").unwrap();
+        std::fs::write(&os_guidance, "").unwrap();
+        std::fs::write(&memory, "memory").unwrap();
+        let headers = guidance_headers("acme", os);
+        assert_eq!(
+            guidance_hook_size(&paths, Some("acme"), os),
+            headers[0].len() + 3 + 3 + headers[2].len() + 3 + 6
+        );
+        assert_eq!(
+            guidance_hook_size(&paths, None, os),
+            headers[0].len() + 3 + 3
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guidance_hook_reads_the_repo_memory_once_a_late_import_moved_the_legacy_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+        };
+        std::fs::create_dir_all(paths.legacy_memory_dir()).unwrap();
+        std::fs::write(paths.memory_file("acme", None), "legacy line").unwrap();
+        let command = guidance_command(&paths, "acme", Os::current());
+        let out = process::run("bash", &["-c", &command], None).unwrap();
+        assert!(out.contains("legacy line"), "{out}");
+
+        let repo_memory = paths.repo_memory_file("acme", None);
+        std::fs::create_dir_all(repo_memory.parent().unwrap()).unwrap();
+        std::fs::write(&repo_memory, "repo line").unwrap();
+        std::fs::remove_dir_all(paths.legacy_memory_dir()).unwrap();
+        let out = process::run("bash", &["-c", &command], None).unwrap();
+        assert!(out.contains("repo line"), "{out}");
     }
 
     #[test]

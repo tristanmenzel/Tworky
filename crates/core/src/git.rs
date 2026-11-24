@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -166,6 +166,36 @@ pub fn last_commit(repo: &Path, rev: &str) -> Result<String> {
 
 pub fn is_worktree(path: &Path) -> bool {
     path.join(".git").exists()
+}
+
+/// The main clone a linked worktree belongs to, read from its `.git` file (`gitdir:`) and that
+/// folder's `commondir`, without running git. `None` when `worktree` isn't a linked worktree or
+/// its clone is gone.
+pub fn main_clone_of(worktree: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(worktree.join(".git")).ok()?;
+    let gitdir = worktree.join(text.strip_prefix("gitdir:")?.trim());
+    let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = lexically_normal(&gitdir.join(common.trim()));
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    let clone = common.parent()?;
+    clone.join(".git").is_dir().then(|| clone.to_path_buf())
+}
+
+/// `path` with `.` and `..` folded away without touching the file system.
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 pub fn current_branch(worktree: &Path) -> Result<String> {

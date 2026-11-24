@@ -11,6 +11,7 @@
     type Activity,
     type AddOutcome,
     type BrowserTabView,
+    type ConfigSyncRecord,
     type Handover,
     type AccountRequest,
     type Phase,
@@ -20,6 +21,7 @@
     type ProjectSummary,
     type Worker,
     type WorkerStage,
+    SETTINGS_SESSION,
   } from './api'
   import ActionMenu from './ActionMenu.svelte'
   import AddIssueDialog from './AddIssueDialog.svelte'
@@ -30,12 +32,17 @@
   import JobView from './JobView.svelte'
   import NewItemDialog from './NewItemDialog.svelte'
   import NewProjectDialog from './NewProjectDialog.svelte'
+  import FirstRunDialog from './FirstRunDialog.svelte'
   import ProjectDetail from './ProjectDetail.svelte'
   import Terminal from './Terminal.svelte'
   import { redrawTerminal } from './terminals'
   import MemoryView from './MemoryView.svelte'
   import MemoryChanges from './MemoryChanges.svelte'
   import AccountsView from './AccountsView.svelte'
+  import GuidanceSettings from './GuidanceSettings.svelte'
+  import RemoteSettings from './RemoteSettings.svelte'
+  import SyncSettings from './SyncSettings.svelte'
+  import { syncProblem } from './configSync'
   import LocalWork from './LocalWork.svelte'
   import WorkerToolbar from './WorkerToolbar.svelte'
   import WorkerSidebar from './WorkerSidebar.svelte'
@@ -79,7 +86,8 @@
     job: Job
   }
 
-  type View = 'items' | 'workers' | 'projects'
+  type View = 'items' | 'workers' | 'projects' | 'settings'
+  type SettingsTab = 'guidance' | 'remote' | 'sync' | 'claude'
 
   let view = $state<View>('items')
   let payload = $state<IssuesPayload | null>(null)
@@ -95,6 +103,13 @@
   let itemTab = $state<string>('overview')
   let workersTab = $state<string>('list')
   let projectTab = $state<'overview' | 'setup' | 'memory' | 'changes' | 'accounts'>('overview')
+  let settingsTab = $state<SettingsTab>('guidance')
+  /** Whether the settings session's terminal is mounted. */
+  let settingsOpen = $state(false)
+  let guidanceUnsaved = $state(false)
+  let guidanceSettings: GuidanceSettings | undefined = $state()
+  let configSync = $state<ConfigSyncRecord | null>(null)
+  const configSyncProblem = $derived(configSync ? syncProblem(configSync.state) : null)
   /** Projects whose setup terminal is mounted. */
   let setupOpen = $state<string[]>([])
   let newProjectOpen = $state(false)
@@ -119,6 +134,8 @@
   let items = $state<Item[]>([])
   let itemsLoaded = $state(false)
   let projects = $state<ProjectSummary[]>([])
+  let projectErrors = $state<Record<string, string>>({})
+  let configErrors = $state<string[]>([])
   let anonymousFor = $state<Worker | null>(null)
   let createProfileFor = $state<{ worker: Worker; request: AccountRequest | null } | null>(null)
   let selectedProject = $state<string | null>(null)
@@ -128,6 +145,7 @@
   const pendingMemoryCount = $derived(pendingMemory.reduce((n, p) => n + p.changes.length, 0))
   const projectChangeCount = $derived(memoryChanges.find((p) => p.project === selectedProject)?.changes.length ?? 0)
   let addDialog = $state<'issue' | 'pull_request' | 'custom' | null>(null)
+  let firstRun = $state(false)
   let flashTimer: ReturnType<typeof setTimeout> | undefined
 
   const issues = $derived(new Map<string, Issue>((payload?.issues ?? []).map((i) => [i.id, i])))
@@ -248,7 +266,8 @@
     return (
       (view === 'items' && activeItemTab === id) ||
       (view === 'workers' && activeWorkersTab === id) ||
-      (view === 'projects' && projectTab === 'setup' && id === project?.setup_session)
+      (view === 'projects' && projectTab === 'setup' && id === project?.setup_session) ||
+      (view === 'settings' && settingsTab === 'claude' && id === SETTINGS_SESSION)
     )
   }
 
@@ -395,7 +414,10 @@
 
   async function loadProjects() {
     try {
-      projects = await api.projects()
+      const [loaded, errors, configWide] = await Promise.all([api.projects(), api.projectErrors(), api.configErrors()])
+      projects = loaded
+      projectErrors = errors
+      configErrors = configWide
       if (!projects.some((p) => p.name === selectedProject)) selectedProject = projects[0]?.name ?? null
     } catch (e) {
       showError(String(e))
@@ -498,9 +520,63 @@
     }
   }
 
-  function showView(v: View) {
+  async function showView(v: View) {
+    if (v !== view && !(await canLeaveGuidance())) return
     view = v
     if (v === 'projects') loadProjects()
+  }
+
+  /** Asks before an unsaved guidance edit is left, and discards it if the user agrees. */
+  async function canLeaveGuidance() {
+    if (view !== 'settings' || settingsTab !== 'guidance' || !guidanceUnsaved) return true
+    const ok = await ask({ title: 'Discard your unsaved guidance edit?', confirmLabel: 'Discard', danger: true })
+    if (ok) guidanceSettings?.discard()
+    return ok
+  }
+
+  async function showSettings(tab: SettingsTab) {
+    if (view === 'settings' && tab === settingsTab) return true
+    if (!(await canLeaveGuidance())) return false
+    view = 'settings'
+    settingsTab = tab
+    return true
+  }
+
+  /** Shows the settings session's terminal, starting or resuming its session if needed. */
+  async function openSettingsSession() {
+    if (!(await showSettings('claude'))) return
+    if (!settingsOpen) settingsOpen = true
+    else if (exited[SETTINGS_SESSION]) {
+      exited[SETTINGS_SESSION] = false
+      generations[SETTINGS_SESSION] = (generations[SETTINGS_SESSION] ?? 0) + 1
+    }
+  }
+
+  /** Opens the settings session on the stopped sync, in a new conversation unless its current one is about that sync. */
+  async function resolveWithClaude() {
+    try {
+      if (await api.prepareSettingsResolve()) exited[SETTINGS_SESSION] = true
+    } catch (e) {
+      showError(String(e))
+      return
+    }
+    openSettingsSession()
+  }
+
+  async function newSettingsConversation() {
+    const ok = await ask({
+      title: 'Start a new settings conversation?',
+      message: 'The current one ends. The new one starts from the sync as it stands.',
+      confirmLabel: 'New conversation',
+    })
+    if (!ok) return
+    try {
+      await api.newConversation(SETTINGS_SESSION)
+      exited[SETTINGS_SESSION] = true
+      openSettingsSession()
+    } catch (e) {
+      showError(String(e))
+    }
   }
 
   async function loadMemoryChanges() {
@@ -524,7 +600,7 @@
     const target = pendingMemory.some((p) => p.project === selectedProject)
       ? selectedProject
       : (pendingMemory[0]?.project ?? selectedProject)
-    if (!(await canSwitchProject(target))) return
+    if (!(await canSwitchProject(target)) || !(await canLeaveGuidance())) return
     showView('projects')
     selectedProject = target
     projectTab = 'changes'
@@ -720,12 +796,14 @@
   }
 
   onMount(() => {
+    api.configFirstRun().then((v) => (firstRun = v), showError)
     loadIssues(false)
     loadWorkers()
     loadItems()
     loadProjects()
     loadJobs()
     loadMemoryChanges()
+    api.configSyncStatus().then((r) => (configSync ??= r), showError)
     api.browserTabs().then((tabs) => (browserTabs = tabs), showError)
     const timer = setInterval(refreshIssuesIfDue, DUE_CHECK_MS)
     document.addEventListener('visibilitychange', onVisibilityChange)
@@ -738,7 +816,8 @@
       listen<string>('worker-changed', (e) => {
         loadWorkers()
         loadJobs()
-        if (view === 'workers' || selectedWorkerIds.includes(e.payload)) loadLocal([e.payload])
+        if (!e.payload.includes('@') && (view === 'workers' || selectedWorkerIds.includes(e.payload)))
+          loadLocal([e.payload])
       }),
       listen<{ id: string; line: string }>('worker-log', (e) => {
         logs[e.payload.id] ??= []
@@ -768,6 +847,9 @@
         browserTabs = e.payload
       }),
       listen('memory-changes', loadMemoryChanges),
+      listen<ConfigSyncRecord>('config-sync', (e) => {
+        configSync = e.payload
+      }),
     ]
     return () => {
       clearInterval(timer)
@@ -846,6 +928,7 @@
       </button>
       <button class:active={view === 'workers'} onclick={() => showView('workers')}>Workers ({workers.length})</button>
       <button class:active={view === 'projects'} onclick={() => showView('projects')}>Projects</button>
+      <button class:active={view === 'settings'} onclick={() => showView('settings')}>Settings</button>
     </nav>
     <span class="right">
       <KeepAwakePill />
@@ -870,6 +953,14 @@
     </div>
   {/if}
 
+  {#if configSyncProblem}
+    <div class="sync-bar" role="status">
+      <span class="sync-dot"></span>
+      <span class="memory-text">{configSyncProblem}</span>
+      <button class="primary" onclick={() => showSettings('sync')}>View</button>
+    </div>
+  {/if}
+
   {#if error}
     <div class="error-bar" role="alert">
       <pre>{error}</pre>
@@ -877,7 +968,7 @@
     </div>
   {/if}
 
-  <div class="shell" class:wide={view === 'workers'}>
+  <div class="shell" class:wide={view === 'workers' || view === 'settings'}>
     {#if view === 'items'}
       <aside>
         <div class="side-head">
@@ -931,6 +1022,9 @@
           <button onclick={loadProjects} title="Reload project config">↻</button>
         </div>
         <ul class="projects">
+          {#each configErrors as error, i (i)}
+            <li class="project broken"><span class="error-text">{error}</span></li>
+          {/each}
           {#each projects as p (p.name)}
             {@const n = workers.filter((w) => w.project === p.name).length}
             <li>
@@ -942,7 +1036,13 @@
               </button>
             </li>
           {:else}
-            <li class="muted pad">No projects configured.</li>
+            {#if !Object.keys(projectErrors).length}<li class="muted pad">No projects configured.</li>{/if}
+          {/each}
+          {#each Object.entries(projectErrors) as [folder, error] (folder)}
+            <li class="project broken">
+              <strong>{folder}</strong>
+              <span class="error-text">doesn't load: {error}</span>
+            </li>
           {/each}
         </ul>
       </aside>
@@ -976,7 +1076,7 @@
           {#each strayBrowsers as t (t.id)}
             {@render browserTab(t, activeWorkersTab === webTab(t), () => (workersTab = webTab(t)))}
           {/each}
-        {:else}
+        {:else if view === 'projects'}
           <button class:active={projectTab === 'overview'} onclick={() => (projectTab = 'overview')}>Overview</button>
           <button class:active={projectTab === 'setup'} onclick={() => (projectTab = 'setup')}>Setup</button>
           <button class:active={projectTab === 'memory'} onclick={() => (projectTab = 'memory')}>Memory</button>
@@ -984,6 +1084,13 @@
             >Changes{projectChangeCount ? ` (${projectChangeCount})` : ''}</button
           >
           <button class:active={projectTab === 'accounts'} onclick={() => (projectTab = 'accounts')}>Accounts</button>
+        {:else}
+          <button class:active={settingsTab === 'guidance'} onclick={() => showSettings('guidance')}>Guidance</button>
+          <button class:active={settingsTab === 'remote'} onclick={() => showSettings('remote')}>Remote</button>
+          <button class:active={settingsTab === 'sync'} onclick={() => showSettings('sync')}
+            >Sync{configSyncProblem ? ' (!)' : ''}</button
+          >
+          <button class:active={settingsTab === 'claude'} onclick={() => showSettings('claude')}>Claude</button>
         {/if}
       </nav>
 
@@ -1093,6 +1200,7 @@
                 items={items.filter((i) => i.project === project.name)}
                 onShowWorker={showProjectWorker}
                 onOpenSetup={() => openProjectSetup(project.name)}
+                onChanged={loadProjects}
                 onError={showError}
               />
             {/key}
@@ -1158,6 +1266,73 @@
             {/key}
           {/if}
         </div>
+
+        <div class="overview" class:hidden={view !== 'settings' || settingsTab !== 'guidance'}>
+          <GuidanceSettings
+            bind:this={guidanceSettings}
+            visible={view === 'settings' && settingsTab === 'guidance'}
+            onError={showError}
+            onUnsavedChange={(unsaved) => (guidanceUnsaved = unsaved)}
+          />
+        </div>
+
+        <div class="overview" class:hidden={view !== 'settings' || settingsTab !== 'remote'}>
+          <RemoteSettings
+            visible={view === 'settings' && settingsTab === 'remote'}
+            sync={configSync}
+            onSync={(r) => (configSync = r)}
+            onError={showError}
+          />
+        </div>
+
+        <div class="overview" class:hidden={view !== 'settings' || settingsTab !== 'sync'}>
+          <SyncSettings
+            visible={view === 'settings' && settingsTab === 'sync'}
+            sync={configSync}
+            onSync={(r) => (configSync = r)}
+            onResolve={resolveWithClaude}
+            onShowRemote={() => showSettings('remote')}
+            onError={showError}
+          />
+        </div>
+
+        <div class="overview" class:hidden={view !== 'settings' || settingsTab !== 'claude' || settingsOpen}>
+          <div class="setup-intro">
+            <h2>Config with Claude</h2>
+            <p class="muted">
+              A Claude session in the config repo's sync worktree, where syncs bring in the remote's changes. It
+              resolves conflicts and fixes config held back from the remote, then runs <code>tw config sync</code>.
+            </p>
+            <button class="primary" onclick={openSettingsSession}>Start session</button>
+          </div>
+        </div>
+
+        {#if settingsOpen}
+          <div class="term-wrap" class:hidden={!terminalVisible(SETTINGS_SESSION)}>
+            <div class="setup-bar">
+              <strong>Settings session</strong>
+              <span class="spacer"></span>
+              {#if exited[SETTINGS_SESSION]}
+                <button class="primary" onclick={openSettingsSession}>Resume</button>
+              {:else}
+                <button onclick={() => api.stop(SETTINGS_SESSION).catch((e) => showError(String(e)))}>Stop</button>
+                <button
+                  title="Repaint the terminal if its screen looks garbled (Ctrl+Shift+L)"
+                  onclick={() => redrawTerminal(SETTINGS_SESSION)}>Redraw</button
+                >
+              {/if}
+              <button onclick={newSettingsConversation}>New conversation</button>
+            </div>
+            <div class="term-host">
+              <Terminal
+                workerId={SETTINGS_SESSION}
+                visible={terminalVisible(SETTINGS_SESSION)}
+                generation={generations[SETTINGS_SESSION] ?? 0}
+                onError={showError}
+              />
+            </div>
+          </div>
+        {/if}
 
         {#if shownJob}
           {#key shownJob.tab}
@@ -1280,6 +1455,10 @@
 
   {#if newProjectOpen}
     <NewProjectDialog onCreated={projectCreated} onClose={() => (newProjectOpen = false)} />
+  {/if}
+
+  {#if firstRun}
+    <FirstRunDialog onDone={() => location.reload()} />
   {/if}
 
   <ConfirmDialog />
@@ -1434,6 +1613,17 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+  }
+  .project.broken {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    border-left-color: var(--bad);
+  }
+  .error-text {
+    color: var(--bad);
+    font-size: 12px;
+    overflow-wrap: anywhere;
   }
   .setup-badge {
     flex: none;
@@ -1611,6 +1801,23 @@
   .memory-text {
     flex: 1;
     min-width: 0;
+  }
+  .sync-bar {
+    flex: none;
+    background: var(--panel);
+    border-bottom: 1px solid var(--warn);
+    padding: 7px 12px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .sync-dot {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--warn);
   }
   .error-bar {
     flex: none;

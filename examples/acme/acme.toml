@@ -10,11 +10,11 @@ Start the API and the web app with `tw service start <name>` (`api`, `web`), whi
 
 [[repos]]
 name = "acme-api"
-source = 'C:\Source\acme\acme-api'
+repo = "acme/acme-api"
 
 [[repos]]
 name = "acme-web"
-source = 'C:\Source\acme\acme-web'
+repo = "acme/acme-web"
 
 [ports]
 api = 4000

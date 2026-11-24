@@ -12,6 +12,7 @@ keyring = { version = "3", features = ["windows-native", "apple-native", "sync-s
 minijinja = "2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_ignored = "0.1.14"
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 thiserror = "2.0.21"
 toml = "1.1.8"

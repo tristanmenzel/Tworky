@@ -10,10 +10,16 @@
     items: Item[]
     onShowWorker: (worker: Worker) => void
     onOpenSetup: () => void
+    onChanged: () => void
     onError: (message: string) => void
   }
 
-  let { project, workers, items, onShowWorker, onOpenSetup, onError }: Props = $props()
+  let { project, workers, items, onShowWorker, onOpenSetup, onChanged, onError }: Props = $props()
+
+  const notCloned = $derived(project.repos.filter((r) => r.source === null))
+  let cloning = $state<string[]>([])
+  let finding = $state(false)
+  let findResult = $state<string | null>(null)
 
   const ports = $derived(Object.entries(project.ports))
   const hooks = $derived([
@@ -26,6 +32,32 @@
     return Object.entries(run)
       .map(([os, command]) => `${os}: ${command}`)
       .join('\n')
+  }
+
+  async function clone(repo: string) {
+    cloning = [...cloning, repo]
+    try {
+      await api.cloneProjectRepo(project.name, repo)
+      onChanged()
+    } catch (e) {
+      onError(String(e))
+    } finally {
+      cloning = cloning.filter((r) => r !== repo)
+    }
+  }
+
+  async function findClones() {
+    finding = true
+    findResult = null
+    try {
+      const found = await api.findProjectClones(project.name)
+      findResult = found.length ? null : 'No clones found under the source roots.'
+      if (found.length) onChanged()
+    } catch (e) {
+      onError(String(e))
+    } finally {
+      finding = false
+    }
   }
 
   async function openConfig() {
@@ -65,6 +97,16 @@
     </section>
   {/if}
 
+  {#if project.warnings.length}
+    <section class="box warnings">
+      <strong>Warnings</strong>
+      <span class="muted">Another machine may run a newer Tworky that knows these keys. This one ignores them.</span>
+      <ul>
+        {#each project.warnings as w (w)}<li>{w}</li>{/each}
+      </ul>
+    </section>
+  {/if}
+
   <section class="box">
     <h2>Matching</h2>
     <dl>
@@ -87,12 +129,38 @@
   </section>
 
   <section class="box">
-    <h2>Repositories</h2>
+    <div class="box-head">
+      <h2>Repositories</h2>
+      {#if notCloned.length}
+        <button onclick={findClones} disabled={finding} title="Look under the source roots for clones of these repos">
+          {finding ? 'Looking…' : 'Find clones'}
+        </button>
+      {/if}
+    </div>
+    {#if findResult}<p class="muted small">{findResult}</p>{/if}
     <table>
-      <thead><tr><th>Name</th><th>Source</th><th>Base</th></tr></thead>
+      <thead><tr><th>Name</th><th>GitHub</th><th>Clone</th><th>Base</th></tr></thead>
       <tbody>
         {#each project.repos as r (r.name)}
-          <tr><td>{r.name}</td><td><code>{r.source}</code></td><td><code>{r.base}</code></td></tr>
+          <tr>
+            <td>{r.name}</td>
+            <td
+              >{#if r.repo}<code>{r.repo}</code>{:else}<span class="muted">not set</span>{/if}</td
+            >
+            <td>
+              {#if r.source !== null}
+                <code>{r.source}</code>
+              {:else}
+                <span class="not-cloned">not cloned</span>
+                {#if r.repo}
+                  <button onclick={() => clone(r.name)} disabled={cloning.includes(r.name)}>
+                    {cloning.includes(r.name) ? 'Cloning…' : 'Clone'}
+                  </button>
+                {/if}
+              {/if}
+            </td>
+            <td><code>{r.base}</code></td>
+          </tr>
         {/each}
       </tbody>
     </table>
@@ -200,6 +268,26 @@
     display: flex;
     gap: 6px;
     flex: none;
+  }
+  .warnings {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border-color: var(--warn);
+  }
+  .warnings ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+  .box-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+  .not-cloned {
+    color: var(--warn);
+    margin-right: 6px;
   }
   .onboarding {
     display: flex;

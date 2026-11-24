@@ -6,7 +6,7 @@ Start the app with `tw service start app`. It runs on this worker's Vite port (`
 
 [[repos]]
 name = "Tworky"
-source = 'C:\Source\Tworky'
+repo = "tristanmenzel/Tworky"
 
 [ports]
 vite = 1420

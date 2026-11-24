@@ -1,9 +1,8 @@
-use std::path::Path;
-
 use anyhow::{Context, Result, bail};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 
-use crate::config::{AccountConfig, ProjectConfig};
+use crate::config::{AccountConfig, Paths, ProjectConfig};
+use crate::config_repo;
 use crate::ports::PortMap;
 
 const CREDENTIAL_SERVICE: &str = "tworky";
@@ -116,6 +115,7 @@ pub fn unusable_services(
 /// Adds the account, or replaces the one called `previous` (moving its password on a rename).
 /// Edits the file in place so comments and the layout of other keys survive.
 pub fn save_account(
+    paths: &Paths,
     project: &ProjectConfig,
     previous: Option<&str>,
     account: &AccountConfig,
@@ -145,21 +145,26 @@ pub fn save_account(
             account.name
         );
     }
-    edit_accounts(&project.file, |tables| {
-        let existing = previous.and_then(|name| {
-            tables
-                .iter_mut()
-                .find(|t| t.get("name").and_then(Item::as_str) == Some(name))
-        });
-        match existing {
-            Some(table) => write_account(table, account),
-            None => {
-                let mut table = Table::new();
-                write_account(&mut table, account);
-                tables.push(table);
+    edit_accounts(
+        paths,
+        project,
+        &format!("Save account {} in {}", account.name, project.name),
+        |tables| {
+            let existing = previous.and_then(|name| {
+                tables
+                    .iter_mut()
+                    .find(|t| t.get("name").and_then(Item::as_str) == Some(name))
+            });
+            match existing {
+                Some(table) => write_account(table, account),
+                None => {
+                    let mut table = Table::new();
+                    write_account(&mut table, account);
+                    tables.push(table);
+                }
             }
-        }
-    })?;
+        },
+    )?;
     // Credential Manager matches targets ignoring case, so on Windows a case-only rename
     // already names the same credential and moving it would delete it.
     let same_credential = |old: &str| {
@@ -179,9 +184,15 @@ pub fn save_account(
 }
 
 /// Allows the account's password to be filled on `origin` too, unless it already is.
-pub fn add_login_origin(project: &ProjectConfig, account: &str, origin: &str) -> Result<()> {
+pub fn add_login_origin(
+    paths: &Paths,
+    project: &ProjectConfig,
+    account: &str,
+    origin: &str,
+) -> Result<()> {
     let mut found = false;
-    edit_accounts(&project.file, |tables| {
+    let message = format!("Allow {account} of {} to sign in on {origin}", project.name);
+    edit_accounts(paths, project, &message, |tables| {
         let Some(table) = tables
             .iter_mut()
             .find(|t| t.get("name").and_then(Item::as_str) == Some(account))
@@ -238,8 +249,9 @@ pub fn login_origin_to_save(project: &ProjectConfig, worker: &PortMap, origin: &
     }
 }
 
-pub fn remove_account(project: &ProjectConfig, name: &str) -> Result<()> {
-    edit_accounts(&project.file, |tables| {
+pub fn remove_account(paths: &Paths, project: &ProjectConfig, name: &str) -> Result<()> {
+    let message = format!("Remove account {name} from {}", project.name);
+    edit_accounts(paths, project, &message, |tables| {
         tables.retain(|t| t.get("name").and_then(Item::as_str) != Some(name))
     })?;
     delete_password(&project.name, name)
@@ -287,9 +299,15 @@ fn set_or_remove(table: &mut Table, key: &str, item: Option<Item>) {
     }
 }
 
-/// Applies `change` to the file's `[[accounts]]` and writes it atomically, refusing a result
-/// that no longer parses as a project.
-fn edit_accounts(file: &Path, change: impl FnOnce(&mut ArrayOfTables)) -> Result<()> {
+/// Writes atomically and commits, refusing a result that no longer parses as a project.
+fn edit_accounts(
+    paths: &Paths,
+    project: &ProjectConfig,
+    message: &str,
+    change: impl FnOnce(&mut ArrayOfTables),
+) -> Result<()> {
+    let guard = config_repo::lock_for_write(paths)?;
+    let file = &project.file;
     let text =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let mut doc: DocumentMut = text
@@ -307,9 +325,9 @@ fn edit_accounts(file: &Path, change: impl FnOnce(&mut ArrayOfTables)) -> Result
     }
     let out = doc.to_string();
     toml::from_str::<ProjectConfig>(&out).context("the edited project config")?;
-    let tmp = file.with_extension("toml.tmp");
-    std::fs::write(&tmp, &out)?;
-    std::fs::rename(&tmp, file).with_context(|| format!("writing {}", file.display()))
+    crate::memory::write_atomic(file, out.as_bytes())?;
+    config_repo::commit_logged(&guard, paths, &[file], message);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -414,9 +432,16 @@ name = "queue"
 run = "npm run queue"
 "#;
 
-    fn project(dir: &Path, text: &str) -> ProjectConfig {
-        let file = dir.join("acme.toml");
-        std::fs::write(&file, text).unwrap();
+    fn home(dir: &std::path::Path) -> Paths {
+        Paths {
+            config_dir: dir.join("config"),
+            data_dir: dir.join("data"),
+        }
+    }
+
+    fn project(dir: &std::path::Path, text: &str) -> ProjectConfig {
+        let paths = config_repo::test_home(dir);
+        let file = crate::config::write_project(&paths, "acme", text);
         let mut p: ProjectConfig = toml::from_str(text).unwrap();
         p.file = file;
         p
@@ -445,15 +470,24 @@ run = "npm run queue"
     fn save_adds_and_replaces_keeping_comments() {
         let dir = tempfile::tempdir().unwrap();
         let p = project(dir.path(), PROJECT);
-        save_account(&p, None, &tester()).unwrap();
+        save_account(&home(dir.path()), &p, None, &tester()).unwrap();
         let (text, p) = reload(&p);
         assert!(text.contains("# Acme") && text.contains("# inline comment"));
         assert_eq!(p.accounts, vec![tester()]);
+        let paths = home(dir.path());
+        assert_eq!(
+            config_repo::log_for_tests(&paths)[0],
+            "Save account Tester 1 in acme"
+        );
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&paths),
+            ["projects/acme/project.toml"]
+        );
 
         let mut changed = tester();
         changed.mobile = true;
         changed.login_origins.clear();
-        save_account(&p, Some("Tester 1"), &changed).unwrap();
+        save_account(&home(dir.path()), &p, Some("Tester 1"), &changed).unwrap();
         let (text, p) = reload(&p);
         assert!(!text.contains("login_origins"));
         assert_eq!(p.accounts, vec![changed]);
@@ -463,9 +497,9 @@ run = "npm run queue"
     fn save_refuses_a_duplicate_name() {
         let dir = tempfile::tempdir().unwrap();
         let p = project(dir.path(), PROJECT);
-        save_account(&p, None, &tester()).unwrap();
+        save_account(&home(dir.path()), &p, None, &tester()).unwrap();
         let (_, p) = reload(&p);
-        assert!(save_account(&p, None, &tester()).is_err());
+        assert!(save_account(&home(dir.path()), &p, None, &tester()).is_err());
     }
 
     #[test]
@@ -474,30 +508,33 @@ run = "npm run queue"
         let p = project(dir.path(), PROJECT);
         let mut admin = tester();
         admin.name = "Admin".into();
-        save_account(&p, None, &admin).unwrap();
+        save_account(&home(dir.path()), &p, None, &admin).unwrap();
         let (_, p) = reload(&p);
         admin.name = "admin".into();
-        let err = save_account(&p, None, &admin).unwrap_err().to_string();
+        let err = save_account(&home(dir.path()), &p, None, &admin)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("already has an account"), "{err}");
-        save_account(&p, Some("Admin"), &admin).expect("renaming it only changes its case");
+        save_account(&home(dir.path()), &p, Some("Admin"), &admin)
+            .expect("renaming it only changes its case");
     }
 
     #[test]
     fn save_switches_between_a_start_url_and_a_start_service() {
         let dir = tempfile::tempdir().unwrap();
         let p = project(dir.path(), PROJECT);
-        save_account(&p, None, &tester()).unwrap();
+        save_account(&home(dir.path()), &p, None, &tester()).unwrap();
         let (_, p) = reload(&p);
 
         let mut by_service = tester();
         by_service.start_url.clear();
         by_service.start_service = Some("web".into());
-        save_account(&p, Some("Tester 1"), &by_service).unwrap();
+        save_account(&home(dir.path()), &p, Some("Tester 1"), &by_service).unwrap();
         let (text, p) = reload(&p);
         assert!(!text.contains("start_url"), "{text}");
         assert_eq!(p.accounts, vec![by_service]);
 
-        save_account(&p, Some("Tester 1"), &tester()).unwrap();
+        save_account(&home(dir.path()), &p, Some("Tester 1"), &tester()).unwrap();
         let (text, p) = reload(&p);
         assert!(!text.contains("start_service"), "{text}");
         assert_eq!(p.accounts, vec![tester()]);
@@ -509,10 +546,10 @@ run = "npm run queue"
         let p = project(dir.path(), PROJECT);
         let mut neither = tester();
         neither.start_url = " ".into();
-        assert!(save_account(&p, None, &neither).is_err());
+        assert!(save_account(&home(dir.path()), &p, None, &neither).is_err());
         let mut both = tester();
         both.start_service = Some("web".into());
-        assert!(save_account(&p, None, &both).is_err());
+        assert!(save_account(&home(dir.path()), &p, None, &both).is_err());
     }
 
     #[test]
@@ -522,13 +559,17 @@ run = "npm run queue"
         let mut account = tester();
         account.start_url.clear();
         account.start_service = Some("nope".into());
-        let err = save_account(&p, None, &account).unwrap_err().to_string();
+        let err = save_account(&home(dir.path()), &p, None, &account)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("names service nope, which doesn't exist"),
             "{err}"
         );
         account.start_service = Some("queue".into());
-        let err = save_account(&p, None, &account).unwrap_err().to_string();
+        let err = save_account(&home(dir.path()), &p, None, &account)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("names service queue, which has no port"),
             "{err}"
@@ -536,7 +577,9 @@ run = "npm run queue"
 
         let mut by_origin = tester();
         by_origin.login_origins.push("service:nope".into());
-        let err = save_account(&p, None, &by_origin).unwrap_err().to_string();
+        let err = save_account(&home(dir.path()), &p, None, &by_origin)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("names service nope"), "{err}");
         assert!(reload(&p).1.accounts.is_empty());
     }
@@ -547,28 +590,28 @@ run = "npm run queue"
         let p = project(dir.path(), PROJECT);
         let mut bare = tester();
         bare.login_origins.clear();
-        save_account(&p, None, &bare).unwrap();
+        save_account(&home(dir.path()), &p, None, &bare).unwrap();
         let (_, p) = reload(&p);
 
-        add_login_origin(&p, "Tester 1", "service:web").unwrap();
-        add_login_origin(&p, "Tester 1", "https://login.example").unwrap();
-        add_login_origin(&p, "Tester 1", "service:web").unwrap();
+        add_login_origin(&home(dir.path()), &p, "Tester 1", "service:web").unwrap();
+        add_login_origin(&home(dir.path()), &p, "Tester 1", "https://login.example").unwrap();
+        add_login_origin(&home(dir.path()), &p, "Tester 1", "service:web").unwrap();
         let (text, p) = reload(&p);
         assert!(text.contains("# Acme") && text.contains("# inline comment"));
         assert_eq!(
             p.accounts[0].login_origins,
             vec!["service:web".to_string(), "https://login.example".into()]
         );
-        assert!(add_login_origin(&p, "Nobody", "service:web").is_err());
+        assert!(add_login_origin(&home(dir.path()), &p, "Nobody", "service:web").is_err());
     }
 
     #[test]
     fn removing_the_last_account_drops_the_key() {
         let dir = tempfile::tempdir().unwrap();
         let p = project(dir.path(), PROJECT);
-        save_account(&p, None, &tester()).unwrap();
+        save_account(&home(dir.path()), &p, None, &tester()).unwrap();
         let (_, p) = reload(&p);
-        edit_accounts(&p.file, |t| t.clear()).unwrap();
+        edit_accounts(&home(dir.path()), &p, "Clear", |t| t.clear()).unwrap();
         let (text, p) = reload(&p);
         assert!(!text.contains("accounts"));
         assert!(p.accounts.is_empty());

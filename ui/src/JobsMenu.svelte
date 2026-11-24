@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import { formatBytes, jobLabel } from './issue'
   import { overlay } from './overlay.svelte'
 
@@ -20,7 +21,7 @@
 
   $effect(() => {
     if (!open) return
-    overlay.open++
+    untrack(() => overlay.open++)
     return () => overlay.open--
   })
 

@@ -14,13 +14,15 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tworky_core::activity::{self, AccountRequest, Activity, Handover, Phase, Session};
-use tworky_core::config::Paths;
+use tworky_core::config::{Os, Paths};
+use tworky_core::config_repo;
 use tworky_core::existing::WorkSubject;
 use tworky_core::github;
 use tworky_core::hierarchy::IssueIndex;
 use tworky_core::items::{AddOutcome, Listed, ProjectChoice};
 use tworky_core::memory;
 use tworky_core::project_setup;
+use tworky_core::settings_session;
 use tworky_core::state::WorkerRecord;
 use tworky_core::worker::{PrSummary, Workspace};
 use tworky_core::{build_info, feedback, update};
@@ -341,6 +343,7 @@ async fn set_board_status(
 #[derive(Serialize)]
 struct ProjectMemory {
     project: String,
+    os: Option<Os>,
     path: String,
     text: String,
     hash: String,
@@ -350,14 +353,106 @@ struct ProjectMemory {
 async fn list_memories() -> CmdResult<Vec<ProjectMemory>> {
     blocking(|| {
         let ws = workspace()?;
+        let targets = std::iter::once(None).chain(Os::ALL.map(Some));
         ws.config
             .projects
             .iter()
-            .map(|p| {
-                let path = ws.config.paths.memory_file(&p.name);
+            .flat_map(|p| targets.clone().map(move |os| (p, os)))
+            .map(|(p, os)| {
+                let path = ws.config.paths.memory_file(&p.name, os);
                 let text = memory::read(&path).map_err(err)?;
                 Ok(ProjectMemory {
                     project: p.name.clone(),
+                    os,
+                    hash: memory::hash(&text),
+                    text,
+                    path: path.display().to_string(),
+                })
+            })
+            .collect()
+    })
+    .await
+}
+
+#[derive(Serialize)]
+struct SessionGuidanceSize {
+    os: Os,
+    bytes: u64,
+    /// The project whose memory was counted: the one asked about, or without one the project with
+    /// the most memory on this OS.
+    project: Option<String>,
+    /// What the session's guidance hook weighs, headers included: past `budget`, sessions get the
+    /// files' paths instead of their text.
+    measured: usize,
+    budget: usize,
+}
+
+/// The combined size of the guidance and memory a session on this OS loads: one of `project`, or
+/// without a project, one of the project with the most memory.
+#[tauri::command]
+async fn session_guidance_size(project: Option<String>) -> CmdResult<SessionGuidanceSize> {
+    blocking(move || {
+        let paths = Paths::resolve().map_err(err)?;
+        let os = Os::current();
+        let size = |files: &[PathBuf]| -> u64 {
+            files
+                .iter()
+                .filter_map(|f| std::fs::metadata(f).ok())
+                .map(|m| m.len())
+                .sum()
+        };
+        let project = match project {
+            Some(project) => Some(project),
+            None => workspace().ok().and_then(|ws| {
+                ws.config
+                    .projects
+                    .iter()
+                    .max_by_key(|p| {
+                        size(&[
+                            paths.memory_file(&p.name, None),
+                            paths.memory_file(&p.name, Some(os)),
+                        ])
+                    })
+                    .map(|p| p.name.clone())
+            }),
+        };
+        let bytes = match &project {
+            Some(project) => size(&tworky_core::worker::session_guidance_files(
+                &paths, project, os,
+            )),
+            None => size(&paths.guidance_files(os)),
+        };
+        Ok(SessionGuidanceSize {
+            os,
+            bytes,
+            measured: tworky_core::worker::guidance_hook_size(&paths, project.as_deref(), os),
+            budget: tworky_core::worker::GUIDANCE_BUDGET,
+            project,
+        })
+    })
+    .await
+}
+
+#[derive(Serialize)]
+struct GuidanceFile {
+    os: Option<Os>,
+    path: String,
+    text: String,
+    hash: String,
+}
+
+/// The user's guidance for every session, then its refinement for each OS.
+#[tauri::command]
+async fn list_guidance() -> CmdResult<Vec<GuidanceFile>> {
+    blocking(|| {
+        let paths = Paths::resolve().map_err(err)?;
+        std::iter::once(None)
+            .chain(Os::ALL.map(Some))
+            .map(|os| {
+                let path = paths.guidance_file(os);
+                let text = memory::read(&path).map_err(err)?;
+                Ok(GuidanceFile {
+                    os,
                     hash: memory::hash(&text),
                     text,
                     path: path.display().to_string(),
@@ -369,11 +464,22 @@ async fn list_memories() -> CmdResult<Vec<ProjectMemory>> {
 }
 
 #[tauri::command]
-async fn save_memory(project: String, base: String, text: String) -> CmdResult<()> {
+async fn save_guidance(os: Option<Os>, base: String, text: String) -> CmdResult<()> {
+    blocking(move || {
+        let paths = Paths::resolve().map_err(err)?;
+        memory::save_guidance(&paths, os, &base, &text).map_err(err)?;
+        wake_config_sync();
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn save_memory(project: String, os: Option<Os>, base: String, text: String) -> CmdResult<()> {
     blocking(move || {
         let ws = workspace()?;
         ws.config.project(&project).ok_or("no such project")?;
-        memory::save(&ws.config.paths.memory_file(&project), &base, &text).map_err(err)
+        memory::save(&ws.config.paths, &project, os, &base, &text).map_err(err)
     })
     .await
 }
@@ -410,11 +516,15 @@ async fn list_memory_changes() -> CmdResult<Vec<ProjectMemoryChanges>> {
 }
 
 #[tauri::command]
-async fn approve_memory_changes(project: String, ids: Vec<String>, base: String) -> CmdResult<()> {
+async fn approve_memory_changes(
+    project: String,
+    ids: Vec<String>,
+    bases: Vec<memory::Base>,
+) -> CmdResult<()> {
     blocking(move || {
         let ws = workspace()?;
         ws.config.project(&project).ok_or("no such project")?;
-        memory::approve(&ws.config.paths, &project, &ids, &base).map_err(err)
+        memory::approve(&ws.config.paths, &project, &ids, &bases).map_err(err)
     })
     .await
 }
@@ -622,7 +732,7 @@ async fn list_projects(app: AppHandle) -> CmdResult<Vec<ProjectSummary>> {
                 Ok(ProjectSummary {
                     config: p.clone(),
                     file: p.file.clone(),
-                    memory_file: ws.config.paths.memory_file(&p.name),
+                    memory_file: ws.config.paths.memory_file(&p.name, None),
                     setup_alive: sessions.is_alive(&setup_session),
                     setup_started: ws
                         .state
@@ -633,6 +743,37 @@ async fn list_projects(app: AppHandle) -> CmdResult<Vec<ProjectSummary>> {
                 })
             })
             .collect()
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_project_errors() -> CmdResult<BTreeMap<String, String>> {
+    blocking(|| Ok(workspace()?.config.project_errors)).await
+}
+
+/// Problems with the config as a whole: the config repo not set up, `machine.toml` not loading, or
+/// the last commit or sweep failing.
+#[tauri::command]
+async fn list_config_errors() -> CmdResult<Vec<String>> {
+    blocking(|| Ok(workspace()?.config.load_errors)).await
+}
+
+#[tauri::command]
+async fn clone_project_repo(project: String, repo: String) -> CmdResult<PathBuf> {
+    blocking(move || {
+        workspace()?
+            .clone_project_repo(&project, &repo)
+            .map_err(err)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn find_project_clones(project: String) -> CmdResult<Vec<tworky_core::config::FoundSource>> {
+    blocking(move || {
+        let ws = workspace()?;
+        tworky_core::config::find_sources(&ws.config, Some(&project)).map_err(err)
     })
     .await
 }
@@ -694,8 +835,10 @@ async fn save_account(
     account: tworky_core::config::AccountConfig,
 ) -> CmdResult<()> {
     blocking(move || {
-        let p = project_named(&workspace()?, &project)?;
-        tworky_core::accounts::save_account(&p, previous.as_deref(), &account).map_err(err)
+        let ws = workspace()?;
+        let p = project_named(&ws, &project)?;
+        tworky_core::accounts::save_account(&ws.config.paths, &p, previous.as_deref(), &account)
+            .map_err(err)
     })
     .await
 }
@@ -703,8 +846,9 @@ async fn save_account(
 #[tauri::command]
 async fn remove_account(project: String, name: String) -> CmdResult<()> {
     blocking(move || {
-        let p = project_named(&workspace()?, &project)?;
-        tworky_core::accounts::remove_account(&p, &name).map_err(err)
+        let ws = workspace()?;
+        let p = project_named(&ws, &project)?;
+        tworky_core::accounts::remove_account(&ws.config.paths, &p, &name).map_err(err)
     })
     .await
 }
@@ -932,11 +1076,18 @@ async fn open_session(
     blocking(move || {
         let state = app.state::<AppState>();
         if !state.sessions.is_alive(&id) {
-            let ws = workspace()?;
+            let paths = Paths::resolve().map_err(err)?;
+            let settings = id == settings_session::SESSION_ID;
+            let ws = if settings { None } else { Some(workspace()?) };
             let setup = project_setup::session_project(&id).map(String::from);
-            let mut launch = match &setup {
-                Some(project) => ws.launch_project_setup(project).map_err(err)?,
-                None => {
+            let mut launch = match (&ws, &setup) {
+                (None, _) => settings_session::launch(
+                    &paths,
+                    tworky_core::claude_config::claude_home().as_deref(),
+                )
+                .map_err(err)?,
+                (Some(ws), Some(project)) => ws.launch_project_setup(project).map_err(err)?,
+                (Some(ws), None) => {
                     let mcp = app.try_state::<browser::Mcp>().map(|mcp| mcp.endpoint(&id));
                     ws.launch(&id, mcp.as_ref()).map_err(err)?
                 }
@@ -958,9 +1109,7 @@ async fn open_session(
                     &format!("could not pre-trust the session folder: {e:#}"),
                 );
             }
-            if let Ok(paths) = Paths::resolve() {
-                let _ = activity::launching(&paths, &id);
-            }
+            let _ = activity::launching(&paths, &id);
             let exit_app = app.clone();
             let exit_id = id.clone();
             state
@@ -970,9 +1119,12 @@ async fn open_session(
                     let _ = exit_app.emit("worker-changed", &exit_id);
                 })
                 .map_err(err)?;
-            match &setup {
-                Some(project) => ws.mark_project_session_started(project).map_err(err)?,
-                None => ws.mark_claude_started(&id).map_err(err)?,
+            match (&ws, &setup) {
+                (None, _) => settings_session::mark_started(&paths).map_err(err)?,
+                (Some(ws), Some(project)) => {
+                    ws.mark_project_session_started(project).map_err(err)?
+                }
+                (Some(ws), None) => ws.mark_claude_started(&id).map_err(err)?,
             }
             let _ = app.emit("worker-changed", &id);
         }
@@ -1097,6 +1249,7 @@ fn watch_activity(app: AppHandle) {
     let Ok(paths) = Paths::resolve() else { return };
     let mut memory_changes = memory_change_names(&paths);
     let mut memory_files = memory_file_stamps(&paths);
+    let mut config_sync = None;
     let mut freshness = freshness::Freshness::default();
     let mut live_before = HashMap::new();
     loop {
@@ -1107,6 +1260,13 @@ fn watch_activity(app: AppHandle) {
             memory_changes = names;
             memory_files = stamps;
             let _ = app.emit("memory-changes", ());
+        }
+        let sync_stamp = file_stamp(&paths.config_sync_file());
+        if sync_stamp != config_sync {
+            config_sync = sync_stamp;
+            if let Ok(record) = config_repo::sync_status(&paths) {
+                let _ = app.emit("config-sync", record);
+            }
         }
         let state = app.state::<AppState>();
         // Liveness first: a launch between the two reads would otherwise pair its new generation
@@ -1200,21 +1360,341 @@ fn memory_change_names(paths: &Paths) -> BTreeSet<String> {
     names
 }
 
-/// Each memory file's modified time and size, so an edit from anywhere refreshes open diffs.
+/// Each memory and guidance file's modified time and size, so an edit from anywhere, or a sync,
+/// refreshes open diffs and views.
 fn memory_file_stamps(paths: &Paths) -> BTreeMap<String, (Option<std::time::SystemTime>, u64)> {
     let mut stamps = BTreeMap::new();
-    let Ok(files) = std::fs::read_dir(paths.config_dir.join("memory")) else {
+    for file in std::iter::once(None)
+        .chain(Os::ALL.map(Some))
+        .map(|os| paths.guidance_file(os))
+    {
+        if let Some(stamp) = file_stamp(&file) {
+            stamps.insert(file.display().to_string(), stamp);
+        }
+    }
+    let Ok(projects) = std::fs::read_dir(paths.repo_projects_dir()) else {
         return stamps;
     };
-    for file in files.flatten() {
-        let name = file.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".md")
-            && let Ok(meta) = file.metadata()
-        {
-            stamps.insert(name, (meta.modified().ok(), meta.len()));
+    for project in projects.flatten() {
+        let Ok(files) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            if name.starts_with("memory")
+                && name.ends_with(".md")
+                && let Ok(meta) = file.metadata()
+            {
+                let key = format!("{}/{name}", project.file_name().to_string_lossy());
+                stamps.insert(key, (meta.modified().ok(), meta.len()));
+            }
         }
     }
     stamps
+}
+
+fn file_stamp(file: &std::path::Path) -> Option<(Option<std::time::SystemTime>, u64)> {
+    let meta = std::fs::metadata(file).ok()?;
+    Some((meta.modified().ok(), meta.len()))
+}
+
+#[tauri::command]
+async fn config_sync_status() -> CmdResult<config_repo::SyncRecord> {
+    blocking(|| config_repo::sync_status(&Paths::resolve().map_err(err)?).map_err(err)).await
+}
+
+#[tauri::command]
+async fn sync_config_now() -> CmdResult<config_repo::SyncRecord> {
+    blocking(|| {
+        let paths = Paths::resolve().map_err(err)?;
+        config_repo::sync(&paths, config_repo::Trigger::User).map_err(err)
+    })
+    .await
+}
+
+/// Readies the settings session to resolve the stopped sync, stopping it when its conversation is
+/// about another one. Returns whether it was restarted.
+#[tauri::command]
+async fn prepare_settings_resolve(app: AppHandle) -> CmdResult<bool> {
+    blocking(move || {
+        let restarted =
+            settings_session::prepare_resolve(&Paths::resolve().map_err(err)?).map_err(err)?;
+        if restarted {
+            app.state::<AppState>()
+                .sessions
+                .kill(settings_session::SESSION_ID);
+        }
+        Ok(restarted)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn abort_config_sync() -> CmdResult<config_repo::SyncRecord> {
+    blocking(|| config_repo::abort(&Paths::resolve().map_err(err)?).map_err(err)).await
+}
+
+#[tauri::command]
+async fn dismiss_config_incoming() -> CmdResult<()> {
+    blocking(|| config_repo::dismiss_incoming(&Paths::resolve().map_err(err)?).map_err(err)).await
+}
+
+#[derive(Serialize)]
+struct ConfigRepoStatus {
+    /// With any credentials in it redacted.
+    remote: Option<String>,
+    /// Uncommitted allowlisted files, such as a `project.toml` that doesn't parse.
+    changes: Vec<String>,
+    ahead_behind: Option<(u32, u32)>,
+    stale_index_lock: bool,
+}
+
+#[tauri::command]
+async fn config_repo_status() -> CmdResult<ConfigRepoStatus> {
+    blocking(|| {
+        let paths = Paths::resolve().map_err(err)?;
+        let remote = config_repo::remote_url(&paths).map(|url| config_repo::redact_url(&url));
+        if !paths.has_repo() {
+            return Ok(ConfigRepoStatus {
+                remote,
+                changes: Vec::new(),
+                ahead_behind: None,
+                stale_index_lock: false,
+            });
+        }
+        let status = config_repo::status(&paths).map_err(err)?;
+        Ok(ConfigRepoStatus {
+            remote,
+            changes: status.changes,
+            ahead_behind: status.ahead_behind,
+            stale_index_lock: status.stale_index_lock,
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn config_first_run() -> CmdResult<bool> {
+    blocking(|| {
+        Ok(config_repo::awaits_first_run(
+            &Paths::resolve().map_err(err)?,
+        ))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn start_fresh_config() -> CmdResult<()> {
+    blocking(|| {
+        let paths = Paths::resolve().map_err(err)?;
+        for line in config_repo::migrate(&paths).map_err(err)? {
+            eprintln!("{line}");
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn find_shared_configs() -> CmdResult<Vec<config_repo::SharedConfig>> {
+    blocking(|| config_repo::find_shared_configs(&config_repo::Gh).map_err(err)).await
+}
+
+#[tauri::command]
+async fn use_shared_config(
+    remote: String,
+    seen: Option<config_repo::Seen>,
+) -> CmdResult<ConnectOutcome> {
+    blocking(move || {
+        let paths = Paths::resolve().map_err(err)?;
+        let outcome = connect_outcome(config_repo::use_shared_config(
+            &paths,
+            &config_repo::Gh,
+            &remote,
+            seen,
+        ))?;
+        wake_config_sync();
+        Ok(outcome)
+    })
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ConnectOutcome {
+    Connected {
+        connected: Box<config_repo::Connected>,
+    },
+    /// The remote's check found more than the user saw; they're shown it to confirm again.
+    Changed { check: config_repo::RemoteCheck },
+}
+
+fn connect_outcome(result: anyhow::Result<config_repo::Connected>) -> CmdResult<ConnectOutcome> {
+    match result {
+        Ok(connected) => Ok(ConnectOutcome::Connected {
+            connected: Box::new(connected),
+        }),
+        Err(e) => match e.downcast::<config_repo::CheckChanged>() {
+            Ok(changed) => Ok(ConnectOutcome::Changed { check: changed.0 }),
+            Err(e) => Err(err(e)),
+        },
+    }
+}
+
+#[tauri::command]
+async fn config_github_owners() -> CmdResult<Vec<String>> {
+    blocking(|| tworky_core::github::viewer_owners().map_err(err)).await
+}
+
+#[tauri::command]
+async fn check_config_remote(remote: Option<String>) -> CmdResult<config_repo::RemoteCheck> {
+    blocking(move || {
+        match remote {
+            Some(remote) => config_repo::check_remote(&config_repo::Gh, &remote),
+            None => {
+                config_repo::check_current_remote(&Paths::resolve().map_err(err)?, &config_repo::Gh)
+            }
+        }
+        .map_err(err)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_config_remote(
+    remote: String,
+    seen: Option<config_repo::Seen>,
+) -> CmdResult<ConnectOutcome> {
+    blocking(move || {
+        let paths = Paths::resolve().map_err(err)?;
+        connect_outcome(config_repo::connect_remote(
+            &paths,
+            &config_repo::Gh,
+            &remote,
+            seen,
+        ))
+    })
+    .await
+}
+
+/// Connects the repo's current remote, added outside Tworky, once the user has seen its check.
+#[tauri::command]
+async fn confirm_config_remote(seen: config_repo::Seen) -> CmdResult<ConnectOutcome> {
+    blocking(move || {
+        let paths = Paths::resolve().map_err(err)?;
+        connect_outcome(config_repo::confirm_remote(&paths, &config_repo::Gh, &seen))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn create_config_remote(owner: Option<String>) -> CmdResult<config_repo::Connected> {
+    blocking(move || {
+        let paths = Paths::resolve().map_err(err)?;
+        config_repo::create_remote(&paths, &config_repo::Gh, owner.as_deref()).map_err(err)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn remove_config_remote() -> CmdResult<config_repo::SyncRecord> {
+    blocking(|| config_repo::remove_remote(&Paths::resolve().map_err(err)?).map_err(err)).await
+}
+
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// How long the config repo's `main` must stay put after a commit before it's synced, so a burst
+/// of commits syncs once.
+const COMMIT_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+static CONFIG_SYNC_WAKE: (Mutex<bool>, std::sync::Condvar) =
+    (Mutex::new(false), std::sync::Condvar::new());
+
+/// Sweeps and syncs the config repo soon, as on focus.
+fn wake_config_sync() {
+    let (woken, wake) = &CONFIG_SYNC_WAKE;
+    *woken.lock().unwrap() = true;
+    wake.notify_one();
+}
+
+/// Sweeps the config repo and syncs it with its remote: at start, on focus, every
+/// [`SWEEP_INTERVAL`], and [`COMMIT_DEBOUNCE`] after a commit, which it notices by `main` moving.
+fn sync_config_loop() {
+    use std::time::Instant;
+    let Ok(paths) = Paths::resolve() else { return };
+    let mut due = true;
+    let mut next_interval = Instant::now() + SWEEP_INTERVAL;
+    let mut main = config_repo::main_ref_stamp(&paths);
+    let mut moved_at = None;
+    loop {
+        if due {
+            moved_at = None;
+            next_interval = Instant::now() + SWEEP_INTERVAL;
+            sweep_config(&paths);
+            if paths.has_repo()
+                && let Err(e) = config_repo::sync(&paths, config_repo::Trigger::Background)
+            {
+                eprintln!("config repo: sync failed: {e:#}");
+            }
+            main = config_repo::main_ref_stamp(&paths);
+        }
+        let (woken, wake) = &CONFIG_SYNC_WAKE;
+        let mut woken = wake
+            .wait_timeout(woken.lock().unwrap(), std::time::Duration::from_secs(1))
+            .unwrap()
+            .0;
+        due = std::mem::take(&mut *woken);
+        drop(woken);
+        let now = Instant::now();
+        let stamp = config_repo::main_ref_stamp(&paths);
+        if stamp != main {
+            main = stamp;
+            moved_at = Some(now);
+        }
+        due |= now >= next_interval || moved_at.is_some_and(|at| now - at >= COMMIT_DEBOUNCE);
+    }
+}
+
+/// Commits edits made to the config repo outside Tworky, such as by a setup session.
+fn sweep_config(paths: &Paths) {
+    let swept = (|| {
+        if !paths.has_repo() {
+            return Ok(None);
+        }
+        let guard = config_repo::with_lock(paths)?;
+        config_repo::sweep(&guard, paths).map(Some)
+    })();
+    match swept {
+        Ok(None) => {}
+        Ok(Some(swept)) => {
+            for file in swept.held_back {
+                eprintln!(
+                    "config repo: not committing {}: it doesn't parse",
+                    file.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("config repo: sweep failed: {e:#}"),
+    }
+}
+
+/// Once per start, looks for clones of repos that have no source on this machine.
+fn find_missing_sources() {
+    let found = tworky_core::config::Config::load()
+        .and_then(|config| tworky_core::config::find_sources(&config, None));
+    match found {
+        Ok(found) => {
+            for f in found {
+                eprintln!(
+                    "found {} of {} at {}",
+                    f.repo,
+                    f.project,
+                    f.source.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("looking for clones: {e:#}"),
+    }
 }
 
 #[tauri::command]
@@ -1232,7 +1712,7 @@ fn resize_session(state: State<'_, AppState>, id: String, cols: u16, rows: u16) 
 
 #[tauri::command]
 async fn stop_session(app: AppHandle, id: String) -> CmdResult<()> {
-    if project_setup::session_project(&id).is_some() {
+    if id == settings_session::SESSION_ID || project_setup::session_project(&id).is_some() {
         app.state::<AppState>().sessions.kill(&id);
         let _ = app.emit("worker-changed", &id);
         return Ok(());
@@ -1246,6 +1726,9 @@ async fn stop_session(app: AppHandle, id: String) -> CmdResult<()> {
 async fn new_conversation(app: AppHandle, id: String) -> CmdResult<()> {
     app.state::<AppState>().sessions.kill(&id);
     blocking(move || {
+        if id == settings_session::SESSION_ID {
+            return settings_session::reset(&Paths::resolve().map_err(err)?).map_err(err);
+        }
         let ws = workspace()?;
         match project_setup::session_project(&id) {
             Some(project) => ws.reset_project_session(project),
@@ -1398,6 +1881,16 @@ fn main() {
         Ok(copied) => copied.iter().for_each(|line| eprintln!("{line}")),
         Err(e) => eprintln!("could not migrate work-app folders: {e:#}"),
     }
+    match tworky_core::config::Paths::resolve().and_then(|p| {
+        if config_repo::awaits_first_run(&p) {
+            Ok(vec![])
+        } else {
+            p.migrate_to_repo()
+        }
+    }) {
+        Ok(lines) => lines.iter().for_each(|line| eprintln!("{line}")),
+        Err(e) => eprintln!("{e:#}"),
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(
@@ -1426,7 +1919,14 @@ fn main() {
             let keep_awake_handle = handle.clone();
             std::thread::spawn(move || watch_activity(handle));
             std::thread::spawn(move || keep_awake::run(keep_awake_handle));
+            std::thread::spawn(find_missing_sources);
+            std::thread::spawn(sync_config_loop);
             Ok(())
+        })
+        .on_window_event(|_, event| {
+            if let tauri::WindowEvent::Focused(true) = event {
+                wake_config_sync();
+            }
         })
         .register_asynchronous_uri_scheme_protocol("ghimg", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
@@ -1439,11 +1939,34 @@ fn main() {
             set_issue_state,
             set_board_status,
             list_memories,
+            session_guidance_size,
+            list_guidance,
+            save_guidance,
             save_memory,
             list_memory_changes,
             approve_memory_changes,
             reject_memory_changes,
             list_projects,
+            list_project_errors,
+            list_config_errors,
+            config_sync_status,
+            config_repo_status,
+            sync_config_now,
+            abort_config_sync,
+            prepare_settings_resolve,
+            dismiss_config_incoming,
+            config_first_run,
+            start_fresh_config,
+            find_shared_configs,
+            use_shared_config,
+            config_github_owners,
+            check_config_remote,
+            set_config_remote,
+            confirm_config_remote,
+            create_config_remote,
+            remove_config_remote,
+            clone_project_repo,
+            find_project_clones,
             search_repos,
             list_items,
             create_item,
