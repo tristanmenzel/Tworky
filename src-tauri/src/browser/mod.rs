@@ -143,7 +143,6 @@ pub struct TabView {
     username: Option<String>,
     color: Option<String>,
     viewport: Viewport,
-    mobile: bool,
     url: String,
     loading: bool,
     /// A login form for this account is on the page.
@@ -332,7 +331,6 @@ fn saved_tabs(tabs: &[Arc<Tab>]) -> Vec<SavedTab> {
 fn view(tab: &Tab) -> TabView {
     let state = tab.events.state();
     let account = tab.account();
-    let viewport = tab.viewport();
     let url = url::Url::parse(&state.url).ok();
     let login_fields = match (&account, &url, &state.login) {
         (Some(_), Some(url), Some(form)) if url.origin().ascii_serialization() == form.origin => {
@@ -354,8 +352,7 @@ fn view(tab: &Tab) -> TabView {
         id: tab.id,
         worker: tab.worker.clone(),
         project: tab.project.clone(),
-        viewport,
-        mobile: viewport.mobile(),
+        viewport: tab.viewport(),
         username: account.as_ref().map(|a| a.username.clone()),
         account: account.map(|a| a.name),
         color: tab.color.clone(),

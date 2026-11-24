@@ -183,14 +183,18 @@ fn merge(mut into: Value, from: Value) -> Value {
 }
 
 impl<C: Cdp> Page<'_, C> {
-    /// `{ url, title }`, plus `still_loading` when a wait gave up.
+    /// `{ url, title, viewport }`, plus `still_loading` when a wait gave up.
     pub async fn state(&self, still_loading: bool) -> Value {
         let title = evaluate(self.cdp, "document.title")
             .await
             .ok()
             .and_then(|t| t.as_str().map(str::to_string))
             .unwrap_or_default();
-        let mut state = json!({ "url": self.events.state().url, "title": title });
+        let mut state = json!({
+            "url": self.events.state().url,
+            "title": title,
+            "viewport": self.viewport,
+        });
         if still_loading {
             state["still_loading"] = true.into();
         }
@@ -553,6 +557,7 @@ mod tests {
         loader.await.unwrap();
         assert_eq!(state["url"], "http://localhost:5173/");
         assert_eq!(state["title"], "Home");
+        assert_eq!(state["viewport"], json!({ "kind": "fit" }));
         assert!(state.get("still_loading").is_none());
         assert_eq!(
             cdp.params("Page.navigate")[0]["url"],

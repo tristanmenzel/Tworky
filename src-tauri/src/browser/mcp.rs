@@ -796,7 +796,6 @@ impl TworkyMcp {
             let mut state = page(&cdp, &tab).navigate(&target).await?;
             state["tab"] = tab.id.into();
             state["account"] = tab.account().map(|a| a.name).into();
-            state["viewport"] = json!(tab.viewport());
             if let Some(e) = service_error {
                 state["service_error"] = e.into();
             }
@@ -953,7 +952,6 @@ impl TworkyMcp {
             let (tab, cdp) = self.tab(&ctx, args.tab)?;
             let notes = super::set_viewport(&self.app, &tab, viewport).await?;
             let mut state = page(&cdp, &tab).state(false).await;
-            state["viewport"] = json!(tab.viewport());
             if !notes.is_empty() {
                 state["notes"] = notes.into();
             }

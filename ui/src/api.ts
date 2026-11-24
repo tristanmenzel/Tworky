@@ -354,6 +354,8 @@ export interface AccountsPayload {
   accounts: AccountView[]
 }
 
+export type Viewport = { kind: 'fit' } | { kind: 'fixed'; width: number; height: number; mobile: boolean }
+
 export interface BrowserTabView {
   id: number
   worker: string
@@ -363,8 +365,7 @@ export interface BrowserTabView {
   /** The account's username (its email, for a profile made with Create). */
   username: string | null
   color: string | null
-  viewport: { kind: 'fit' } | { kind: 'fixed'; width: number; height: number; mobile: boolean }
-  mobile: boolean
+  viewport: Viewport
   url: string
   loading: boolean
   can_sign_in: boolean
@@ -489,6 +490,7 @@ export const api = {
   browserResetSession: (tab: number) => invoke<void>('browser_reset_session', { tab }),
   browserStartService: (tab: number) => invoke<void>('browser_start_service', { tab }),
   browserRetry: (tab: number) => invoke<void>('browser_retry', { tab }),
+  browserSetViewport: (tab: number, viewport: Viewport) => invoke<string[]>('browser_set_viewport', { tab, viewport }),
   accounts: (project: string) => invoke<AccountsPayload>('list_accounts', { project }),
   saveAccount: (project: string, previous: string | null, account: Account) =>
     invoke<void>('save_account', { project, previous, account }),
