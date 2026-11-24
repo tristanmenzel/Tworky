@@ -55,7 +55,6 @@ fn with_boards_if_allowed<T>(query: impl Fn(bool) -> Result<T>) -> Result<T> {
     with_boards_reported(query).map(|(value, _)| value)
 }
 
-/// As `with_boards_if_allowed`, also saying whether the board fields were loaded.
 fn with_boards_reported<T>(query: impl Fn(bool) -> Result<T>) -> Result<(T, bool)> {
     match query(true) {
         Err(e) if format!("{e:#}").contains("read:project") => Ok((query(false)?, false)),
@@ -500,7 +499,6 @@ pub struct IssueLookup {
     pub boards_loaded: bool,
 }
 
-/// As `issue_by_url`, also saying whether board fields were loaded.
 pub fn issue_lookup(url: &str, is_subtask: IsSubtask) -> Result<IssueLookup> {
     let (page, boards_loaded) =
         with_boards_reported(|boards| graphql(&resource_query(boards), &[("url", url)]))?;
@@ -642,8 +640,7 @@ fn parse_options(field: &Value) -> Vec<BoardOption> {
         .collect()
 }
 
-/// A Projects board with its single-select Status field, read before any write so a bad board or
-/// status name fails without changing anything.
+/// Resolved before any write, so a bad board or status name fails without changing anything.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedBoard {
     pub owner: String,
@@ -661,7 +658,6 @@ impl ResolvedBoard {
     }
 }
 
-/// The option named `name`, ignoring case.
 pub fn pick_option<'a>(options: &'a [BoardOption], name: &str) -> Result<&'a BoardOption> {
     let name = name.trim();
     options
@@ -715,8 +711,6 @@ fn board_position(boards: &[BoardStatus], project_id: &str) -> Option<usize> {
     boards.iter().position(|b| b.project_id == project_id)
 }
 
-/// Sets the issue's Status on `board` to `option`, first adding the issue to the board when it
-/// isn't on it, and mirrors the change onto `issue.boards`.
 pub fn set_board_option(
     issue: &mut Issue,
     board: &ResolvedBoard,
@@ -744,7 +738,6 @@ pub fn set_board_option(
     Ok(())
 }
 
-/// Sets Status on a board item, such as the one `CreatedSubtask::board_item_id` names.
 pub fn set_item_status(board: &ResolvedBoard, item_id: &str, option: &BoardOption) -> Result<()> {
     graphql(
         "mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) { \
@@ -1042,8 +1035,7 @@ fn board_id(owner: &str, number: u64) -> Result<String> {
         .with_context(|| format!("board {number} not found on {owner}"))
 }
 
-/// Adds `content_id` (an issue's node id) to board `project_id` and returns its item id. Adding an
-/// issue that is already on the board returns its existing item.
+/// `content_id` is an issue's node id. Adding an issue already on the board returns its existing item.
 pub fn add_to_board(project_id: &str, content_id: &str) -> Result<String> {
     let add = || -> Result<String> {
         let page = graphql(

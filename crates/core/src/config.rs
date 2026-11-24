@@ -148,9 +148,8 @@ impl Paths {
     }
 }
 
-/// Tells the app that `tw` changed issues on GitHub, so it reloads them without waiting for its
-/// next poll. The content changes on every call because a write within the filesystem's mtime
-/// resolution would otherwise look unchanged.
+/// The app watches this marker to reload issues before its next poll. The content changes on every
+/// call because a write within the filesystem's mtime resolution would otherwise look unchanged.
 pub fn notify_issues_changed(paths: &Paths) -> Result<()> {
     let marker = paths.issues_changed_marker();
     if let Some(dir) = marker.parent() {

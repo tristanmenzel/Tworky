@@ -9,7 +9,8 @@ You keep a work list of GitHub issues, pull requests and custom tasks. **Begin s
 - check out the repos it needs as git worktrees on the work's branch, with config files such as `.env` pointing at the worker's ports
 - start the worker's own database and other backing services, and run dependency installs and migrations
 - run the project's dev servers and tests on the worker's ports
-- open and comment on PRs, add subtasks and set their assignee and board status, and propose additions and corrections to the project's shared memory, each applied once you approve it in Tworky
+- open and comment on PRs, and add subtasks and set their assignee and board status
+- propose additions and corrections to the project's shared memory, each applied once you approve it in Tworky
 
 Because every worker has shifted ports and its own compose project, any number of them can run side by side with the main checkout. The app shows each session's state (working, waiting for you, idle, ready for testing), the worker's worktrees, services and containers, and the branches and PRs for the work. On Windows, browser tabs signed in as the project's test accounts open beside the terminal, and Claude can drive them to test its change and hand it over to you. **Clean up** stops everything and removes the worktrees, branches and folder once the PRs are merged.
 

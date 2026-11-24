@@ -1164,8 +1164,7 @@ fn status_board(
     github::resolve_board(repo_owner(&parent.repo), number)
 }
 
-/// Fetches the subtask `reference` names and checks it is a sub-issue of the parent, so no command
-/// writes to an issue outside the parent's subtasks.
+/// Checks the target is a sub-issue of the parent, so no command writes outside the parent's subtasks.
 fn load_target(
     ws: &Workspace,
     parent: &SubtaskParent,
@@ -1215,8 +1214,6 @@ fn parse_subtask_ref(reference: &str) -> Result<SubtaskRef> {
     anyhow::bail!("expected a subtask number, issue URL or owner/repo#number, got '{reference}'")
 }
 
-/// The repo and number of the subtask `reference` names. A bare number is matched against the
-/// parent's loaded sub-issues first, else taken to be in the parent's repo.
 fn subtask_target(
     parent: &tworky_core::hierarchy::Issue,
     children: &[&tworky_core::hierarchy::Issue],
@@ -1281,8 +1278,6 @@ fn board_status_name(board: &tworky_core::hierarchy::BoardStatus) -> Option<&str
         .map(|o| o.name.as_str())
 }
 
-/// One row per direct sub-issue of `parent`: label, state, assignees, Status and title. With
-/// `board` (a project id) the Status is the one on that board, else every board's.
 fn subtask_rows(
     index: &IssueIndex,
     parent: &tworky_core::hierarchy::Issue,
