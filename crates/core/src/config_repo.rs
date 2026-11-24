@@ -1204,10 +1204,77 @@ fn unconfirmed_remote(paths: &Paths, record: &SyncRecord, dirs: &[PathBuf]) -> O
     None
 }
 
-/// Records `origin` as the remote the user connected, and who could see it, so syncs use it.
-/// The caller holds the sync lock.
-fn record_remote(paths: &Paths, visibility: Visibility) -> Result<SyncRecord> {
-    let urls = remote_urls_in(paths, &paths.repo_dir()).context("the config repo has no remote")?;
+/// The dirs whose `origin` a sync uses: `repo/`, and `repo-sync` once it exists.
+fn remote_dirs(paths: &Paths) -> Vec<PathBuf> {
+    let mut dirs = vec![paths.repo_dir()];
+    if is_worktree(paths, &paths.repo_sync_dir()) {
+        dirs.push(paths.repo_sync_dir());
+    }
+    dirs
+}
+
+/// The URLs `origin` fetches from and pushes to in `dirs` once git applies `pushurl`, `insteadOf`
+/// and `pushInsteadOf`. Refuses unless every one names the repo at `checked` ([`same_repo`]) and
+/// every dir resolves alike, so git config the user never saw can't send the config elsewhere.
+fn resolved_remote(paths: &Paths, dirs: &[PathBuf], checked: &str) -> Result<RemoteUrls> {
+    let checked = redact_url(checked);
+    let mut resolved: Option<RemoteUrls> = None;
+    for dir in dirs {
+        let urls = remote_urls_in(paths, dir).context("the config repo has no remote")?;
+        let elsewhere = urls.fetch.is_empty()
+            || urls.push.is_empty()
+            || !urls
+                .fetch
+                .iter()
+                .chain(&urls.push)
+                .all(|url| same_repo(url, &checked));
+        if elsewhere {
+            bail!(
+                "with your git config, the config repo would fetch from {} and push to {}, not only {checked}; check the remote's pushurl and any insteadOf or pushInsteadOf in your git config",
+                urls.fetch.join(", "),
+                urls.push.join(", ")
+            );
+        }
+        if let Some(first) = &resolved
+            && *first != urls
+        {
+            bail!(
+                "the config sync's worktree {} fetches from {} and pushes to {}, unlike the config repo; remove the remote and connect it again",
+                dir.display(),
+                urls.fetch.join(", "),
+                urls.push.join(", ")
+            );
+        }
+        resolved = Some(urls);
+    }
+    resolved.context("the config repo has no remote")
+}
+
+/// Whether two redacted remote URLs name the same repo: the same GitHub `owner/name` over https,
+/// `ssh://` or scp-like SSH, else the same text.
+fn same_repo(a: &str, b: &str) -> bool {
+    a == b || github_repo(a).is_some_and(|repo| github_repo(b) == Some(repo))
+}
+
+/// The lowercased `owner/name` of an https, `ssh://` or scp-like URL on github.com.
+fn github_repo(url: &str) -> Option<(String, String)> {
+    if let Some((scheme, _)) = url.split_once("://")
+        && !scheme.eq_ignore_ascii_case("https")
+        && !scheme.eq_ignore_ascii_case("ssh")
+    {
+        return None;
+    }
+    let remote = split_remote(url)?;
+    if !remote.host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let (owner, name) = owner_and_name(remote.path)?;
+    Some((owner.to_ascii_lowercase(), name.to_ascii_lowercase()))
+}
+
+/// Records `urls`, from [`resolved_remote`], as the remote the user connected, and who could see
+/// it, so syncs use it. The caller holds the sync lock.
+fn record_remote(paths: &Paths, urls: RemoteUrls, visibility: Visibility) -> Result<SyncRecord> {
     update_record(paths, |r| {
         r.remote = Some(urls);
         r.visibility = Some(visibility);
@@ -1276,11 +1343,7 @@ fn sync_locked(paths: &Paths, trigger: Trigger, network: Duration) -> Result<Syn
         });
     }
     let before = read_record(paths);
-    let mut dirs = vec![paths.repo_dir()];
-    if is_worktree(paths, &paths.repo_sync_dir()) {
-        dirs.push(paths.repo_sync_dir());
-    }
-    if let Some(url) = unconfirmed_remote(paths, &before, &dirs) {
+    if let Some(url) = unconfirmed_remote(paths, &before, &remote_dirs(paths)) {
         return update_record(paths, |r| r.state = SyncState::UnconfirmedRemote { url });
     }
     if trigger == Trigger::Background && before.paused {
@@ -2175,7 +2238,9 @@ fn set_remote_within(
     }
     let repo = paths.repo_dir();
     git(paths, &repo, &["remote", "add", REMOTE, url], LOCAL_TIMEOUT)?;
-    if let Err(e) = record_remote(paths, visibility) {
+    let recorded = resolved_remote(paths, &remote_dirs(paths), url)
+        .and_then(|urls| record_remote(paths, urls, visibility));
+    if let Err(e) = recorded {
         forget_remote(paths);
         return Err(e);
     }
@@ -2211,7 +2276,37 @@ fn forget_remote(paths: &Paths) {
     for key in ["branch.main.remote", "branch.main.merge"] {
         let _ = run(&["config", "--unset-all", key]);
     }
+    let _ = clear_worktree_origins(paths);
     let _ = update_record(paths, reset_to_no_remote);
+}
+
+/// Removes any `origin` set in a worktree's own config (`extensions.worktreeConfig`) of `repo/` or
+/// `repo-sync`, which `git remote remove` leaves behind and the sync's check would still see.
+fn clear_worktree_origins(paths: &Paths) -> Result<()> {
+    let repo = paths.repo_dir();
+    let enabled = git(
+        paths,
+        &repo,
+        &["config", "--bool", "extensions.worktreeConfig"],
+        LOCAL_TIMEOUT,
+    )
+    .is_ok_and(|out| out.trim() == "true");
+    if !enabled {
+        return Ok(());
+    }
+    for dir in remote_dirs(paths) {
+        let run = |args: &[&str]| git(paths, &dir, args, LOCAL_TIMEOUT);
+        let pattern = format!("^remote\\.{REMOTE}\\.");
+        if run(&["config", "--worktree", "--get-regexp", &pattern]).is_ok() {
+            run(&[
+                "config",
+                "--worktree",
+                "--remove-section",
+                &format!("remote.{REMOTE}"),
+            ])?;
+        }
+    }
+    Ok(())
 }
 
 fn reset_to_no_remote(r: &mut SyncRecord) {
@@ -2323,6 +2418,7 @@ pub fn remove_remote(paths: &Paths) -> Result<SyncRecord> {
         &["remote", "remove", REMOTE],
         LOCAL_TIMEOUT,
     )?;
+    clear_worktree_origins(paths)?;
     update_record(paths, reset_to_no_remote)
 }
 
@@ -2334,8 +2430,9 @@ pub trait GitHub: Sync {
     /// `owner/name`, or `None` when it doesn't exist or the user can't see it.
     fn repo(&self, name_with_owner: &str) -> Result<Option<RepoView>>;
     fn create_private(&self, name_with_owner: &str) -> Result<()>;
-    /// The host name an SSH host alias resolves to in the user's SSH config (`ssh -G`).
-    fn ssh_hostname(&self, host: &str) -> Result<String>;
+    /// The host name an SSH host alias resolves to in the user's SSH config (`ssh -G`), connecting
+    /// as `user` on `port` when the URL names them, as git would.
+    fn ssh_hostname(&self, host: &str, user: Option<&str>, port: Option<&str>) -> Result<String>;
 }
 
 pub struct Gh;
@@ -2355,15 +2452,32 @@ impl GitHub for Gh {
         github::create_private_repo(name_with_owner)
     }
 
-    fn ssh_hostname(&self, host: &str) -> Result<String> {
+    fn ssh_hostname(&self, host: &str, user: Option<&str>, port: Option<&str>) -> Result<String> {
         let mut cmd = process::command("ssh");
-        cmd.args(["-G", "--", host]);
+        cmd.args(ssh_config_args(host, user, port));
         let out = process::output_timeout(cmd, &format!("ssh -G {host}"), SSH_CONFIG_TIMEOUT)?;
         out.lines()
             .find_map(|line| line.strip_prefix("hostname "))
             .map(|name| name.trim().to_string())
             .with_context(|| format!("`ssh -G {host}` printed no hostname"))
     }
+}
+
+/// The arguments to `ssh -G` for `host`, as `user` on `port` when given.
+fn ssh_config_args<'a>(
+    host: &'a str,
+    user: Option<&'a str>,
+    port: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut args = vec!["-G"];
+    if let Some(user) = user {
+        args.extend(["-l", user]);
+    }
+    if let Some(port) = port {
+        args.extend(["-p", port]);
+    }
+    args.extend(["--", host]);
+    args
 }
 
 /// The name of the repo [`create_remote`] makes and [`find_shared_configs`] looks for:
@@ -2393,9 +2507,11 @@ pub struct RemoteCheck {
 }
 
 /// What the user was shown of a [`RemoteCheck`] when they chose to connect the remote. Connecting
-/// refuses when the check made then finds the remote riskier than this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// refuses when the check made then is of another URL, or finds the remote riskier than this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Seen {
+    /// The checked URL, redacted.
+    pub url: String,
     pub visibility: Visibility,
     #[serde(default)]
     pub foreign_owner: bool,
@@ -2404,6 +2520,7 @@ pub struct Seen {
 impl Seen {
     pub fn of(check: &RemoteCheck) -> Seen {
         Seen {
+            url: redact_url(&check.url),
             visibility: check.visibility,
             foreign_owner: check.foreign_owner,
         }
@@ -2521,15 +2638,17 @@ fn github_target(gh: &dyn GitHub, url: &str) -> Target {
     if host == "github.com" || host == "www.github.com" {
         return Target::GitHub(owner, name);
     }
-    let alias = !host.is_empty()
-        && !host.starts_with('-')
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
-    if !remote.ssh || !alias {
+    let safe = |arg: &str| {
+        !arg.is_empty()
+            && !arg.starts_with('-')
+            && arg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    };
+    if !remote.ssh || !safe(&host) || !remote.user.is_none_or(safe) {
         return Target::Elsewhere;
     }
-    match gh.ssh_hostname(remote.host) {
+    match gh.ssh_hostname(remote.host, remote.user, remote.port) {
         Ok(resolved)
             if resolved.eq_ignore_ascii_case("github.com")
                 || resolved.eq_ignore_ascii_case("ssh.github.com") =>
@@ -2581,12 +2700,14 @@ fn remote_url_for(remote: &str) -> Result<String> {
     })
 }
 
-/// A remote URL's host and path. `ssh` is set for `ssh://` URLs and scp-like `user@host:path`
-/// ones, whose host may be an alias from the user's SSH config.
+/// A remote URL's host and path, and the user and port it names. `ssh` is set for `ssh://` URLs
+/// and scp-like `user@host:path` ones, whose host may be an alias from the user's SSH config.
 struct RemoteParts<'a> {
     host: &'a str,
     path: &'a str,
     ssh: bool,
+    user: Option<&'a str>,
+    port: Option<&'a str>,
 }
 
 /// Splits a `scheme://[userinfo@]host[:port]/path` URL or a scp-like `[user@]host:path`, or
@@ -2613,12 +2734,23 @@ fn split_remote(url: &str) -> Option<RemoteParts<'_>> {
             (authority, path, true)
         }
     };
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = match host.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
-        _ => host,
+    let (user, host) = match authority.rsplit_once('@') {
+        Some((userinfo, host)) => (Some(userinfo.split(':').next().unwrap_or(userinfo)), host),
+        None => (None, authority),
     };
-    (!host.is_empty()).then_some(RemoteParts { host, path, ssh })
+    let (host, port) = match host.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => {
+            (host, Some(port).filter(|p| !p.is_empty()))
+        }
+        _ => (host, None),
+    };
+    (!host.is_empty()).then_some(RemoteParts {
+        host,
+        path,
+        ssh,
+        user,
+        port,
+    })
 }
 
 /// `owner/name` from a remote's path, with any `.git` and slashes around it dropped.
@@ -2640,9 +2772,9 @@ pub struct Connected {
 }
 
 /// Refuses a remote that needs confirming when the user saw no check, and one whose check now
-/// finds more than the user saw ([`CheckChanged`]): riskier visibility, or an owner warning they
-/// didn't get.
-fn needs_confirmation(check: &RemoteCheck, seen: Option<Seen>) -> Result<()> {
+/// differs from what the user saw ([`CheckChanged`]): another URL, riskier visibility, or an owner
+/// warning they didn't get.
+fn needs_confirmation(check: &RemoteCheck, seen: Option<&Seen>) -> Result<()> {
     let Some(seen) = seen else {
         if check.needs_confirmation {
             bail!(
@@ -2657,7 +2789,8 @@ fn needs_confirmation(check: &RemoteCheck, seen: Option<Seen>) -> Result<()> {
         Visibility::Internal | Visibility::Unknown => 1,
         Visibility::Public => 2,
     };
-    if risk(check.visibility) > risk(seen.visibility)
+    if seen.url != redact_url(&check.url)
+        || risk(check.visibility) > risk(seen.visibility)
         || (check.foreign_owner && !seen.foreign_owner)
     {
         return Err(CheckChanged(check.clone()).into());
@@ -2686,7 +2819,7 @@ pub fn connect_remote(
     seen: Option<Seen>,
 ) -> Result<Connected> {
     let check = check_remote(gh, remote)?;
-    needs_confirmation(&check, seen)?;
+    needs_confirmation(&check, seen.as_ref())?;
     let sync = set_remote(paths, &check.url, check.visibility)?;
     Ok(Connected { check, sync })
 }
@@ -2699,23 +2832,16 @@ pub fn check_current_remote(paths: &Paths, gh: &dyn GitHub) -> Result<RemoteChec
     )
 }
 
-/// Connects an `origin` that wasn't connected through Tworky, such as one added with plain git:
-/// checks it like [`connect_remote`], records it and syncs with it. Refuses an `origin` that
-/// pushes somewhere other than where it fetches from.
-pub fn confirm_remote(paths: &Paths, gh: &dyn GitHub, seen: Option<Seen>) -> Result<Connected> {
+/// Connects an `origin` that wasn't connected through Tworky, such as one added with plain git,
+/// once the user has `seen` its check: checks it like [`connect_remote`], records it and syncs
+/// with it. Refuses an `origin` that isn't the URL the user saw, and one that fetches or pushes
+/// anywhere but the repo it names ([`resolved_remote`]).
+pub fn confirm_remote(paths: &Paths, gh: &dyn GitHub, seen: &Seen) -> Result<Connected> {
     let check = check_current_remote(paths, gh)?;
-    needs_confirmation(&check, seen)?;
+    needs_confirmation(&check, Some(seen))?;
     let _sync = with_sync_lock(paths)?;
-    let urls = remote_urls_in(paths, &paths.repo_dir()).context("the config repo has no remote")?;
-    let checked = redact_url(&check.url);
-    if urls.fetch != [checked.clone()] || urls.push != [checked.clone()] {
-        bail!(
-            "the config repo's remote fetches from {} and pushes to {}, not only {checked}; remove it and connect the one you want",
-            urls.fetch.join(", "),
-            urls.push.join(", ")
-        );
-    }
-    record_remote(paths, check.visibility)?;
+    let urls = resolved_remote(paths, &remote_dirs(paths), &check.url)?;
+    record_remote(paths, urls, check.visibility)?;
     let sync = sync_locked(paths, Trigger::User, NETWORK_TIMEOUT)?;
     Ok(Connected { check, sync })
 }
@@ -2849,12 +2975,13 @@ fn use_shared_config_within(
     network: Duration,
 ) -> Result<Connected> {
     let check = check_remote(gh, remote)?;
-    needs_confirmation(&check, seen)?;
+    needs_confirmation(&check, seen.as_ref())?;
     let cloned = {
         let _sync = with_sync_lock(paths)?;
         let cloned = !is_unconnected_init(paths)? && clone_into_repo(paths, &check.url, network)?;
         if cloned {
-            record_remote(paths, check.visibility)?;
+            let urls = resolved_remote(paths, &remote_dirs(paths), &check.url)?;
+            record_remote(paths, urls, check.visibility)?;
         }
         cloned
     };
@@ -2925,6 +3052,7 @@ fn clone_into_repo(paths: &Paths, url: &str, network: Duration) -> Result<bool> 
             network,
         )?;
         configure(paths, &tmp)?;
+        resolved_remote(paths, std::slice::from_ref(&tmp), url)?;
         if remote_main(paths, &tmp)?.is_none() {
             return Ok(false);
         }
@@ -3434,7 +3562,12 @@ mod tests {
         )
         .unwrap();
         home.git(&["remote", "add", "origin", &forward_slashes(&remote)]);
-        record_remote(&home.paths, Visibility::Unknown).unwrap();
+        record_remote(
+            &home.paths,
+            remote_urls_in(&home.paths, &home.paths.repo_dir()).unwrap(),
+            Visibility::Unknown,
+        )
+        .unwrap();
         home.git(&["push", "-q", "-u", "origin", "main"]);
         let guard = with_lock(&home.paths).unwrap();
         let memory = home.write("projects/acme/memory.md", "# Acme\n");
@@ -4554,7 +4687,12 @@ mod tests {
         let home = Home::new("");
         home.init();
         home.git(&["remote", "add", "origin", "ssh://tworky.invalid/config.git"]);
-        record_remote(&home.paths, Visibility::Unknown).unwrap();
+        record_remote(
+            &home.paths,
+            remote_urls_in(&home.paths, &home.paths.repo_dir()).unwrap(),
+            Visibility::Unknown,
+        )
+        .unwrap();
         let (paths, global) = (home.paths.clone(), home.dir.path().join("gitconfig"));
         let started = Instant::now();
         let syncing = std::thread::spawn(move || {
@@ -4780,13 +4918,18 @@ mod tests {
         /// What `ssh -G` would resolve each SSH host to: `None` fails, and a host missing here
         /// resolves to itself, as `ssh -G` does for a host with no config.
         ssh_hosts: BTreeMap<String, Option<String>>,
+        /// The arguments of each `ssh -G` asked.
+        ssh_asked: Mutex<Vec<String>>,
     }
 
-    /// What the user saw of a remote Tworky can't check, such as a local bare repo.
-    const SEEN: Option<Seen> = Some(Seen {
-        visibility: Visibility::Unknown,
-        foreign_owner: false,
-    });
+    /// What the user saw of a remote at `url` Tworky can't check, such as a local bare repo.
+    fn saw(url: &str) -> Seen {
+        Seen {
+            url: url.into(),
+            visibility: Visibility::Unknown,
+            foreign_owner: false,
+        }
+    }
 
     impl FakeGitHub {
         fn new(owners: &[&str]) -> FakeGitHub {
@@ -4818,7 +4961,16 @@ mod tests {
             Ok(self.owners.clone())
         }
 
-        fn ssh_hostname(&self, host: &str) -> Result<String> {
+        fn ssh_hostname(
+            &self,
+            host: &str,
+            user: Option<&str>,
+            port: Option<&str>,
+        ) -> Result<String> {
+            self.ssh_asked
+                .lock()
+                .unwrap()
+                .push(ssh_config_args(host, user, port).join(" "));
             match self.ssh_hosts.get(host) {
                 Some(Some(resolved)) => Ok(resolved.clone()),
                 Some(None) => bail!("ssh isn't installed"),
@@ -5025,7 +5177,7 @@ mod tests {
     #[test]
     fn a_confirmation_holds_only_for_what_the_user_saw() {
         let check = |visibility, foreign_owner| RemoteCheck {
-            url: "https://github.com/me/config".into(),
+            url: "https://github.com/me/config.git".into(),
             visibility,
             warnings: vec!["a warning".into()],
             needs_confirmation: matches!(visibility, Visibility::Public | Visibility::Unknown),
@@ -5033,6 +5185,7 @@ mod tests {
         };
         let seen = |visibility, foreign_owner| {
             Some(Seen {
+                url: "https://github.com/me/config.git".into(),
                 visibility,
                 foreign_owner,
             })
@@ -5045,7 +5198,7 @@ mod tests {
             (Private, Unknown),
             (Private, Internal),
         ] {
-            let e = needs_confirmation(&check(now, false), seen(saw, false)).unwrap_err();
+            let e = needs_confirmation(&check(now, false), seen(saw, false).as_ref()).unwrap_err();
             let changed = e.downcast_ref::<CheckChanged>().expect("the new check");
             assert_eq!(changed.0.visibility, now);
         }
@@ -5057,14 +5210,21 @@ mod tests {
             (Unknown, Unknown),
             (Private, Private),
         ] {
-            needs_confirmation(&check(now, false), seen(saw, false))
+            needs_confirmation(&check(now, false), seen(saw, false).as_ref())
                 .unwrap_or_else(|e| panic!("{saw:?} then {now:?}: {e:#}"));
         }
-        let e = needs_confirmation(&check(Private, true), seen(Private, false)).unwrap_err();
+        let e =
+            needs_confirmation(&check(Private, true), seen(Private, false).as_ref()).unwrap_err();
         assert!(e.is::<CheckChanged>(), "{e:#}");
-        needs_confirmation(&check(Private, true), seen(Private, true)).unwrap();
+        needs_confirmation(&check(Private, true), seen(Private, true).as_ref()).unwrap();
         assert!(needs_confirmation(&check(Public, false), None).is_err());
         needs_confirmation(&check(Private, false), None).unwrap();
+        let elsewhere = Seen {
+            url: "https://github.com/me/other.git".into(),
+            ..seen(Public, true).unwrap()
+        };
+        let e = needs_confirmation(&check(Private, false), Some(&elsewhere)).unwrap_err();
+        assert!(e.is::<CheckChanged>(), "{e:#}");
 
         let home = Home::new("");
         home.init();
@@ -5146,7 +5306,7 @@ mod tests {
         assert!(awaits_first_run(&c));
         let gh = FakeGitHub::new(&["me"]);
 
-        let set_up = use_shared_config(&c, &gh, &m.remote, SEEN).unwrap();
+        let set_up = use_shared_config(&c, &gh, &m.remote, Some(saw(&m.remote))).unwrap();
         assert!(!awaits_first_run(&c));
         assert!(!c.repo_tmp_dir().exists());
         assert_eq!(set_up.sync.visibility, Some(Visibility::Unknown));
@@ -5171,7 +5331,7 @@ mod tests {
         assert_eq!(sync_now(&m.a).state, SyncState::Idle);
         assert_eq!(read_file(&m.a, MEMORY), "# Acme\n- from C\n");
 
-        let e = use_shared_config(&c, &gh, &m.remote, SEEN).unwrap_err();
+        let e = use_shared_config(&c, &gh, &m.remote, Some(saw(&m.remote))).unwrap_err();
         assert!(format!("{e:#}").contains("already exists"), "{e:#}");
     }
 
@@ -5194,13 +5354,13 @@ mod tests {
         assert!(awaits_first_run(&c));
 
         FAIL.set(Some("fetch"));
-        let e = use_shared_config(&c, &gh, &empty, SEEN).unwrap_err();
+        let e = use_shared_config(&c, &gh, &empty, Some(saw(&empty))).unwrap_err();
         FAIL.set(None);
         assert!(format!("{e:#}").contains("injected"), "{e:#}");
         assert_eq!(log_for_tests(&c), [INIT_MESSAGE]);
         assert_eq!(remote_url(&c), None);
 
-        use_shared_config(&c, &gh, &empty, SEEN).unwrap();
+        use_shared_config(&c, &gh, &empty, Some(saw(&empty))).unwrap();
         assert_eq!(log_for_tests(&c), [INIT_MESSAGE]);
         assert_eq!(rev_parse(&c, Path::new(&empty), "main").unwrap(), head(&c));
         assert!(!c.repo_tmp_dir().exists());
@@ -5220,17 +5380,23 @@ mod tests {
         )
         .unwrap();
         FAIL.set(Some("fetch"));
-        use_shared_config(&c, &gh, &forward_slashes(&empty), SEEN).unwrap_err();
+        use_shared_config(
+            &c,
+            &gh,
+            &forward_slashes(&empty),
+            Some(saw(&forward_slashes(&empty))),
+        )
+        .unwrap_err();
         FAIL.set(None);
 
         commit_file(&m.a, MEMORY, "# Acme\n");
         sync_now(&m.a);
-        use_shared_config(&c, &gh, &m.remote, SEEN).unwrap();
+        use_shared_config(&c, &gh, &m.remote, Some(saw(&m.remote))).unwrap();
         assert_eq!(head(&c), head(&m.a));
         assert_eq!(read_file(&c, MEMORY), "# Acme\n");
 
         commit_file(&c, "tworky/claude.local.md", "Mine\n");
-        let e = use_shared_config(&c, &gh, &m.remote, SEEN).unwrap_err();
+        let e = use_shared_config(&c, &gh, &m.remote, Some(saw(&m.remote))).unwrap_err();
         assert!(format!("{e:#}").contains("already exists"), "{e:#}");
     }
 
@@ -5245,7 +5411,7 @@ mod tests {
             &c,
             &gh,
             "ssh://tworky.invalid/config.git",
-            SEEN,
+            Some(saw("ssh://tworky.invalid/config.git")),
             Duration::from_secs(2),
         )
         .unwrap_err();
@@ -5255,7 +5421,7 @@ mod tests {
         assert!(!c.repo_dir().exists());
         assert!(awaits_first_run(&c));
 
-        use_shared_config(&c, &gh, &m.remote, SEEN).unwrap();
+        use_shared_config(&c, &gh, &m.remote, Some(saw(&m.remote))).unwrap();
         assert_eq!(head(&c), head(&m.a));
         assert!(!c.repo_tmp_dir().exists());
     }
@@ -5459,7 +5625,13 @@ mod tests {
 
         let d = paths_under(&m.dir.path().join("d"));
         stale(&d);
-        use_shared_config(&d, &FakeGitHub::new(&["me"]), &m.remote, SEEN).unwrap();
+        use_shared_config(
+            &d,
+            &FakeGitHub::new(&["me"]),
+            &m.remote,
+            Some(saw(&m.remote)),
+        )
+        .unwrap();
         let record = read_record(&d);
         assert_eq!((record.base, record.upstream), (None, None));
         assert_eq!(record.state, SyncState::Idle);
@@ -5494,9 +5666,11 @@ mod tests {
         );
 
         let gh = FakeGitHub::new(&["me"]);
-        let e = confirm_remote(&c, &gh, None).unwrap_err();
-        assert!(e.to_string().contains("confirm"), "{e:#}");
-        let connected = confirm_remote(&c, &gh, SEEN).unwrap();
+        let e = confirm_remote(&c, &gh, &saw("C:/elsewhere/config.git")).unwrap_err();
+        let changed = e.downcast_ref::<CheckChanged>().expect("the fresh check");
+        assert_eq!(changed.0.url, m.remote);
+        assert_eq!(m.remote_head(), before, "nothing was pushed");
+        let connected = confirm_remote(&c, &gh, &saw(&m.remote)).unwrap();
         assert_eq!(connected.sync.state, SyncState::Idle, "{connected:?}");
         assert_eq!(connected.sync.visibility, Some(Visibility::Unknown));
         assert_eq!(m.remote_head(), head(&c));
@@ -5533,8 +5707,8 @@ mod tests {
             "nothing was pushed to the other repo"
         );
         let gh = FakeGitHub::new(&["me"]);
-        let e = confirm_remote(&m.a, &gh, SEEN).unwrap_err();
-        assert!(e.to_string().contains("pushes to"), "{e:#}");
+        let e = confirm_remote(&m.a, &gh, &saw(&m.remote)).unwrap_err();
+        assert!(e.to_string().contains(&format!("push to {other}")), "{e:#}");
 
         run(&["config", "--unset", "remote.origin.pushurl"]);
         assert_eq!(sync_now(&m.a).state, SyncState::Idle);
@@ -5557,9 +5731,242 @@ mod tests {
         );
 
         remove_remote(&m.a).unwrap();
-        connect_remote(&m.a, &gh, &m.remote, SEEN).unwrap();
+        connect_remote(&m.a, &gh, &m.remote, Some(saw(&m.remote))).unwrap();
         assert_eq!(sync_now(&m.a).state, SyncState::Idle);
         assert_eq!(m.remote_head(), head(&m.a));
+    }
+
+    fn bare(m: &Machines, name: &str) -> String {
+        git(
+            &m.a,
+            m.dir.path(),
+            &["init", "-q", "--bare", "-b", "main", name],
+            LOCAL_TIMEOUT,
+        )
+        .unwrap();
+        forward_slashes(&m.dir.path().join(name))
+    }
+
+    #[test]
+    fn git_config_that_sends_the_config_elsewhere_is_refused() {
+        let m = machines();
+        let other = bare(&m, "other.git");
+        let before = m.remote_head();
+        std::fs::write(
+            m.global_config(),
+            format!("[remote \"origin\"]\n\tpushurl = {other}\n"),
+        )
+        .unwrap();
+        let gh = FakeGitHub::new(&["me"]);
+
+        let c = own_home(&m, "c");
+        commit_file(&c, MEMORY, "# Secret\n");
+        let e = connect_remote(&c, &gh, &m.remote, Some(saw(&m.remote))).unwrap_err();
+        assert!(e.to_string().contains(&other), "{e:#}");
+        assert_eq!(remote_url(&c), None);
+        assert_eq!(sync_status(&c).unwrap().remote, None);
+
+        let d = paths_under(&m.dir.path().join("d"));
+        let e = use_shared_config(&d, &gh, &m.remote, Some(saw(&m.remote))).unwrap_err();
+        assert!(format!("{e:#}").contains(&other), "{e:#}");
+        assert!(!d.repo_dir().exists());
+        assert!(awaits_first_run(&d));
+
+        assert!(
+            git(
+                &m.a,
+                Path::new(&other),
+                &["rev-parse", "main"],
+                LOCAL_TIMEOUT
+            )
+            .is_err(),
+            "nothing was pushed to the other repo"
+        );
+        assert_eq!(m.remote_head(), before);
+
+        std::fs::write(
+            m.global_config(),
+            "[url \"https://gitlab.com/\"]\n\tinsteadOf = https://github.com/\n",
+        )
+        .unwrap();
+        let gh = gh.with_repo(
+            "me/config",
+            "https://github.com/me/config",
+            Visibility::Private,
+        );
+        let e = connect_remote(&c, &gh, "me/config", None).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("fetch from https://gitlab.com/me/config.git"),
+            "{e:#}"
+        );
+        assert_eq!(remote_url(&c), None);
+    }
+
+    /// Serves `owner/name` over SSH from the bare repo `<dir>/owner/name`, whatever the host.
+    fn serve_github_over_ssh(dir: &Path) {
+        SSH_COMMAND.set(Some(format!(
+            "sh -c 'cd \"$0\" && eval \"$2\"' '{}'",
+            forward_slashes(dir)
+        )));
+    }
+
+    #[test]
+    fn a_push_insteadof_to_the_same_github_repo_over_ssh_is_accepted() {
+        let m = machines();
+        let github = m.dir.path().join("github");
+        std::fs::create_dir_all(github.join("me")).unwrap();
+        bare(&m, "github/me/config.git");
+        std::fs::write(
+            m.global_config(),
+            "[url \"git@github.com:\"]\n\tinsteadOf = https://github.com/\n\
+             [url \"git@GitHub.com:\"]\n\tpushInsteadOf = https://github.com/\n",
+        )
+        .unwrap();
+        serve_github_over_ssh(&github);
+        let gh = FakeGitHub::new(&["me"]).with_repo(
+            "me/config",
+            "https://github.com/me/config",
+            Visibility::Private,
+        );
+        let expected = RemoteUrls {
+            fetch: vec!["git@github.com:me/config.git".into()],
+            push: vec!["git@GitHub.com:me/config.git".into()],
+        };
+        let served =
+            |paths: &Paths| rev_parse(paths, &github.join("me/config.git"), "main").unwrap();
+
+        let c = own_home(&m, "c");
+        commit_file(&c, MEMORY, "# From C\n");
+        let connected = connect_remote(&c, &gh, "me/config", None).unwrap();
+        assert_eq!(connected.sync.state, SyncState::Idle, "{connected:?}");
+        assert_eq!(connected.sync.remote.as_ref(), Some(&expected));
+        assert_eq!(served(&c), head(&c));
+
+        let d = own_home(&m, "d");
+        commit_file(&d, "tworky/claude.local.md", "Mine\n");
+        git(
+            &d,
+            &d.repo_dir(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/me/config.git",
+            ],
+            LOCAL_TIMEOUT,
+        )
+        .unwrap();
+        let check = check_current_remote(&d, &gh).unwrap();
+        assert_eq!(check.url, "git@github.com:me/config.git");
+        let connected = confirm_remote(&d, &gh, &Seen::of(&check)).unwrap();
+        SSH_COMMAND.set(None);
+        assert_eq!(connected.sync.state, SyncState::Idle, "{connected:?}");
+        assert_eq!(connected.sync.remote.as_ref(), Some(&expected));
+        assert_eq!(served(&d), head(&d));
+    }
+
+    #[test]
+    fn the_same_github_repo_is_matched_across_url_forms() {
+        for url in [
+            "https://github.com/me/config.git",
+            "https://***@github.com/Me/Config",
+            "ssh://git@github.com/me/config.git",
+            "ssh://git@GITHUB.com:22/me/config.GIT",
+            "git@github.com:me/config.git",
+            "github.com:me/config",
+        ] {
+            assert!(same_repo(url, "https://github.com/me/config"), "{url}");
+        }
+        for url in [
+            "https://github.com/me/other.git",
+            "https://github.com/you/config.git",
+            "http://github.com/me/config.git",
+            "file://github.com/me/config.git",
+            "git@github-personal:me/config.git",
+            "https://gitlab.com/me/config.git",
+            "C:/github.com/me/config.git",
+        ] {
+            assert!(!same_repo(url, "https://github.com/me/config"), "{url}");
+        }
+        assert!(same_repo("C:/config.git", "C:/config.git"));
+        assert!(!same_repo("C:/config.git", "c:/config.git"));
+    }
+
+    #[test]
+    fn a_worktree_local_origin_in_repo_sync_is_cleared_by_removing_the_remote() {
+        let m = machines();
+        let other = bare(&m, "other.git");
+        let before = m.remote_head();
+        git(
+            &m.a,
+            &m.a.repo_dir(),
+            &["config", "extensions.worktreeConfig", "true"],
+            LOCAL_TIMEOUT,
+        )
+        .unwrap();
+        in_sync_dir(&m.a, &["config", "--worktree", "remote.origin.url", &other]);
+        commit_file(&m.a, MEMORY, "# Acme\n");
+        assert_eq!(
+            sync_now(&m.a).state,
+            SyncState::UnconfirmedRemote { url: other.clone() }
+        );
+
+        let gh = FakeGitHub::new(&["me"]);
+        let e = confirm_remote(&m.a, &gh, &saw(&m.remote)).unwrap_err();
+        assert!(e.to_string().contains(&other), "{e:#}");
+        assert_eq!(m.remote_head(), before);
+
+        remove_remote(&m.a).unwrap();
+        assert!(
+            git(
+                &m.a,
+                &m.a.repo_sync_dir(),
+                &["config", "--worktree", "--get-regexp", "^remote\\."],
+                LOCAL_TIMEOUT
+            )
+            .is_err()
+        );
+        connect_remote(&m.a, &gh, &m.remote, Some(saw(&m.remote))).unwrap();
+        assert_eq!(sync_now(&m.a).state, SyncState::Idle);
+        assert_eq!(m.remote_head(), head(&m.a));
+        assert!(
+            git(
+                &m.a,
+                Path::new(&other),
+                &["rev-parse", "main"],
+                LOCAL_TIMEOUT
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ssh_config_is_resolved_as_the_user_and_port_git_connects_with() {
+        assert_eq!(
+            ssh_config_args("alias", Some("git"), Some("2222")),
+            ["-G", "-l", "git", "-p", "2222", "--", "alias"]
+        );
+        assert_eq!(ssh_config_args("alias", None, None), ["-G", "--", "alias"]);
+
+        let gh = FakeGitHub::new(&["me"]);
+        for remote in [
+            "ssh://me:secret@work:2222/me/config.git",
+            "git@personal:me/config.git",
+            "ssh://plain/me/config.git",
+            "ssh://-oProxyCommand=x@evil/me/config.git",
+            "ssh://a+b@evil/me/config.git",
+        ] {
+            check_remote(&gh, remote).unwrap();
+        }
+        assert_eq!(
+            *gh.ssh_asked.lock().unwrap(),
+            [
+                "-G -l me -p 2222 -- work",
+                "-G -l git -- personal",
+                "-G -- plain",
+            ]
+        );
     }
 
     /// The other process in `writers_in_two_processes_take_turns_on_the_lock`; does nothing in a

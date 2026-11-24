@@ -558,6 +558,8 @@ export interface RemoteCheck {
 
 /** What the user was shown of a remote's check when they chose to connect it. */
 export interface RemoteSeen {
+  /** The checked URL, redacted, as `RemoteCheck.url` carries it. */
+  url: string
   visibility: Visibility
   foreign_owner: boolean
 }
@@ -693,7 +695,7 @@ export const api = {
   setConfigRemote: (remote: string, seen: RemoteSeen | null) =>
     invoke<ConnectOutcome>('set_config_remote', { remote, seen }),
   /** Connects the config repo's current remote, which was added outside Tworky. */
-  confirmConfigRemote: (seen: RemoteSeen | null) => invoke<ConnectOutcome>('confirm_config_remote', { seen }),
+  confirmConfigRemote: (seen: RemoteSeen) => invoke<ConnectOutcome>('confirm_config_remote', { seen }),
   createConfigRemote: (owner: string | null) => invoke<ConfigConnected>('create_config_remote', { owner }),
   removeConfigRemote: () => invoke<ConfigSyncRecord>('remove_config_remote'),
   openProjectConfig: (name: string) => invoke<void>('open_project_config', { name }),

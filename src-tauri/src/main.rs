@@ -1579,10 +1579,10 @@ async fn set_config_remote(
 
 /// Connects the repo's current remote, added outside Tworky, once the user has seen its check.
 #[tauri::command]
-async fn confirm_config_remote(seen: Option<config_repo::Seen>) -> CmdResult<ConnectOutcome> {
+async fn confirm_config_remote(seen: config_repo::Seen) -> CmdResult<ConnectOutcome> {
     blocking(move || {
         let paths = Paths::resolve().map_err(err)?;
-        connect_outcome(config_repo::confirm_remote(&paths, &config_repo::Gh, seen))
+        connect_outcome(config_repo::confirm_remote(&paths, &config_repo::Gh, &seen))
     })
     .await
 }

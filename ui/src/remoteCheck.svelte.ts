@@ -26,7 +26,7 @@ export class RemoteConfirmation {
       }
       seen = checked
     }
-    const outcome = await connect({ visibility: seen.visibility, foreign_owner: seen.foreign_owner })
+    const outcome = await connect({ url: seen.url, visibility: seen.visibility, foreign_owner: seen.foreign_owner })
     if (outcome.kind === 'changed') {
       this.check = outcome.check
       return null
