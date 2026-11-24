@@ -4720,10 +4720,20 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(20));
     }
 
-    /// A home with a config repo of its own, which never synced.
+    /// A home with a config repo of its own, which never synced. Its first commit gets its own
+    /// author date because two inits in the same second by the same identity are the same
+    /// commit, and the histories would then not be unrelated.
     fn own_home(m: &Machines, name: &str) -> Paths {
         let paths = paths_under(&m.dir.path().join(name));
         init(&with_lock(&paths).unwrap(), &paths).unwrap();
+        let seconds: u64 = name.bytes().map(u64::from).sum::<u64>() * 7919;
+        let date = format!("@{} +0000", 1_000_000_000 + seconds);
+        git_committing(
+            &paths,
+            &paths.repo_dir(),
+            &["commit", "-q", "--amend", "--no-edit", "--date", &date],
+        )
+        .unwrap();
         paths
     }
 
