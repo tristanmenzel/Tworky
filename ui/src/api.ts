@@ -545,7 +545,7 @@ export interface ConfigRepoStatus {
   stale_index_lock: boolean
 }
 
-/** The id the settings session's terminal runs under. */
+/** Must match `SESSION_ID` in crates/core/src/settings_session.rs. */
 export const SETTINGS_SESSION = 'settings@tworky'
 
 export interface RemoteCheck {
@@ -587,7 +587,6 @@ export const api = {
   keepAwakeStatus: () => invoke<KeepAwakeStatus>('keep_awake_status'),
   setKeepAwake: (mode: KeepAwakeMode) => invoke<void>('set_keep_awake', { mode }),
   projects: () => invoke<ProjectSummary[]>('list_projects'),
-  /** Projects that didn't load, by folder, with why. */
   projectErrors: () => invoke<Record<string, string>>('list_project_errors'),
   configErrors: () => invoke<string[]>('list_config_errors'),
   cloneProjectRepo: (project: string, repo: string) => invoke<string>('clone_project_repo', { project, repo }),

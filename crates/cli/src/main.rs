@@ -750,9 +750,8 @@ fn refuse_config_in_session(cmd: &ConfigCommand, is_set: impl Fn(&str) -> bool) 
     }
 }
 
-/// Refuses, inside a Tworky session, what only the user should do: a guard against a Claude doing
-/// it by mistake, such as changing the config's remote or aborting a sync the user is resolving.
-/// `is_set` says whether an environment variable is set.
+/// Stops a Claude in a Tworky session doing what only the user should, such as changing the
+/// config's remote or aborting a sync the user is resolving.
 fn refuse_in_session(action: &str, instead: &str, is_set: impl Fn(&str) -> bool) -> Result<()> {
     let session = [
         "TW_WORKER_ID",
@@ -766,7 +765,7 @@ fn refuse_in_session(action: &str, instead: &str, is_set: impl Fn(&str) -> bool)
     Ok(())
 }
 
-/// Asks a yes/no question on the terminal. Without one, fails.
+/// Fails when there's no terminal to ask on.
 fn confirm(question: &str) -> Result<bool> {
     use std::io::{IsTerminal, Write};
     if !std::io::stdin().is_terminal() {
@@ -782,7 +781,7 @@ fn confirm(question: &str) -> Result<bool> {
     ))
 }
 
-/// Prints the sync state and what came in. Returns whether the sync is stopped.
+/// Returns whether the sync is stopped.
 fn print_sync(paths: &Paths, record: &tworky_core::config_repo::SyncRecord) -> bool {
     use tworky_core::config_repo::{HeldBackCause, SyncState};
     let files = |files: &[String]| files.join(", ");
@@ -1013,8 +1012,6 @@ fn project(cmd: ProjectCommand) -> Result<()> {
     Ok(())
 }
 
-/// Prints what's wrong with the config as a whole: load errors, and a config repo whose commits are
-/// stuck or behind.
 fn report_config_problems(config: &tworky_core::config::Config) {
     for error in &config.load_errors {
         println!("error: {error}");
@@ -1046,8 +1043,7 @@ fn report_config_problems(config: &tworky_core::config::Config) {
     }
 }
 
-/// Looks for clones of repos with no source, prints each one found and records it. Returns whether
-/// it found any.
+/// Also records each clone found. Returns whether it found any.
 fn report_found_sources(ws: &Workspace, project: Option<&str>) -> Result<bool> {
     let found = tworky_core::config::find_sources(&ws.config, project)?;
     for f in &found {

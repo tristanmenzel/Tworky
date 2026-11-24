@@ -299,8 +299,7 @@ fn set_or_remove(table: &mut Table, key: &str, item: Option<Item>) {
     }
 }
 
-/// Applies `change` to the project file's `[[accounts]]`, writes it atomically and commits it,
-/// refusing a result that no longer parses as a project.
+/// Writes atomically and commits, refusing a result that no longer parses as a project.
 fn edit_accounts(
     paths: &Paths,
     project: &ProjectConfig,

@@ -747,7 +747,6 @@ async fn list_projects(app: AppHandle) -> CmdResult<Vec<ProjectSummary>> {
     .await
 }
 
-/// Projects that didn't load, by their folder in the config repo, with why.
 #[tauri::command]
 async fn list_project_errors() -> CmdResult<BTreeMap<String, String>> {
     blocking(|| Ok(workspace()?.config.project_errors)).await
@@ -760,7 +759,6 @@ async fn list_config_errors() -> CmdResult<Vec<String>> {
     blocking(|| Ok(workspace()?.config.load_errors)).await
 }
 
-/// Clones a repo of the project that isn't cloned on this machine. Returns where it went.
 #[tauri::command]
 async fn clone_project_repo(project: String, repo: String) -> CmdResult<PathBuf> {
     blocking(move || {
@@ -771,7 +769,6 @@ async fn clone_project_repo(project: String, repo: String) -> CmdResult<PathBuf>
     .await
 }
 
-/// Looks under the source roots for clones of the project's repos that have no source here.
 #[tauri::command]
 async fn find_project_clones(project: String) -> CmdResult<Vec<tworky_core::config::FoundSource>> {
     blocking(move || {

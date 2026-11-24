@@ -36,7 +36,7 @@ const RENAME_RETRY: Duration = Duration::from_secs(10);
 /// [`RENAME_RETRY`] for renaming the legacy folders, which is retried on every start anyway.
 const LEGACY_RENAME_RETRY: Duration = Duration::from_secs(1);
 
-/// Failures by config folder, kept for [`recorded_failures`].
+/// Keyed by config folder, for [`recorded_failures`].
 type Failures = Mutex<BTreeMap<PathBuf, String>>;
 
 static MIGRATION_FAILURES: Failures = Mutex::new(BTreeMap::new());
@@ -182,8 +182,7 @@ pub fn git(paths: &Paths, dir: &Path, args: &[&str], timeout: Duration) -> Resul
     })
 }
 
-/// `text` with the user name and password of every `scheme://user:password@host` URL in it
-/// replaced by `***`, for errors and anything else Tworky shows or records.
+/// Replaces the userinfo of every `scheme://user:password@host` URL anywhere in `text` with `***`.
 pub fn redact_url(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -1072,7 +1071,6 @@ pub enum SyncState {
     },
 }
 
-/// Why held-back `project.toml` files don't parse.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeldBackCause {
@@ -1311,7 +1309,6 @@ fn sync_locked(paths: &Paths, trigger: Trigger, network: Duration) -> Result<Syn
     update_record(paths, |r| step.apply(r))
 }
 
-/// Where a sync got to.
 #[derive(Default)]
 struct Step {
     state: SyncState,
@@ -2501,9 +2498,7 @@ pub fn check_remote(gh: &dyn GitHub, remote: &str) -> Result<RemoteCheck> {
     })
 }
 
-/// Where a remote URL points, as far as GitHub goes.
 enum Target {
-    /// A repo on github.com.
     GitHub(String, String),
     /// An SSH host alias Tworky couldn't resolve, whose path looks like the GitHub repo `seems`.
     UnresolvedAlias {
@@ -2992,7 +2987,6 @@ pub(crate) fn log_for_tests(paths: &Paths) -> Vec<String> {
     .collect()
 }
 
-/// The files the newest commit changed.
 #[cfg(test)]
 pub(crate) fn last_commit_files_for_tests(paths: &Paths) -> Vec<String> {
     git(

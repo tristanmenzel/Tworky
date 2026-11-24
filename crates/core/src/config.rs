@@ -129,14 +129,10 @@ impl Paths {
         self.config_dir.join("config.toml")
     }
 
-    /// Where project TOMLs lived before the config repo; renamed to `projects.pre-repo` once
-    /// they're imported.
     pub fn legacy_projects_dir(&self) -> PathBuf {
         self.config_dir.join("projects")
     }
 
-    /// Where shared memory lived before the config repo; renamed to `memory.pre-repo` once it's
-    /// imported.
     pub fn legacy_memory_dir(&self) -> PathBuf {
         self.config_dir.join("memory")
     }
@@ -179,8 +175,8 @@ impl Paths {
         self.config_dir.join("repo")
     }
 
-    /// Whether the config repo exists. A `repo/` folder alone doesn't count: a build from before
-    /// writers and setup launches checked for the repo could create one after a failed migration.
+    /// A `repo/` folder without `.git` doesn't count: older builds could leave one after a failed
+    /// migration.
     pub fn has_repo(&self) -> bool {
         self.repo_dir().join(".git").exists()
     }
@@ -211,7 +207,6 @@ impl Paths {
         self.config_dir.join("repo-sync.lock")
     }
 
-    /// The config repo's sync state, written by every sync.
     pub fn config_sync_file(&self) -> PathBuf {
         self.data_dir.join("config-sync.json")
     }
@@ -229,7 +224,6 @@ impl Paths {
         [self.guidance_file(None), self.guidance_file(Some(os))]
     }
 
-    /// The user's guidance for every session, or with `os` its refinement for that OS.
     pub fn guidance_file(&self, os: Option<Os>) -> PathBuf {
         let name = match os {
             Some(os) => format!("claude.local.{}.md", os.name()),
@@ -318,10 +312,8 @@ pub fn project_slug(name: &str) -> String {
         .collect()
 }
 
-/// Writes a minimal `project.toml` (match, repos; no ports, stack or hooks) for repos no project
-/// covers yet, so items, worktrees and memory work for them, and marks it as still to be set up.
-/// The clones go in `machine.toml`. Never overwrites a project. `name` defaults to the first
-/// repo's. Returns the project's name.
+/// Writes a minimal `project.toml` (match and repos only), marked as still to be set up, with the
+/// clones in `machine.toml`. Never overwrites a project. `name` defaults to the first repo's.
 pub fn create_repo_project(
     paths: &Paths,
     taken: &[String],
@@ -384,9 +376,8 @@ pub fn create_repo_project(
     Ok(parsed.name)
 }
 
-/// Adds `repo` to `project`: to `match.repos`, so its issues and PRs route here, and to
-/// `[[repos]]`, so workers can add worktrees for it, with its clone in `machine.toml`. Comments
-/// and layout survive, and the file is written only if the result still parses.
+/// Adds `repo` to both `match.repos` and `[[repos]]`, with its clone in `machine.toml`. Keeps
+/// comments and layout, and writes only if the result still parses.
 pub fn add_repo_to_project(paths: &Paths, project: &str, repo: &NewRepo) -> Result<()> {
     use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
     let guard = config_repo::lock_for_write(paths)?;
@@ -469,7 +460,6 @@ pub fn add_repo_to_project(paths: &Paths, project: &str, repo: &NewRepo) -> Resu
     Ok(())
 }
 
-/// Records where `repo` of `project` is cloned on this machine.
 pub fn set_source(paths: &Paths, project: &str, repo: &str, source: &Path) -> Result<()> {
     let guard = config_repo::with_lock(paths)?;
     MachineConfig::update(&guard, paths, |m| {
@@ -477,7 +467,6 @@ pub fn set_source(paths: &Paths, project: &str, repo: &str, source: &Path) -> Re
     })
 }
 
-/// A clone found for a repo that had no source on this machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FoundSource {
     pub project: String,
@@ -485,9 +474,8 @@ pub struct FoundSource {
     pub source: PathBuf,
 }
 
-/// Looks under `source_roots` for clones of the repos with no source on this machine (of
-/// `project`, or of every project), matching each clone's origin to the repo's `repo`, and records
-/// the ones found in `machine.toml`. Reload the config to see them.
+/// Matches clones under `source_roots` to repos with no source by origin, and records them in
+/// `machine.toml`. `config` isn't updated; reload it to see them.
 pub fn find_sources(config: &Config, project: Option<&str>) -> Result<Vec<FoundSource>> {
     let missing: Vec<(&str, &str, &str)> = config
         .projects
@@ -528,11 +516,10 @@ pub fn find_sources(config: &Config, project: Option<&str>) -> Result<Vec<FoundS
     Ok(found)
 }
 
-/// How many folders deep under each source root clones are looked for.
 pub const CLONE_SEARCH_DEPTH: usize = 3;
 
-/// `machine.toml`: where this machine keeps each project's clones and templates. It's never
-/// synced, so the shared `project.toml` names repos by `owner/name` only.
+/// `machine.toml`: this machine's clone and template paths. Never synced, which is why
+/// `project.toml` names repos by `owner/name` only.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MachineConfig {
@@ -567,8 +554,7 @@ impl MachineConfig {
         }
     }
 
-    /// Reads `machine.toml`, applies `change` and writes it back, so writers holding the lock in
-    /// turn never lose each other's entries.
+    /// Read-modify-write under the repo lock, so writers never lose each other's entries.
     pub fn update(guard: &RepoLock, paths: &Paths, change: impl FnOnce(&mut Self)) -> Result<()> {
         let mut machine = Self::read(paths)?;
         change(&mut machine);
@@ -663,7 +649,7 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// `config.toml`, or the defaults when there's none.
+    /// The defaults when there's no `config.toml`.
     pub fn read(paths: &Paths) -> Result<Self> {
         let app: AppConfig = match std::fs::read_to_string(paths.app_config()) {
             Ok(text) => toml::from_str(&text)
@@ -925,12 +911,11 @@ pub struct Config {
     pub app: AppConfig,
     pub machine: MachineConfig,
     pub projects: Vec<ProjectConfig>,
-    /// Projects that didn't load, by their folder in the repo, so one broken project hides only
-    /// itself.
+    /// Projects that didn't load, by folder in the repo. The rest still load.
     pub project_errors: BTreeMap<String, String>,
     /// Why `machine.toml` didn't load, when it didn't. Every repo then looks not cloned.
     pub machine_error: Option<String>,
-    /// Problems with the config as a whole, for the Projects list and `tw project ls|check`.
+    /// Problems with the config as a whole, not one project.
     pub load_errors: Vec<String>,
 }
 
@@ -1056,7 +1041,6 @@ fn validate_app(app: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-/// The folders under `repo/projects`, sorted.
 fn project_folders(paths: &Paths) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(paths.repo_projects_dir()) else {
         return vec![];
@@ -1241,7 +1225,6 @@ pub fn is_subtask_type(project: Option<&ProjectConfig>, issue_type: Option<&str>
     }
 }
 
-/// Writes `toml` as project `name`'s `project.toml` in the config repo.
 #[cfg(test)]
 pub(crate) fn write_project(paths: &Paths, name: &str, toml: &str) -> PathBuf {
     let file = paths.project_file(name);
@@ -1267,7 +1250,6 @@ mod tests {
         }
     }
 
-    /// Project `acme`, or why it didn't load.
     fn load_acme(paths: &Paths) -> Result<ProjectConfig> {
         let config = Config::load_from(paths.clone())?;
         match config.project("acme") {

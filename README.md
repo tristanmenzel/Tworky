@@ -62,16 +62,16 @@ A release is published for every push to `main` (`.github/workflows/release.yml`
 
 ### Your config
 
-Tworky keeps your guidance for Claude, your projects and their memory in a local git repo, and commits every change. The first time it starts, it asks how to set this up:
+Tworky keeps your guidance for Claude, your projects and their memory in a local git repo, and commits every change. With no config, it asks on first start:
 
 - **Start fresh** creates an empty config.
-- **Use my shared config** clones the config you already sync from another machine. Tworky looks for a `tworky-config` repo under your GitHub account and organisations, or takes a URL.
+- **Use my shared config** clones a config you sync from another machine: a `tworky-config` repo under your GitHub account or organisations, or a URL.
 
-To sync between machines, open **Settings › Remote** and create a private `tworky-config` repo on GitHub, or use one you have. Tworky warns before using a repo that isn't private. Changes then sync in the background. If two machines change the same thing, **Settings › Sync** shows the conflict and **Resolve with Claude** opens a Claude session to fix it. The shared config names repos by `owner/name`, and each machine finds its own clones under your source folders.
+To sync between machines, open **Settings › Remote** and create a private `tworky-config` repo on GitHub, or connect one you have. Tworky warns before using a repo that isn't private. Changes sync in the background. When two machines change the same thing, **Settings › Sync** shows the conflict, and **Resolve with Claude** opens a Claude session to fix it. The shared config names repos by `owner/name`, and each machine finds its own clones under your source folders.
 
-**Settings › Guidance** holds your own instructions for every session, with a file per OS for what only applies there.
+**Settings › Guidance** holds your instructions for every session, plus a file per OS for instructions that apply only there.
 
-If you used Tworky before it had this repo, it imports your projects and memory on first start and keeps the old folders as `projects.pre-repo` and `memory.pre-repo` in the config folder (`tw paths` shows where). An older build sees no projects after that. To go back to one, rename those folders to `projects` and `memory`.
+An existing install imports its projects and memory into the repo on first start, and renames the old folders in the config folder (`tw paths` shows where) to `projects.pre-repo` and `memory.pre-repo`. An older build then sees no projects. To go back to one, rename those folders to `projects` and `memory`.
 
 ### Add your first item
 
