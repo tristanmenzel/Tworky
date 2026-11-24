@@ -47,6 +47,7 @@ pub struct Tab {
     pub paused: Mutex<Option<Paused>>,
     pub viewport: Mutex<Viewport>,
     /// The tab's box in the window, from the last `set_bounds`; `None` until it is shown.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub frame: Mutex<Option<Frame>>,
     /// Held while touch and the user agent are matched to the viewport, so a mobile flip's
     /// calls aren't interleaved with another's.
