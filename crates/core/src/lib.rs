@@ -20,6 +20,7 @@ pub mod project_setup;
 pub mod pulls;
 pub mod services;
 pub mod settings;
+pub mod settings_session;
 pub mod stack;
 pub mod stage;
 pub mod state;

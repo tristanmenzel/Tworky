@@ -88,7 +88,7 @@ impl Workspace {
         let mut args: Vec<String> = self.config.app.claude[1..].to_vec();
         let mut settings: serde_json::Value = serde_json::from_str(&session_settings(
             &self.config.paths,
-            name,
+            Some(name),
             false,
             false,
             Some(&session_id(name)),

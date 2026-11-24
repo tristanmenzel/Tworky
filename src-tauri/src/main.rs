@@ -22,6 +22,7 @@ use tworky_core::hierarchy::IssueIndex;
 use tworky_core::items::{AddOutcome, Listed, ProjectChoice};
 use tworky_core::memory;
 use tworky_core::project_setup;
+use tworky_core::settings_session;
 use tworky_core::state::WorkerRecord;
 use tworky_core::worker::{PrSummary, Workspace};
 use tworky_core::{build_info, feedback, update};
@@ -1000,11 +1001,18 @@ async fn open_session(
     blocking(move || {
         let state = app.state::<AppState>();
         if !state.sessions.is_alive(&id) {
-            let ws = workspace()?;
+            let paths = Paths::resolve().map_err(err)?;
+            let settings = id == settings_session::SESSION_ID;
+            let ws = if settings { None } else { Some(workspace()?) };
             let setup = project_setup::session_project(&id).map(String::from);
-            let mut launch = match &setup {
-                Some(project) => ws.launch_project_setup(project).map_err(err)?,
-                None => {
+            let mut launch = match (&ws, &setup) {
+                (None, _) => settings_session::launch(
+                    &paths,
+                    tworky_core::claude_config::claude_home().as_deref(),
+                )
+                .map_err(err)?,
+                (Some(ws), Some(project)) => ws.launch_project_setup(project).map_err(err)?,
+                (Some(ws), None) => {
                     let mcp = app.try_state::<browser::Mcp>().map(|mcp| mcp.endpoint(&id));
                     ws.launch(&id, mcp.as_ref()).map_err(err)?
                 }
@@ -1026,9 +1034,7 @@ async fn open_session(
                     &format!("could not pre-trust the session folder: {e:#}"),
                 );
             }
-            if let Ok(paths) = Paths::resolve() {
-                let _ = activity::launching(&paths, &id);
-            }
+            let _ = activity::launching(&paths, &id);
             let exit_app = app.clone();
             let exit_id = id.clone();
             state
@@ -1038,9 +1044,12 @@ async fn open_session(
                     let _ = exit_app.emit("worker-changed", &exit_id);
                 })
                 .map_err(err)?;
-            match &setup {
-                Some(project) => ws.mark_project_session_started(project).map_err(err)?,
-                None => ws.mark_claude_started(&id).map_err(err)?,
+            match (&ws, &setup) {
+                (None, _) => settings_session::mark_started(&paths).map_err(err)?,
+                (Some(ws), Some(project)) => {
+                    ws.mark_project_session_started(project).map_err(err)?
+                }
+                (Some(ws), None) => ws.mark_claude_started(&id).map_err(err)?,
             }
             let _ = app.emit("worker-changed", &id);
         }
@@ -1165,6 +1174,7 @@ fn watch_activity(app: AppHandle) {
     let Ok(paths) = Paths::resolve() else { return };
     let mut memory_changes = memory_change_names(&paths);
     let mut memory_files = memory_file_stamps(&paths);
+    let mut config_sync = None;
     let mut freshness = freshness::Freshness::default();
     let mut live_before = HashMap::new();
     loop {
@@ -1175,6 +1185,13 @@ fn watch_activity(app: AppHandle) {
             memory_changes = names;
             memory_files = stamps;
             let _ = app.emit("memory-changes", ());
+        }
+        let sync_stamp = file_stamp(&paths.config_sync_file());
+        if sync_stamp != config_sync {
+            config_sync = sync_stamp;
+            if let Ok(record) = config_repo::sync_status(&paths) {
+                let _ = app.emit("config-sync", record);
+            }
         }
         let state = app.state::<AppState>();
         // Liveness first: a launch between the two reads would otherwise pair its new generation
@@ -1292,25 +1309,98 @@ fn memory_file_stamps(paths: &Paths) -> BTreeMap<String, (Option<std::time::Syst
     stamps
 }
 
+fn file_stamp(file: &std::path::Path) -> Option<(Option<std::time::SystemTime>, u64)> {
+    let meta = std::fs::metadata(file).ok()?;
+    Some((meta.modified().ok(), meta.len()))
+}
+
+#[tauri::command]
+async fn config_sync_status() -> CmdResult<config_repo::SyncRecord> {
+    blocking(|| config_repo::sync_status(&Paths::resolve().map_err(err)?).map_err(err)).await
+}
+
+#[tauri::command]
+async fn sync_config_now() -> CmdResult<config_repo::SyncRecord> {
+    blocking(|| {
+        let paths = Paths::resolve().map_err(err)?;
+        config_repo::sync(&paths, config_repo::Trigger::User).map_err(err)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn abort_config_sync() -> CmdResult<config_repo::SyncRecord> {
+    blocking(|| config_repo::abort(&Paths::resolve().map_err(err)?).map_err(err)).await
+}
+
+#[tauri::command]
+async fn dismiss_config_incoming() -> CmdResult<()> {
+    blocking(|| config_repo::dismiss_incoming(&Paths::resolve().map_err(err)?).map_err(err)).await
+}
+
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-static SWEEPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How long the config repo's `main` must stay put after a commit before it's synced, so a burst
+/// of commits syncs once.
+const COMMIT_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Commits edits made to the config repo outside Tworky, such as by a setup session. Skipped while
-/// another sweep runs.
-fn sweep_config() {
-    use std::sync::atomic::Ordering;
-    if SWEEPING.swap(true, Ordering::AcqRel) {
-        return;
+static CONFIG_SYNC_WAKE: (Mutex<bool>, std::sync::Condvar) =
+    (Mutex::new(false), std::sync::Condvar::new());
+
+/// Sweeps and syncs the config repo soon, as on focus.
+fn wake_config_sync() {
+    let (woken, wake) = &CONFIG_SYNC_WAKE;
+    *woken.lock().unwrap() = true;
+    wake.notify_one();
+}
+
+/// Sweeps the config repo and syncs it with its remote: at start, on focus, every
+/// [`SWEEP_INTERVAL`], and [`COMMIT_DEBOUNCE`] after a commit, which it notices by `main` moving.
+fn sync_config_loop() {
+    use std::time::Instant;
+    let Ok(paths) = Paths::resolve() else { return };
+    let mut due = true;
+    let mut next_interval = Instant::now() + SWEEP_INTERVAL;
+    let mut main = config_repo::main_ref_stamp(&paths);
+    let mut moved_at = None;
+    loop {
+        if due {
+            moved_at = None;
+            next_interval = Instant::now() + SWEEP_INTERVAL;
+            sweep_config(&paths);
+            if paths.has_repo()
+                && let Err(e) = config_repo::sync(&paths, config_repo::Trigger::Background)
+            {
+                eprintln!("config repo: sync failed: {e:#}");
+            }
+            main = config_repo::main_ref_stamp(&paths);
+        }
+        let (woken, wake) = &CONFIG_SYNC_WAKE;
+        let mut woken = wake
+            .wait_timeout(woken.lock().unwrap(), std::time::Duration::from_secs(1))
+            .unwrap()
+            .0;
+        due = std::mem::take(&mut *woken);
+        drop(woken);
+        let now = Instant::now();
+        let stamp = config_repo::main_ref_stamp(&paths);
+        if stamp != main {
+            main = stamp;
+            moved_at = Some(now);
+        }
+        due |= now >= next_interval || moved_at.is_some_and(|at| now - at >= COMMIT_DEBOUNCE);
     }
-    let swept = Paths::resolve().and_then(|paths| {
+}
+
+/// Commits edits made to the config repo outside Tworky, such as by a setup session.
+fn sweep_config(paths: &Paths) {
+    let swept = (|| {
         if !paths.has_repo() {
             return Ok(None);
         }
-        let guard = config_repo::with_lock(&paths)?;
-        config_repo::sweep(&guard, &paths).map(Some)
-    });
-    SWEEPING.store(false, Ordering::Release);
+        let guard = config_repo::with_lock(paths)?;
+        config_repo::sweep(&guard, paths).map(Some)
+    })();
     match swept {
         Ok(None) => {}
         Ok(Some(swept)) => {
@@ -1359,7 +1449,7 @@ fn resize_session(state: State<'_, AppState>, id: String, cols: u16, rows: u16) 
 
 #[tauri::command]
 async fn stop_session(app: AppHandle, id: String) -> CmdResult<()> {
-    if project_setup::session_project(&id).is_some() {
+    if id == settings_session::SESSION_ID || project_setup::session_project(&id).is_some() {
         app.state::<AppState>().sessions.kill(&id);
         let _ = app.emit("worker-changed", &id);
         return Ok(());
@@ -1373,6 +1463,9 @@ async fn stop_session(app: AppHandle, id: String) -> CmdResult<()> {
 async fn new_conversation(app: AppHandle, id: String) -> CmdResult<()> {
     app.state::<AppState>().sessions.kill(&id);
     blocking(move || {
+        if id == settings_session::SESSION_ID {
+            return settings_session::reset(&Paths::resolve().map_err(err)?).map_err(err);
+        }
         let ws = workspace()?;
         match project_setup::session_project(&id) {
             Some(project) => ws.reset_project_session(project),
@@ -1558,17 +1651,12 @@ fn main() {
             std::thread::spawn(move || watch_activity(handle));
             std::thread::spawn(move || keep_awake::run(keep_awake_handle));
             std::thread::spawn(find_missing_sources);
-            std::thread::spawn(|| {
-                loop {
-                    std::thread::sleep(SWEEP_INTERVAL);
-                    sweep_config();
-                }
-            });
+            std::thread::spawn(sync_config_loop);
             Ok(())
         })
         .on_window_event(|_, event| {
             if let tauri::WindowEvent::Focused(true) = event {
-                std::thread::spawn(sweep_config);
+                wake_config_sync();
             }
         })
         .register_asynchronous_uri_scheme_protocol("ghimg", |ctx, request, responder| {
@@ -1590,6 +1678,10 @@ fn main() {
             list_projects,
             list_project_errors,
             list_config_errors,
+            config_sync_status,
+            sync_config_now,
+            abort_config_sync,
+            dismiss_config_incoming,
             clone_project_repo,
             find_project_clones,
             search_repos,

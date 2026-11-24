@@ -211,6 +211,15 @@ impl Paths {
         self.config_dir.join("repo-sync.lock")
     }
 
+    /// The config repo's sync state, written by every sync.
+    pub fn config_sync_file(&self) -> PathBuf {
+        self.data_dir.join("config-sync.json")
+    }
+
+    pub fn config_sync_lock(&self) -> PathBuf {
+        self.data_dir.join("config-sync.lock")
+    }
+
     pub fn machine_file(&self) -> PathBuf {
         self.config_dir.join("machine.toml")
     }
@@ -648,6 +657,20 @@ impl Default for AppConfig {
     }
 }
 
+impl AppConfig {
+    /// `config.toml`, or the defaults when there's none.
+    pub fn read(paths: &Paths) -> Result<Self> {
+        let app: AppConfig = match std::fs::read_to_string(paths.app_config()) {
+            Ok(text) => toml::from_str(&text)
+                .with_context(|| format!("parsing {}", paths.app_config().display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppConfig::default(),
+            Err(e) => return Err(e).context("reading app config"),
+        };
+        validate_app(&app)?;
+        Ok(app)
+    }
+}
+
 /// `C:\<name>` on Windows, `~/<name>` elsewhere.
 fn default_dir(name: &str) -> PathBuf {
     if cfg!(windows) {
@@ -921,13 +944,7 @@ impl Config {
     /// left out and listed in `project_errors`. While the config repo isn't set up, projects come
     /// from the legacy `projects/*.toml`, keyed by file stem.
     pub fn load_from(paths: Paths) -> Result<Self> {
-        let app: AppConfig = match std::fs::read_to_string(paths.app_config()) {
-            Ok(text) => toml::from_str(&text)
-                .with_context(|| format!("parsing {}", paths.app_config().display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppConfig::default(),
-            Err(e) => return Err(e).context("reading app config"),
-        };
-        validate_app(&app)?;
+        let app = AppConfig::read(&paths)?;
         let mut load_errors = Vec::new();
         let (machine, machine_error) = match MachineConfig::read(&paths) {
             Ok(machine) => (machine, None),

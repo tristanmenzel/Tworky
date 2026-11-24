@@ -191,6 +191,10 @@ impl State {
                 project TEXT PRIMARY KEY,
                 data TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_sessions (
+                key TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -373,9 +377,29 @@ impl State {
         )?;
         Ok(())
     }
+
+    /// The Claude conversation of one of the app's own sessions, such as `settings`.
+    pub fn app_session(&self, key: &str) -> Result<Option<ProjectSession>> {
+        let data: Option<String> = self
+            .conn()?
+            .query_row("SELECT data FROM app_sessions WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        data.map(|d| serde_json::from_str(&d).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn save_app_session(&self, key: &str, s: &ProjectSession) -> Result<()> {
+        self.conn()?.execute(
+            "INSERT OR REPLACE INTO app_sessions (key, data) VALUES (?1, ?2)",
+            params![key, serde_json::to_string(s)?],
+        )?;
+        Ok(())
+    }
 }
 
-/// The Claude conversation that sets up or adjusts a project's config.
+/// A Claude conversation Tworky resumes: a project's setup session, or one of the app's own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectSession {
     pub claude_session: String,

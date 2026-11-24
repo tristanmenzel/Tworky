@@ -60,6 +60,9 @@ enum Command {
     /// Configured projects, and the checks a project setup session runs
     #[command(subcommand)]
     Project(ProjectCommand),
+    /// The config repo, and its sync with a remote
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// Record what this worker's Claude is doing (working, idle or waiting). Run by session hooks.
     SessionState {
         activity: tworky_core::activity::Activity,
@@ -440,6 +443,27 @@ enum ServiceCommand {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommand {
+    /// Show the config repo's state and its sync with the remote
+    Status,
+    /// Sync with the remote now, resuming a sync that stopped once it's fixed in the sync worktree
+    Sync,
+    /// Abort the rebase or merge a stopped sync left in the sync worktree. Background syncs then
+    /// wait for the next `tw config sync`, which starts over
+    Abort,
+    #[command(subcommand)]
+    Remote(RemoteCommand),
+}
+
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// Sync with this remote. A config repo with no history of its own takes the remote's.
+    Set { url: String },
+    /// Stop syncing and forget the remote
+    Rm,
+}
+
+#[derive(Subcommand)]
 enum WorktreeCommand {
     /// Add a worktree for a project repo and render its worker config
     Add {
@@ -537,6 +561,7 @@ fn main() -> Result<()> {
         Command::Issue(cmd) => issue(cmd),
         Command::Item(cmd) => item(cmd),
         Command::Project(cmd) => project(cmd),
+        Command::Config(cmd) => config(&paths, cmd),
     }
 }
 
@@ -619,6 +644,104 @@ fn apply_session_change(paths: &Paths, id: &str, change: SessionChange) -> Resul
         SessionChange::SessionStart => activity::session_start(paths, id),
         SessionChange::Touch => activity::touch(paths, id),
     }
+}
+
+fn config(paths: &Paths, cmd: ConfigCommand) -> Result<()> {
+    use tworky_core::config_repo::{self, Trigger};
+    let status = matches!(cmd, ConfigCommand::Status);
+    let record = match cmd {
+        ConfigCommand::Status => {
+            let status = config_repo::status(paths)?;
+            println!("repo:    {}", paths.repo_dir().display());
+            println!(
+                "remote:  {}",
+                config_repo::remote_url(paths).unwrap_or_else(|| "none".into())
+            );
+            if let Some((ahead, behind)) = status.ahead_behind {
+                println!("main:    {ahead} ahead, {behind} behind the remote");
+            }
+            if !status.changes.is_empty() {
+                println!("uncommitted: {}", status.changes.join(", "));
+            }
+            if status.stale_index_lock {
+                println!(
+                    "warning: a git command that was stopped left an index.lock behind in the config repo or its sync worktree; delete it if no git is running there"
+                );
+            }
+            status.sync
+        }
+        ConfigCommand::Sync => config_repo::sync(paths, Trigger::User)?,
+        ConfigCommand::Abort => config_repo::abort(paths)?,
+        ConfigCommand::Remote(RemoteCommand::Set { url }) => config_repo::set_remote(paths, &url)?,
+        ConfigCommand::Remote(RemoteCommand::Rm) => config_repo::remove_remote(paths)?,
+    };
+    let stopped = print_sync(paths, &record);
+    anyhow::ensure!(status || !stopped, "the config sync is stopped");
+    Ok(())
+}
+
+/// Prints the sync state and what came in. Returns whether the sync is stopped.
+fn print_sync(paths: &Paths, record: &tworky_core::config_repo::SyncRecord) -> bool {
+    use tworky_core::config_repo::SyncState;
+    let files = |files: &[String]| files.join(", ");
+    let worktree = paths.repo_sync_dir();
+    let (line, stopped) = match &record.state {
+        SyncState::Idle => ("idle".to_string(), false),
+        SyncState::Syncing => ("syncing".to_string(), false),
+        SyncState::NoRemote => ("no remote".to_string(), false),
+        SyncState::Conflict { files: f } if record.paused => (
+            format!(
+                "paused after a conflict in {}; `tw config sync` starts over",
+                files(f)
+            ),
+            true,
+        ),
+        SyncState::Conflict { files: f } => (
+            format!(
+                "conflict in {}; resolve it in {} and run `tw config sync`",
+                files(f),
+                worktree.display()
+            ),
+            true,
+        ),
+        SyncState::HeldBack { files: f } => (
+            format!(
+                "held back: the remote's {} don't parse; fix and commit them in {}, then run `tw config sync`",
+                files(f),
+                worktree.display()
+            ),
+            true,
+        ),
+        SyncState::BlockedByLocal { files: f } => (
+            format!(
+                "blocked: uncommitted local {} would be overwritten by incoming changes; fix or remove them",
+                files(f)
+            ),
+            true,
+        ),
+        SyncState::Error { message } => (format!("failed: {message}"), true),
+    };
+    println!("sync:    {line}");
+    if let Some(secs) = record.last_sync {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(secs);
+        println!("last:    {} min ago", now.saturating_sub(secs) / 60);
+    }
+    if !record.incoming.hooks_or_services.is_empty() {
+        println!(
+            "incoming hooks or services in: {}",
+            record.incoming.hooks_or_services.join(", ")
+        );
+    }
+    if !record.incoming.guidance.is_empty() {
+        println!(
+            "incoming guidance or memory: {}",
+            record.incoming.guidance.join(", ")
+        );
+    }
+    stopped
 }
 
 fn project(cmd: ProjectCommand) -> Result<()> {

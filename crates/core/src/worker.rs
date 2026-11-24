@@ -143,7 +143,7 @@ fn guidance_command(paths: &Paths, project: &str, os: Os) -> String {
 /// `session` names the activity record to report to; a worker's session reports to `$TW_WORKER_ID`.
 pub(crate) fn session_settings(
     paths: &Paths,
-    project: &str,
+    project: Option<&str>,
     stopped: bool,
     browser: bool,
     session: Option<&str>,
@@ -151,10 +151,15 @@ pub(crate) fn session_settings(
     let target = session
         .map(|s| format!(" --worker {}", sh_quote(s)))
         .unwrap_or_default();
-    let mut hooks = vec![serde_json::json!({
-        "type": "command",
-        "command": guidance_command(paths, project, Os::current()),
-    })];
+    let mut hooks: Vec<serde_json::Value> = project
+        .map(|project| {
+            serde_json::json!({
+                "type": "command",
+                "command": guidance_command(paths, project, Os::current()),
+            })
+        })
+        .into_iter()
+        .collect();
     hooks.push(serde_json::json!({ "type": "command", "command": format!("echo {}", sh_quote(FEEDBACK_NOTE)) }));
     if stopped {
         hooks.push(serde_json::json!({ "type": "command", "command": format!("echo {}", sh_quote(STOPPED_NOTE)) }));
@@ -899,6 +904,13 @@ impl Workspace {
         let sessions: Vec<(PathBuf, String)> = ids
             .iter()
             .filter_map(|id| match crate::project_setup::session_project(id) {
+                _ if id == crate::settings_session::SESSION_ID => {
+                    let s = self
+                        .state
+                        .app_session(crate::settings_session::KEY)
+                        .ok()??;
+                    Some((self.config.paths.repo_sync_dir(), s.claude_session))
+                }
                 Some(project) => {
                     let s = self.state.project_session(project).ok()??;
                     Some((
@@ -938,7 +950,7 @@ impl Workspace {
             "--settings".into(),
             session_settings(
                 &self.config.paths,
-                &project.name,
+                Some(&project.name),
                 w.stopped,
                 mcp.is_some(),
                 None,
@@ -2942,7 +2954,7 @@ run = "{sleep}"
         };
         let settings: Value = serde_json::from_str(&session_settings(
             &paths,
-            "acme",
+            Some("acme"),
             false,
             false,
             Some("setup@acme"),

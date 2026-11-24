@@ -743,7 +743,8 @@
       listen<string>('worker-changed', (e) => {
         loadWorkers()
         loadJobs()
-        if (view === 'workers' || selectedWorkerIds.includes(e.payload)) loadLocal([e.payload])
+        if (!e.payload.includes('@') && (view === 'workers' || selectedWorkerIds.includes(e.payload)))
+          loadLocal([e.payload])
       }),
       listen<{ id: string; line: string }>('worker-log', (e) => {
         logs[e.payload.id] ??= []

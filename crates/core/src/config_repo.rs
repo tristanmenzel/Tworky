@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{MachineConfig, Os, Paths, ProjectConfig};
 use crate::process;
@@ -13,8 +13,17 @@ use crate::process;
 pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
 
-const FALLBACK_NAME: &str = "user.name=Tworky";
-const FALLBACK_EMAIL: &str = "user.email=tworky@localhost";
+const FALLBACK_NAME: &str = "Tworky";
+const FALLBACK_EMAIL: &str = "tworky@localhost";
+const FALLBACK_NAME_ARG: &str = "user.name=Tworky";
+const FALLBACK_EMAIL_ARG: &str = "user.email=tworky@localhost";
+
+const INIT_MESSAGE: &str = "Start the Tworky config";
+
+const REMOTE: &str = "origin";
+
+/// The repo name the installed app's remote defaults to, which a debug build never syncs with.
+const RELEASE_REMOTE_NAME: &str = "tworky-config";
 
 /// How long a rename in the config folder is retried while Windows holds a file in it open.
 const RENAME_RETRY: Duration = Duration::from_secs(10);
@@ -165,7 +174,7 @@ fn forward_slashes(path: &Path) -> String {
 /// Creates `repo/` with its first commit. It's built in `repo.tmp/` and renamed into place, so a
 /// failure leaves no `repo/`.
 pub fn init(_guard: &RepoLock, paths: &Paths) -> Result<()> {
-    create(paths, "Start the Tworky config", |_| Ok(vec![]))
+    create(paths, INIT_MESSAGE, |_| Ok(vec![]))
 }
 
 /// Builds `repo/` in `repo.tmp/`: its git config, allowlist and guidance files plus whatever
@@ -246,17 +255,43 @@ fn commit_everything(paths: &Paths, dir: &Path, unstaged: &[String], message: &s
 /// `user.email` the user hasn't set. Never written to the repo's config, so an identity the user
 /// sets later takes over.
 fn identity_args(paths: &Paths, dir: &Path) -> Vec<&'static str> {
+    let (name, email) = unset_identity(paths, dir);
+    let mut args = Vec::new();
+    if name {
+        args.extend(["-c", FALLBACK_NAME_ARG]);
+    }
+    if email {
+        args.extend(["-c", FALLBACK_EMAIL_ARG]);
+    }
+    args
+}
+
+/// [`identity_args`] as environment variables, for git commands Tworky doesn't run itself, such
+/// as the settings session's.
+pub fn identity_env(paths: &Paths, dir: &Path) -> Vec<(&'static str, &'static str)> {
+    let (name, email) = unset_identity(paths, dir);
+    let mut env = Vec::new();
+    if name {
+        env.extend([
+            ("GIT_AUTHOR_NAME", FALLBACK_NAME),
+            ("GIT_COMMITTER_NAME", FALLBACK_NAME),
+        ]);
+    }
+    if email {
+        env.extend([
+            ("GIT_AUTHOR_EMAIL", FALLBACK_EMAIL),
+            ("GIT_COMMITTER_EMAIL", FALLBACK_EMAIL),
+        ]);
+    }
+    env
+}
+
+/// Whether `user.name` and `user.email` are unset for git in `dir`.
+fn unset_identity(paths: &Paths, dir: &Path) -> (bool, bool) {
     let unset = |key: &str| {
         !git(paths, dir, &["config", key], LOCAL_TIMEOUT).is_ok_and(|v| !v.trim().is_empty())
     };
-    let mut args = Vec::new();
-    if unset("user.name") {
-        args.extend(["-c", FALLBACK_NAME]);
-    }
-    if unset("user.email") {
-        args.extend(["-c", FALLBACK_EMAIL]);
-    }
-    args
+    (unset("user.name"), unset("user.email"))
 }
 
 /// Brings the config repo into being, then renames the legacy folders. See
@@ -849,16 +884,10 @@ pub struct Status {
     pub changes: Vec<String>,
     /// Commits `main` is ahead of and behind its upstream, when it has one.
     pub ahead_behind: Option<(u32, u32)>,
-    /// An `index.lock` older than any git command this module runs, so one a crash left behind.
+    /// An `index.lock` in `repo/` or `repo-sync/` older than any git command this module runs, so
+    /// one a crash left behind.
     pub stale_index_lock: bool,
-    pub sync: SyncState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SyncState {
-    NoRemote,
-    Idle,
+    pub sync: SyncRecord,
 }
 
 impl Status {
@@ -869,11 +898,11 @@ impl Status {
 
 pub fn status(paths: &Paths) -> Result<Status> {
     let repo = paths.repo_dir();
-    let git = |args: &[&str]| git(paths, &repo, args, LOCAL_TIMEOUT);
+    let run = |args: &[&str]| git(paths, &repo, args, LOCAL_TIMEOUT);
     let changes = changes(paths, &repo)?;
     let ahead_behind =
-        if git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).is_ok() {
-            let counts = git(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])?;
+        if run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).is_ok() {
+            let counts = run(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])?;
             let mut counts = counts.split_whitespace().map(str::parse::<u32>);
             match (counts.next(), counts.next()) {
                 (Some(Ok(ahead)), Some(Ok(behind))) => Some((ahead, behind)),
@@ -882,23 +911,935 @@ pub fn status(paths: &Paths) -> Result<Status> {
         } else {
             None
         };
-    let stale_index_lock = std::fs::metadata(repo.join(".git").join("index.lock"))
-        .and_then(|m| m.modified())
-        .is_ok_and(|modified| {
-            SystemTime::now()
-                .duration_since(modified)
-                .is_ok_and(|age| age > LOCAL_TIMEOUT)
-        });
-    let sync = if git(&["remote", "get-url", "origin"]).is_ok() {
-        SyncState::Idle
-    } else {
-        SyncState::NoRemote
-    };
+    let mut index_locks = vec![repo.join(".git").join("index.lock")];
+    let sync_dir = paths.repo_sync_dir();
+    if sync_dir.join(".git").exists()
+        && let Ok(lock) = git(
+            paths,
+            &sync_dir,
+            &["rev-parse", "--git-path", "index.lock"],
+            LOCAL_TIMEOUT,
+        )
+    {
+        index_locks.push(sync_dir.join(lock.trim()));
+    }
+    let stale_index_lock = index_locks.iter().any(|lock| {
+        std::fs::metadata(lock)
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| {
+                SystemTime::now()
+                    .duration_since(modified)
+                    .is_ok_and(|age| age > LOCAL_TIMEOUT)
+            })
+    });
     Ok(Status {
         changes,
         ahead_behind,
         stale_index_lock,
-        sync,
+        sync: sync_status(paths)?,
+    })
+}
+
+/// The config repo's sync with its remote, kept in `<data>/config-sync.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncRecord {
+    pub state: SyncState,
+    /// `main` when the stopped sync began integrating (`S`): the commits after it are this
+    /// machine's.
+    pub base: Option<String>,
+    /// What the stopped sync puts this machine's commits on. A resolution in `repo-sync` contains
+    /// it.
+    pub upstream: Option<String>,
+    /// The result a sync held back, so the next one can tell whether it was fixed since.
+    pub result: Option<String>,
+    /// What `repo-sync` stopped in.
+    pub operation: Option<Operation>,
+    /// Set by [`abort`]: background syncs are skipped until the user asks for one, which starts
+    /// over.
+    pub paused: bool,
+    /// Unix seconds of the last sync that finished.
+    pub last_sync: Option<u64>,
+    /// What pulled changes touched, until dismissed.
+    pub incoming: Incoming,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SyncState {
+    #[default]
+    Idle,
+    Syncing,
+    /// A rebase or merge in `repo-sync` stopped on these files, or its result still has conflict
+    /// markers in them.
+    Conflict {
+        files: Vec<String>,
+    },
+    /// `project.toml` files from the remote that don't parse.
+    HeldBack {
+        files: Vec<String>,
+    },
+    /// Uncommitted files in `repo/` that incoming changes would overwrite.
+    BlockedByLocal {
+        files: Vec<String>,
+    },
+    Error {
+        message: String,
+    },
+    NoRemote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Operation {
+    Rebase,
+    Merge,
+}
+
+/// What pulled changes touched that the user should look at, since synced config runs commands
+/// and steers sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Incoming {
+    /// Projects whose `[[hooks.*]]` or `[[services]]` changed.
+    pub hooks_or_services: Vec<String>,
+    /// Guidance and memory files that changed, relative to the repo.
+    pub guidance: Vec<String>,
+}
+
+impl Incoming {
+    pub fn is_empty(&self) -> bool {
+        self.hooks_or_services.is_empty() && self.guidance.is_empty()
+    }
+
+    fn add(&mut self, other: Incoming) {
+        for (mine, theirs) in [
+            (&mut self.hooks_or_services, other.hooks_or_services),
+            (&mut self.guidance, other.guidance),
+        ] {
+            mine.extend(theirs);
+            mine.sort();
+            mine.dedup();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// The app's start, focus, timer or a commit. Skipped while an aborted sync is paused.
+    Background,
+    /// The user asked. Starts over after an abort.
+    User,
+}
+
+fn read_record(paths: &Paths) -> SyncRecord {
+    std::fs::read(paths.config_sync_file())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn update_record(paths: &Paths, change: impl FnOnce(&mut SyncRecord)) -> Result<SyncRecord> {
+    let _lock = lock(&paths.config_sync_lock())?;
+    let before = read_record(paths);
+    let mut record = before.clone();
+    change(&mut record);
+    if record != before {
+        crate::memory::write_atomic(
+            &paths.config_sync_file(),
+            serde_json::to_string_pretty(&record)?.as_bytes(),
+        )?;
+    }
+    Ok(record)
+}
+
+/// The recorded sync state, or `no_remote` while the repo has no remote.
+pub fn sync_status(paths: &Paths) -> Result<SyncRecord> {
+    let mut record = read_record(paths);
+    if !paths.has_repo() || remote_url(paths).is_none() {
+        record.state = SyncState::NoRemote;
+    }
+    Ok(record)
+}
+
+pub fn remote_url(paths: &Paths) -> Option<String> {
+    git(
+        paths,
+        &paths.repo_dir(),
+        &["remote", "get-url", REMOTE],
+        LOCAL_TIMEOUT,
+    )
+    .ok()
+    .map(|url| url.trim().to_string())
+}
+
+pub fn dismiss_incoming(paths: &Paths) -> Result<()> {
+    update_record(paths, |r| r.incoming = Incoming::default())?;
+    Ok(())
+}
+
+/// `main`'s loose ref, which changes with every commit, for noticing commits without running git.
+pub fn main_ref_stamp(paths: &Paths) -> Option<String> {
+    std::fs::read_to_string(paths.repo_dir().join(".git/refs/heads/main")).ok()
+}
+
+/// Brings `repo/` and the remote together: fetches, rebases this machine's commits onto the
+/// remote's in `repo-sync`, checks the result, moves `main` to it under the repo lock, and pushes.
+/// A conflict, a result that doesn't check out or local files in the way stop it in a state the
+/// next sync resumes from once fixed. Returns the recorded state, which holds any failure.
+pub fn sync(paths: &Paths, trigger: Trigger) -> Result<SyncRecord> {
+    sync_within(paths, trigger, NETWORK_TIMEOUT)
+}
+
+fn sync_within(paths: &Paths, trigger: Trigger, network: Duration) -> Result<SyncRecord> {
+    if !paths.has_repo() {
+        bail!(
+            "the config repo {} isn't set up",
+            paths.repo_dir().display()
+        );
+    }
+    let _sync = with_sync_lock(paths)?;
+    sync_locked(paths, trigger, network)
+}
+
+fn sync_locked(paths: &Paths, trigger: Trigger, network: Duration) -> Result<SyncRecord> {
+    if remote_url(paths).is_none() {
+        return update_record(paths, |r| {
+            *r = SyncRecord {
+                state: SyncState::NoRemote,
+                last_sync: r.last_sync,
+                incoming: std::mem::take(&mut r.incoming),
+                ..Default::default()
+            }
+        });
+    }
+    let before = read_record(paths);
+    if trigger == Trigger::Background && before.paused {
+        return Ok(before);
+    }
+    let step = run_sync(paths, &before, network).unwrap_or_else(|e| Step {
+        state: SyncState::Error {
+            message: failure_message(&e),
+        },
+        ..Default::default()
+    });
+    update_record(paths, |r| step.apply(r))
+}
+
+/// Where a sync got to.
+#[derive(Default)]
+struct Step {
+    state: SyncState,
+    base: Option<String>,
+    upstream: Option<String>,
+    result: Option<String>,
+    operation: Option<Operation>,
+    finished: bool,
+    incoming: Incoming,
+}
+
+impl Step {
+    fn stopped(
+        state: SyncState,
+        base: &str,
+        upstream: Option<&str>,
+        result: Option<&str>,
+        operation: Option<Operation>,
+    ) -> Step {
+        Step {
+            state,
+            base: Some(base.to_string()),
+            upstream: upstream.map(String::from),
+            result: result.map(String::from),
+            operation,
+            ..Default::default()
+        }
+    }
+
+    fn apply(self, r: &mut SyncRecord) {
+        r.state = self.state;
+        r.base = self.base;
+        r.upstream = self.upstream;
+        r.result = self.result;
+        r.operation = self.operation;
+        r.paused = false;
+        if self.finished {
+            r.last_sync = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs());
+        }
+        r.incoming.add(self.incoming);
+    }
+}
+
+fn run_sync(paths: &Paths, before: &SyncRecord, network: Duration) -> Result<Step> {
+    let dir = sync_worktree(paths)?;
+    let progress = progress(paths, &dir)?;
+    if progress != Progress::None {
+        let mut files = unmerged(paths, &dir)?;
+        if files.is_empty()
+            && let SyncState::Conflict { files: before } = &before.state
+        {
+            files = before.clone();
+        }
+        return Ok(Step {
+            state: SyncState::Conflict { files },
+            base: before.base.clone(),
+            upstream: before.upstream.clone(),
+            operation: progress.operation(),
+            ..Default::default()
+        });
+    }
+    update_record(paths, |r| r.state = SyncState::Syncing)?;
+    let mut step = match resumable(paths, &dir, before)? {
+        Some((base, upstream)) => match integrate(paths, &dir, base, Some(upstream), network) {
+            Err(e) if e.downcast_ref::<PushRejected>().is_none() => {
+                return Ok(Step {
+                    state: SyncState::Error {
+                        message: failure_message(&e),
+                    },
+                    base: before.base.clone(),
+                    upstream: before.upstream.clone(),
+                    ..Default::default()
+                });
+            }
+            step => step,
+        },
+        None => start(paths, &dir, network),
+    };
+    for _ in 0..2 {
+        match &step {
+            Err(e) if e.downcast_ref::<PushRejected>().is_some() => {
+                step = start(paths, &dir, network)
+            }
+            _ => break,
+        }
+    }
+    step
+}
+
+/// The base and upstream to resume a stopped sync from, once the user has fixed it in `repo-sync`:
+/// a conflict whose rebase or merge has finished, a held-back result with a commit on top, or a
+/// resumed sync that failed, which keeps its base so the fix in `repo-sync` isn't thrown away.
+fn resumable<'a>(
+    paths: &Paths,
+    dir: &Path,
+    before: &'a SyncRecord,
+) -> Result<Option<(&'a str, &'a str)>> {
+    let (Some(base), Some(upstream)) = (&before.base, &before.upstream) else {
+        return Ok(None);
+    };
+    if before.paused {
+        return Ok(None);
+    }
+    let head = rev_parse(paths, dir, "HEAD")?;
+    let fixed = match &before.state {
+        SyncState::Conflict { .. } | SyncState::Error { .. } => true,
+        SyncState::HeldBack { .. } => before.result.as_deref() != Some(head.as_str()),
+        _ => false,
+    };
+    Ok((fixed && is_ancestor(paths, dir, upstream, &head)?).then_some((base, upstream)))
+}
+
+/// Steps 1 and 2: fetches, then rebases `main`'s commits onto the remote's in `repo-sync`.
+fn start(paths: &Paths, dir: &Path, network: Duration) -> Result<Step> {
+    git(paths, dir, &["fetch", "-q", "--prune", REMOTE], network)?;
+    let base = rev_parse(paths, &paths.repo_dir(), "refs/heads/main")?;
+    let upstream = remote_main(paths, dir)?;
+    let run = |args: &[&str]| git(paths, dir, args, LOCAL_TIMEOUT);
+    run(&["checkout", "-q", "-f", "--detach", &base])?;
+    run(&["clean", "-fdq"])?;
+    if let Some(upstream) = &upstream
+        && !is_ancestor(paths, dir, upstream, &base)?
+        && let Err(e) = git_committing(paths, dir, &["rebase", "-q", "--rebase-merges", upstream])
+    {
+        return stopped_in(paths, dir, e, &base, upstream);
+    }
+    integrate(paths, dir, &base, upstream.as_deref(), network)
+}
+
+/// A rebase or merge in `repo-sync` failed: a conflict if it stopped, else the failure.
+fn stopped_in(
+    paths: &Paths,
+    dir: &Path,
+    failure: anyhow::Error,
+    base: &str,
+    upstream: &str,
+) -> Result<Step> {
+    let progress = progress(paths, dir)?;
+    if progress == Progress::None {
+        return Err(failure);
+    }
+    Ok(Step::stopped(
+        SyncState::Conflict {
+            files: unmerged(paths, dir)?,
+        },
+        base,
+        Some(upstream),
+        None,
+        progress.operation(),
+    ))
+}
+
+/// Steps 3 and 4: checks `repo-sync`'s `HEAD`, which holds `base`'s commits on `upstream`, moves
+/// `main` to it (replaying any commits made since `base` first), then pushes it.
+fn integrate(
+    paths: &Paths,
+    dir: &Path,
+    base: &str,
+    upstream: Option<&str>,
+    network: Duration,
+) -> Result<Step> {
+    let result = rev_parse(paths, dir, "HEAD")?;
+    if let Some(state) = check(paths, dir, base, &result)? {
+        return Ok(Step::stopped(state, base, upstream, Some(&result), None));
+    }
+    let repo = paths.repo_dir();
+    let guard = with_lock(paths)?;
+    sweep(&guard, paths)?;
+    let main = rev_parse(paths, &repo, "refs/heads/main")?;
+    let result = if main == base {
+        result
+    } else {
+        if let Err(e) = git_committing(
+            paths,
+            dir,
+            &[
+                "rebase",
+                "-q",
+                "--rebase-merges",
+                "--onto",
+                &result,
+                base,
+                &main,
+            ],
+        ) {
+            return stopped_in(paths, dir, e, &main, &result);
+        }
+        let replayed = rev_parse(paths, dir, "HEAD")?;
+        if let Some(state) = check(paths, dir, &main, &replayed)? {
+            return Ok(Step::stopped(
+                state,
+                &main,
+                Some(&result),
+                Some(&replayed),
+                None,
+            ));
+        }
+        replayed
+    };
+    let incoming_files = diff_names(paths, &repo, &main, &result)?;
+    let blocked: Vec<String> = changes(paths, &repo)?
+        .into_iter()
+        .filter(|f| incoming_files.contains(f))
+        .collect();
+    if !blocked.is_empty() {
+        return Ok(Step {
+            state: SyncState::BlockedByLocal { files: blocked },
+            ..Default::default()
+        });
+    }
+    git(
+        paths,
+        &repo,
+        &["reset", "-q", "--keep", &result],
+        LOCAL_TIMEOUT,
+    )?;
+    let incoming = summarize(paths, &repo, &main, &result, &incoming_files);
+    drop(guard);
+    if upstream != Some(result.as_str()) {
+        push(paths, dir, network)?;
+    }
+    Ok(Step {
+        finished: true,
+        incoming,
+        ..Default::default()
+    })
+}
+
+/// Why `result` can't become `main`: unmerged files in `repo-sync`, conflict markers it adds to
+/// config files since `base`, or a `project.toml` it changes that doesn't parse.
+fn check(paths: &Paths, dir: &Path, base: &str, result: &str) -> Result<Option<SyncState>> {
+    let files = unmerged(paths, dir)?;
+    if !files.is_empty() {
+        return Ok(Some(SyncState::Conflict { files }));
+    }
+    let diff = git(
+        paths,
+        dir,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "-U0",
+            base,
+            result,
+        ],
+        LOCAL_TIMEOUT,
+    )?;
+    let mut marked: Vec<String> = Vec::new();
+    let (mut file, mut in_header) = (None, false);
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            in_header = true;
+        } else if line.starts_with("@@") {
+            in_header = false;
+        } else if in_header {
+            if let Some(path) = line.strip_prefix("+++ ") {
+                file = path.strip_prefix("b/").map(String::from);
+            }
+        } else if let Some(added) = line.strip_prefix('+')
+            && is_conflict_marker(added)
+            && let Some(file) = &file
+            && is_allowlisted(file)
+            && !marked.contains(file)
+        {
+            marked.push(file.clone());
+        }
+    }
+    if !marked.is_empty() {
+        return Ok(Some(SyncState::Conflict { files: marked }));
+    }
+    let changed = git(
+        paths,
+        dir,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=d",
+            "-z",
+            base,
+            result,
+        ],
+        LOCAL_TIMEOUT,
+    )?;
+    let mut broken = Vec::new();
+    for file in changed
+        .split('\0')
+        .filter(|f| is_project_file(Path::new(f)))
+    {
+        let text = git(
+            paths,
+            dir,
+            &["show", &format!("{result}:{file}")],
+            LOCAL_TIMEOUT,
+        )?;
+        if toml::from_str::<ProjectConfig>(&text).is_err() {
+            broken.push(file.to_string());
+        }
+    }
+    Ok((!broken.is_empty()).then_some(SyncState::HeldBack { files: broken }))
+}
+
+fn is_conflict_marker(line: &str) -> bool {
+    ["<<<<<<<", ">>>>>>>"].iter().any(|marker| {
+        line.strip_prefix(marker)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    })
+}
+
+/// Which projects' commands and which guidance and memory files differ between `old` and `new`.
+fn summarize(paths: &Paths, dir: &Path, old: &str, new: &str, files: &[String]) -> Incoming {
+    let mut incoming = Incoming::default();
+    for file in files {
+        match file.split('/').collect::<Vec<_>>().as_slice() {
+            ["projects", project, "project.toml"] => {
+                let commands = |commit: &str| {
+                    let project = git(
+                        paths,
+                        dir,
+                        &["show", &format!("{commit}:{file}")],
+                        LOCAL_TIMEOUT,
+                    )
+                    .ok()
+                    .and_then(|text| toml::from_str::<ProjectConfig>(&text).ok());
+                    project.map(|p| {
+                        (
+                            serde_json::to_value(&p.hooks).ok(),
+                            serde_json::to_value(&p.services).ok(),
+                        )
+                    })
+                };
+                if commands(old) != commands(new) {
+                    incoming.hooks_or_services.push(project.to_string());
+                }
+            }
+            ["tworky", _] | ["projects", _, _] if is_allowlisted(file) => {
+                incoming.guidance.push(file.clone())
+            }
+            _ => {}
+        }
+    }
+    incoming
+}
+
+/// Runs git in `repo-sync` for a command that may write commits: with Tworky's identity where the
+/// user has none, and with the user's rebase settings that would move other branches or stash
+/// turned off.
+fn git_committing(paths: &Paths, dir: &Path, args: &[&str]) -> Result<String> {
+    let identity = identity_args(paths, dir);
+    let settings = [
+        "-c",
+        "rebase.updateRefs=false",
+        "-c",
+        "rebase.autoStash=false",
+    ];
+    git(
+        paths,
+        dir,
+        &[&identity[..], &settings, args].concat(),
+        LOCAL_TIMEOUT,
+    )
+}
+
+#[derive(Debug)]
+struct PushRejected(String);
+
+impl std::fmt::Display for PushRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the remote changed while syncing: {}", self.0)
+    }
+}
+
+impl std::error::Error for PushRejected {}
+
+fn push(paths: &Paths, dir: &Path, network: Duration) -> Result<()> {
+    match git(
+        paths,
+        dir,
+        &["push", "-q", REMOTE, "HEAD:refs/heads/main"],
+        network,
+    ) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let message = format!("{e:#}");
+            let rejected = [
+                "[rejected]",
+                "non-fast-forward",
+                "fetch first",
+                "Updates were rejected",
+            ];
+            if rejected.iter().any(|r| message.contains(r)) {
+                Err(PushRejected(message).into())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+fn failure_message(e: &anyhow::Error) -> String {
+    let message = format!("{e:#}");
+    let auth = [
+        "Authentication failed",
+        "could not read Username",
+        "could not read Password",
+        "terminal prompts disabled",
+        "Permission denied (publickey",
+        "returned error: 403",
+        "Repository not found",
+    ];
+    if auth.iter().any(|a| message.contains(a)) {
+        format!(
+            "{message}\ngit couldn't sign in to the remote; for a GitHub remote, run `gh auth setup-git` so git uses gh's login"
+        )
+    } else {
+        message
+    }
+}
+
+/// `repo-sync`, a detached worktree of `repo/`, created when missing. The caller holds the sync
+/// lock.
+fn sync_worktree(paths: &Paths) -> Result<PathBuf> {
+    let dir = paths.repo_sync_dir();
+    if is_worktree(paths, &dir) {
+        return Ok(dir);
+    }
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+    }
+    let repo = paths.repo_dir();
+    git(paths, &repo, &["worktree", "prune"], LOCAL_TIMEOUT)?;
+    git(
+        paths,
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &forward_slashes(&dir),
+            "main",
+        ],
+        LOCAL_TIMEOUT,
+    )?;
+    Ok(dir)
+}
+
+fn is_worktree(paths: &Paths, dir: &Path) -> bool {
+    dir.join(".git").exists() && git(paths, dir, &["rev-parse", "--git-dir"], LOCAL_TIMEOUT).is_ok()
+}
+
+/// [`sync_worktree`] for the settings session, taking the sync lock only when it has to create it.
+pub fn sync_worktree_dir(paths: &Paths) -> Result<PathBuf> {
+    let dir = paths.repo_sync_dir();
+    if is_worktree(paths, &dir) {
+        return Ok(dir);
+    }
+    let _sync = with_sync_lock(paths)?;
+    sync_worktree(paths)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Progress {
+    None,
+    Rebase,
+    Merge,
+    /// Unmerged entries with no rebase or merge, such as from a cherry-pick.
+    Unmerged,
+}
+
+impl Progress {
+    fn operation(self) -> Option<Operation> {
+        match self {
+            Progress::Rebase => Some(Operation::Rebase),
+            Progress::Merge => Some(Operation::Merge),
+            Progress::None | Progress::Unmerged => None,
+        }
+    }
+}
+
+fn progress(paths: &Paths, dir: &Path) -> Result<Progress> {
+    let out = git(
+        paths,
+        dir,
+        &[
+            "rev-parse",
+            "--git-path",
+            "rebase-merge",
+            "--git-path",
+            "rebase-apply",
+            "--git-path",
+            "MERGE_HEAD",
+        ],
+        LOCAL_TIMEOUT,
+    )?;
+    let exists: Vec<bool> = out.lines().map(|l| dir.join(l.trim()).exists()).collect();
+    Ok(match exists.as_slice() {
+        [true, _, _] | [_, true, _] => Progress::Rebase,
+        [_, _, true] => Progress::Merge,
+        _ if !unmerged(paths, dir)?.is_empty() => Progress::Unmerged,
+        _ => Progress::None,
+    })
+}
+
+fn unmerged(paths: &Paths, dir: &Path) -> Result<Vec<String>> {
+    let out = git(paths, dir, &["ls-files", "--unmerged", "-z"], LOCAL_TIMEOUT)?;
+    let mut files: Vec<String> = out
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path.to_string()))
+        .collect();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn rev_parse(paths: &Paths, dir: &Path, rev: &str) -> Result<String> {
+    Ok(git(
+        paths,
+        dir,
+        &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")],
+        LOCAL_TIMEOUT,
+    )
+    .with_context(|| format!("resolving {rev}"))?
+    .trim()
+    .to_string())
+}
+
+/// The fetched `main` of the remote, or `None` while the remote is empty.
+fn remote_main(paths: &Paths, dir: &Path) -> Result<Option<String>> {
+    let out = git(
+        paths,
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/remotes/origin/main",
+        ],
+        LOCAL_TIMEOUT,
+    )?;
+    Ok(Some(out.trim().to_string()).filter(|sha| !sha.is_empty()))
+}
+
+/// Whether `ancestor` is `descendant` or one of its ancestors.
+fn is_ancestor(paths: &Paths, dir: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let missing = git(
+        paths,
+        dir,
+        &["rev-list", "-n", "1", &format!("{descendant}..{ancestor}")],
+        LOCAL_TIMEOUT,
+    )?;
+    Ok(missing.trim().is_empty())
+}
+
+fn diff_names(paths: &Paths, dir: &Path, old: &str, new: &str) -> Result<Vec<String>> {
+    let out = git(
+        paths,
+        dir,
+        &["diff", "--name-only", "--no-renames", "-z", old, new],
+        LOCAL_TIMEOUT,
+    )?;
+    Ok(out
+        .split('\0')
+        .filter(|f| !f.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Stops the rebase or merge `repo-sync` is in, and pauses syncing until the user asks for a sync,
+/// which starts over.
+pub fn abort(paths: &Paths) -> Result<SyncRecord> {
+    let _sync = with_sync_lock(paths)?;
+    abort_in_progress(paths)?;
+    update_record(paths, |r| {
+        r.operation = None;
+        r.paused = true;
+    })
+}
+
+fn abort_in_progress(paths: &Paths) -> Result<()> {
+    let dir = paths.repo_sync_dir();
+    if !is_worktree(paths, &dir) {
+        return Ok(());
+    }
+    let run = |args: &[&str]| git(paths, &dir, args, LOCAL_TIMEOUT);
+    match progress(paths, &dir)? {
+        Progress::None => {}
+        Progress::Rebase => {
+            run(&["rebase", "--abort"])?;
+        }
+        Progress::Merge => {
+            run(&["merge", "--abort"])?;
+        }
+        Progress::Unmerged => {
+            run(&["reset", "-q", "--hard"])?;
+        }
+    }
+    Ok(())
+}
+
+/// Makes `url` the repo's remote and syncs with it. A repo holding only its first commit takes the
+/// remote's history when the remote has any. A repo with history of its own is refused while the
+/// remote has content, for now.
+pub fn set_remote(paths: &Paths, url: &str) -> Result<SyncRecord> {
+    set_remote_within(paths, url, NETWORK_TIMEOUT)
+}
+
+fn set_remote_within(paths: &Paths, url: &str, network: Duration) -> Result<SyncRecord> {
+    let url = url.trim();
+    if url.is_empty() {
+        bail!("no remote URL given");
+    }
+    if cfg!(debug_assertions) && remote_repo_name(url).eq_ignore_ascii_case(RELEASE_REMOTE_NAME) {
+        bail!(
+            "a debug build doesn't sync with a repo named {RELEASE_REMOTE_NAME}, which the installed Tworky uses; pick another, such as tworky-config-dev"
+        );
+    }
+    if !paths.has_repo() {
+        bail!(
+            "the config repo {} isn't set up",
+            paths.repo_dir().display()
+        );
+    }
+    let _sync = with_sync_lock(paths)?;
+    if let Some(current) = remote_url(paths) {
+        bail!(
+            "the config repo already syncs with {current}; remove it first with `tw config remote rm`"
+        );
+    }
+    let repo = paths.repo_dir();
+    git(paths, &repo, &["remote", "add", REMOTE, url], LOCAL_TIMEOUT)?;
+    let incoming = match take_remote_history(paths, network) {
+        Ok(incoming) => incoming,
+        Err(e) => {
+            let _ = git(paths, &repo, &["remote", "remove", REMOTE], LOCAL_TIMEOUT);
+            bail!("{}", failure_message(&e));
+        }
+    };
+    sync_locked(paths, Trigger::User, network)?;
+    update_record(paths, |r| r.incoming.add(incoming))
+}
+
+/// Takes the remote's history into a repo that has only its first commit. Nothing to take while
+/// the remote is empty.
+fn take_remote_history(paths: &Paths, network: Duration) -> Result<Incoming> {
+    let repo = paths.repo_dir();
+    let run = |args: &[&str]| git(paths, &repo, args, LOCAL_TIMEOUT);
+    run(&["config", "branch.main.remote", REMOTE])?;
+    run(&["config", "branch.main.merge", "refs/heads/main"])?;
+    git(paths, &repo, &["fetch", "-q", "--prune", REMOTE], network)?;
+    let Some(upstream) = remote_main(paths, &repo)? else {
+        return Ok(Incoming::default());
+    };
+    let guard = with_lock(paths)?;
+    sweep(&guard, paths)?;
+    let main = rev_parse(paths, &repo, "refs/heads/main")?;
+    let init_only = run(&["rev-list", "--count", "main"])?.trim() == "1"
+        && run(&["log", "-1", "--format=%s", "main"])?.trim() == INIT_MESSAGE;
+    if !init_only {
+        bail!(
+            "this machine's config repo has commits of its own and the remote has config too; Tworky can't combine them yet"
+        );
+    }
+    let local = changes(paths, &repo)?;
+    if !local.is_empty() {
+        bail!(
+            "the config repo has uncommitted changes ({}); fix or remove them first",
+            local.join(", ")
+        );
+    }
+    run(&["reset", "-q", "--keep", &upstream])?;
+    let files = diff_names(paths, &repo, &main, &upstream)?;
+    Ok(summarize(paths, &repo, &main, &upstream, &files))
+}
+
+/// The repo's name in a remote URL or path: `tworky-config` for
+/// `git@github.com:me/tworky-config.git`.
+fn remote_repo_name(url: &str) -> &str {
+    let url = url.trim_end_matches(['/', '\\']);
+    let name = url.rsplit(['/', ':', '\\']).next().unwrap_or(url);
+    name.strip_suffix(".git").unwrap_or(name)
+}
+
+/// Stops syncing: aborts anything in progress in `repo-sync` and removes the remote.
+pub fn remove_remote(paths: &Paths) -> Result<SyncRecord> {
+    if !paths.has_repo() {
+        bail!(
+            "the config repo {} isn't set up",
+            paths.repo_dir().display()
+        );
+    }
+    let _sync = with_sync_lock(paths)?;
+    if remote_url(paths).is_none() {
+        bail!("the config repo has no remote");
+    }
+    abort_in_progress(paths)?;
+    git(
+        paths,
+        &paths.repo_dir(),
+        &["remote", "remove", REMOTE],
+        LOCAL_TIMEOUT,
+    )?;
+    update_record(paths, |r| {
+        *r = SyncRecord {
+            state: SyncState::NoRemote,
+            last_sync: r.last_sync,
+            incoming: std::mem::take(&mut r.incoming),
+            ..Default::default()
+        }
     })
 }
 
@@ -968,6 +1909,7 @@ mod tests {
         static GLOBAL_CONFIG: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
         static FAIL: Cell<Option<&'static str>> = const { Cell::new(None) };
         static BEFORE_ADD: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static SSH_COMMAND: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
     const CHILD_HOME: &str = "TWORKY_TEST_LOCK_CHILD_HOME";
@@ -986,6 +1928,10 @@ mod tests {
             "EMAIL",
         ] {
             cmd.env_remove(var);
+        }
+        if let Some(ssh) = SSH_COMMAND.with_borrow(|s| s.clone()) {
+            cmd.env("GIT_SSH_COMMAND", ssh)
+                .env("GIT_SSH_VARIANT", "simple");
         }
         if args.contains(&"add")
             && let Some(before) = BEFORE_ADD.take()
@@ -1102,7 +2048,7 @@ mod tests {
         assert!(status.is_clean(), "{status:?}");
         assert_eq!(status.ahead_behind, None);
         assert!(!status.stale_index_lock);
-        assert_eq!(status.sync, SyncState::NoRemote);
+        assert_eq!(status.sync.state, SyncState::NoRemote);
 
         let again = init(&with_lock(&home.paths).unwrap(), &home.paths).unwrap_err();
         assert!(again.to_string().contains("already exists"), "{again:#}");
@@ -1395,7 +2341,7 @@ mod tests {
         File::create(&lock).unwrap();
         let fresh = status(&home.paths).unwrap();
         assert_eq!(fresh.ahead_behind, Some((1, 0)));
-        assert_eq!(fresh.sync, SyncState::Idle);
+        assert_eq!(fresh.sync.state, SyncState::Idle);
         assert!(!fresh.stale_index_lock);
 
         File::options()
@@ -1864,6 +2810,489 @@ mod tests {
         assert_eq!(home.log(), ["Start the Tworky config"]);
         assert!(!home.paths.legacy_projects_dir().exists());
         assert!(migrate(&home.paths).unwrap().is_empty());
+    }
+
+    /// Two machines' homes sharing a bare remote: A pushed its new repo there, and B, also new,
+    /// took A's history.
+    struct Machines {
+        dir: tempfile::TempDir,
+        a: Paths,
+        b: Paths,
+        remote: String,
+    }
+
+    fn machines() -> Machines {
+        let dir = tempfile::tempdir().unwrap();
+        isolate_git_for_tests(dir.path());
+        let a = paths_under(&dir.path().join("a"));
+        let b = paths_under(&dir.path().join("b"));
+        git(
+            &a,
+            dir.path(),
+            &["init", "-q", "--bare", "-b", "main", "remote.git"],
+            LOCAL_TIMEOUT,
+        )
+        .unwrap();
+        let remote = forward_slashes(&dir.path().join("remote.git"));
+        for paths in [&a, &b] {
+            init(&with_lock(paths).unwrap(), paths).unwrap();
+            assert_eq!(set_remote(paths, &remote).unwrap().state, SyncState::Idle);
+        }
+        Machines { dir, a, b, remote }
+    }
+
+    impl Machines {
+        fn remote_head(&self) -> String {
+            rev_parse(&self.a, &self.dir.path().join("remote.git"), "main").unwrap()
+        }
+
+        fn global_config(&self) -> PathBuf {
+            self.dir.path().join("gitconfig")
+        }
+    }
+
+    const MEMORY: &str = "projects/acme/memory.md";
+    const PROJECT_FILE: &str = "projects/acme/project.toml";
+
+    fn write_file(paths: &Paths, relative: &str, text: &str) -> PathBuf {
+        let file = paths.repo_dir().join(relative);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, text).unwrap();
+        file
+    }
+
+    fn commit_file(paths: &Paths, relative: &str, text: &str) {
+        let file = write_file(paths, relative, text);
+        let guard = with_lock(paths).unwrap();
+        assert!(commit(&guard, paths, &[file], &format!("Save {relative}")).unwrap());
+    }
+
+    fn read_file(paths: &Paths, relative: &str) -> String {
+        std::fs::read_to_string(paths.repo_dir().join(relative)).unwrap()
+    }
+
+    fn head(paths: &Paths) -> String {
+        rev_parse(paths, &paths.repo_dir(), "refs/heads/main").unwrap()
+    }
+
+    fn sync_now(paths: &Paths) -> SyncRecord {
+        sync(paths, Trigger::User).unwrap()
+    }
+
+    fn in_sync_dir(paths: &Paths, args: &[&str]) -> String {
+        git(paths, &paths.repo_sync_dir(), args, LOCAL_TIMEOUT).unwrap()
+    }
+
+    /// Resolves a conflict in `repo-sync` the way the settings session would, as a user with an
+    /// identity of their own.
+    fn finish_rebase(paths: &Paths, file: &str, text: &str) {
+        std::fs::write(paths.repo_sync_dir().join(file), text).unwrap();
+        in_sync_dir(paths, &["add", file]);
+        in_sync_dir(
+            paths,
+            &[
+                "-c",
+                "user.name=Resolver",
+                "-c",
+                "user.email=resolver@example.com",
+                "rebase",
+                "--continue",
+            ],
+        );
+    }
+
+    fn conflicted(m: &Machines) -> String {
+        commit_file(&m.a, MEMORY, "# Acme\n- from A\n");
+        assert_eq!(sync_now(&m.a).state, SyncState::Idle);
+        commit_file(&m.b, MEMORY, "# Acme\n- from B\n");
+        let before = head(&m.b);
+        let stopped = sync_now(&m.b);
+        assert_eq!(
+            stopped.state,
+            SyncState::Conflict {
+                files: vec![MEMORY.into()]
+            }
+        );
+        assert_eq!(stopped.operation, Some(Operation::Rebase));
+        before
+    }
+
+    #[test]
+    fn a_commit_is_pushed() {
+        let m = machines();
+        assert_eq!(head(&m.b), head(&m.a), "B took A's history");
+        assert_eq!(m.remote_head(), head(&m.a));
+        assert_eq!(remote_url(&m.a).as_deref(), Some(m.remote.as_str()));
+
+        commit_file(&m.a, MEMORY, "# Acme\n");
+        let synced = sync_now(&m.a);
+        assert_eq!(synced.state, SyncState::Idle);
+        assert!(synced.last_sync.is_some());
+        assert_eq!(m.remote_head(), head(&m.a));
+        assert_eq!(status(&m.a).unwrap().ahead_behind, Some((0, 0)));
+    }
+
+    #[test]
+    fn a_remote_change_reaches_repo_and_is_summarised_until_dismissed() {
+        let m = machines();
+        commit_file(
+            &m.a,
+            PROJECT_FILE,
+            &format!("{PROJECT}\n[[hooks.setup]]\ncwd = \"api\"\nrun = \"npm ci\"\n"),
+        );
+        commit_file(&m.a, MEMORY, "# Acme\n");
+        sync_now(&m.a);
+
+        let synced = sync_now(&m.b);
+        assert_eq!(synced.state, SyncState::Idle);
+        assert_eq!(head(&m.b), head(&m.a));
+        assert_eq!(read_file(&m.b, MEMORY), "# Acme\n");
+        assert_eq!(synced.incoming.hooks_or_services, ["acme"]);
+        assert_eq!(synced.incoming.guidance, [MEMORY]);
+        let config = crate::config::Config::load_from(m.b.clone()).unwrap();
+        assert!(config.project("acme").is_some());
+
+        commit_file(&m.a, "tworky/claude.local.md", "Be brief.\n");
+        sync_now(&m.a);
+        let again = sync_now(&m.b);
+        assert_eq!(
+            again.incoming.guidance,
+            [MEMORY, "tworky/claude.local.md"],
+            "kept until dismissed"
+        );
+        dismiss_incoming(&m.b).unwrap();
+        assert!(sync_status(&m.b).unwrap().incoming.is_empty());
+    }
+
+    #[test]
+    fn both_sides_with_commits_converge_under_tworkys_identity() {
+        let m = machines();
+        commit_file(&m.a, "tworky/claude.local.md", "From A\n");
+        sync_now(&m.a);
+        commit_file(&m.b, MEMORY, "From B\n");
+
+        assert_eq!(sync_now(&m.b).state, SyncState::Idle);
+        assert_eq!(read_file(&m.b, "tworky/claude.local.md"), "From A\n");
+        assert_eq!(m.remote_head(), head(&m.b));
+        let repo = m.b.repo_dir();
+        let moved = git(
+            &m.b,
+            &repo,
+            &["reflog", "-1", "--format=%gs", "main"],
+            LOCAL_TIMEOUT,
+        )
+        .unwrap();
+        assert!(moved.starts_with("reset: moving to"), "{moved}");
+        let rebased = git(
+            &m.b,
+            &repo,
+            &["log", "-1", "--format=%s|%cn <%ce>", "main"],
+            LOCAL_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(
+            rebased.trim(),
+            format!("Save {MEMORY}|Tworky <tworky@localhost>")
+        );
+
+        assert_eq!(sync_now(&m.a).state, SyncState::Idle);
+        assert_eq!(read_file(&m.a, MEMORY), "From B\n");
+        assert_eq!(head(&m.a), head(&m.b));
+    }
+
+    #[test]
+    fn a_conflict_leaves_repo_alone_until_resolved_in_repo_sync() {
+        let m = machines();
+        let before = conflicted(&m);
+        assert_eq!(head(&m.b), before);
+        assert_eq!(read_file(&m.b, MEMORY), "# Acme\n- from B\n");
+        let config = crate::config::Config::load_from(m.b.clone()).unwrap();
+        assert!(config.load_errors.is_empty(), "{:?}", config.load_errors);
+        assert!(status(&m.b).unwrap().is_clean());
+        assert!(matches!(
+            sync(&m.b, Trigger::Background).unwrap().state,
+            SyncState::Conflict { .. }
+        ));
+
+        finish_rebase(&m.b, MEMORY, "# Acme\n- from A\n- from B\n");
+        assert_eq!(sync_now(&m.b).state, SyncState::Idle);
+        assert_eq!(read_file(&m.b, MEMORY), "# Acme\n- from A\n- from B\n");
+        assert_eq!(m.remote_head(), head(&m.b));
+        assert_eq!(sync_now(&m.a).state, SyncState::Idle);
+        assert_eq!(head(&m.a), head(&m.b));
+    }
+
+    #[test]
+    fn a_commit_made_during_a_conflict_is_replayed_after_resolution() {
+        let m = machines();
+        conflicted(&m);
+        commit_file(&m.b, "tworky/claude.local.md", "B guidance\n");
+
+        finish_rebase(&m.b, MEMORY, "# Acme\n- from A\n- from B\n");
+        let synced = sync_now(&m.b);
+        assert_eq!(synced.state, SyncState::Idle);
+        assert_eq!(read_file(&m.b, "tworky/claude.local.md"), "B guidance\n");
+        assert_eq!(read_file(&m.b, MEMORY), "# Acme\n- from A\n- from B\n");
+        assert_eq!(m.remote_head(), head(&m.b));
+        assert!(status(&m.b).unwrap().is_clean());
+    }
+
+    #[test]
+    fn a_resolution_that_keeps_conflict_markers_is_refused() {
+        let m = machines();
+        let before = conflicted(&m);
+        let marked = std::fs::read_to_string(m.b.repo_sync_dir().join(MEMORY)).unwrap();
+        assert!(marked.contains("<<<<<<< "), "{marked}");
+        finish_rebase(&m.b, MEMORY, &marked);
+
+        let refused = sync_now(&m.b);
+        assert_eq!(
+            refused.state,
+            SyncState::Conflict {
+                files: vec![MEMORY.into()]
+            }
+        );
+        assert_eq!(refused.operation, None);
+        assert_eq!(head(&m.b), before);
+
+        std::fs::write(m.b.repo_sync_dir().join(MEMORY), "# Acme\n- from both\n").unwrap();
+        in_sync_dir(
+            &m.b,
+            &[
+                "-c",
+                "user.name=Resolver",
+                "-c",
+                "user.email=resolver@example.com",
+                "commit",
+                "-q",
+                "-am",
+                "Fix the markers",
+            ],
+        );
+        assert_eq!(sync_now(&m.b).state, SyncState::Idle);
+        assert_eq!(read_file(&m.b, MEMORY), "# Acme\n- from both\n");
+    }
+
+    #[test]
+    fn abort_stops_the_rebase_and_pauses_background_syncs() {
+        let m = machines();
+        let before = conflicted(&m);
+
+        let aborted = abort(&m.b).unwrap();
+        assert!(aborted.paused);
+        assert_eq!(aborted.operation, None);
+        assert_eq!(
+            progress(&m.b, &m.b.repo_sync_dir()).unwrap(),
+            Progress::None
+        );
+        assert_eq!(sync(&m.b, Trigger::Background).unwrap(), aborted);
+        assert_eq!(head(&m.b), before);
+
+        let again = sync_now(&m.b);
+        assert!(!again.paused);
+        assert_eq!(again.operation, Some(Operation::Rebase));
+    }
+
+    #[test]
+    fn a_remote_project_toml_that_does_not_parse_is_held_back() {
+        let m = machines();
+        let broken = "projects/beta/project.toml";
+        write_file(&m.a, broken, "name = [");
+        let a = m.a.repo_dir();
+        for args in [
+            &["add", broken][..],
+            &[
+                "-c",
+                "user.name=A",
+                "-c",
+                "user.email=a@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "Break beta",
+            ],
+            &["push", "-q", "origin", "main"],
+        ] {
+            git(&m.a, &a, args, LOCAL_TIMEOUT).unwrap();
+        }
+        let before = head(&m.b);
+
+        let held = sync_now(&m.b);
+        assert_eq!(
+            held.state,
+            SyncState::HeldBack {
+                files: vec![broken.into()]
+            }
+        );
+        assert_eq!(head(&m.b), before);
+        assert!(!m.b.project_file("beta").exists());
+        assert_eq!(
+            sync(&m.b, Trigger::Background).unwrap().state,
+            held.state,
+            "fetched again, and still broken"
+        );
+
+        std::fs::write(
+            m.b.repo_sync_dir().join(broken),
+            PROJECT.replace("acme", "beta"),
+        )
+        .unwrap();
+        in_sync_dir(
+            &m.b,
+            &[
+                "-c",
+                "user.name=Resolver",
+                "-c",
+                "user.email=resolver@example.com",
+                "commit",
+                "-q",
+                "-am",
+                "Fix beta",
+            ],
+        );
+        assert_eq!(sync_now(&m.b).state, SyncState::Idle);
+        assert!(m.b.project_file("beta").exists());
+        assert_eq!(m.remote_head(), head(&m.b));
+    }
+
+    #[test]
+    fn an_uncommitted_file_in_the_way_of_an_incoming_one_blocks_the_sync() {
+        let m = machines();
+        commit_file(&m.a, PROJECT_FILE, PROJECT);
+        sync_now(&m.a);
+        write_file(&m.b, PROJECT_FILE, "name = [");
+        let before = head(&m.b);
+
+        assert_eq!(
+            sync_now(&m.b).state,
+            SyncState::BlockedByLocal {
+                files: vec![PROJECT_FILE.into()]
+            }
+        );
+        assert_eq!(head(&m.b), before);
+        assert_eq!(read_file(&m.b, PROJECT_FILE), "name = [");
+
+        std::fs::remove_file(m.b.repo_dir().join(PROJECT_FILE)).unwrap();
+        assert_eq!(sync_now(&m.b).state, SyncState::Idle);
+        assert_eq!(read_file(&m.b, PROJECT_FILE), PROJECT);
+    }
+
+    #[test]
+    fn overlapping_syncs_take_turns_on_the_sync_lock() {
+        let m = machines();
+        commit_file(&m.a, MEMORY, "# Acme\n");
+        let spawn_sync = || {
+            let (paths, global) = (m.a.clone(), m.global_config());
+            std::thread::spawn(move || {
+                use_global_config(global);
+                sync(&paths, Trigger::User).unwrap()
+            })
+        };
+
+        let held = with_sync_lock(&m.a).unwrap();
+        let first = spawn_sync();
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(!first.is_finished(), "the sync went ahead without the lock");
+        assert_ne!(m.remote_head(), head(&m.a));
+        drop(held);
+        let second = spawn_sync();
+
+        assert_eq!(first.join().unwrap().state, SyncState::Idle);
+        assert_eq!(second.join().unwrap().state, SyncState::Idle);
+        assert_eq!(m.remote_head(), head(&m.a));
+    }
+
+    #[test]
+    fn a_hung_remote_times_out_without_blocking_commits() {
+        let home = Home::new("");
+        home.init();
+        home.git(&["remote", "add", "origin", "ssh://tworky.invalid/config.git"]);
+        let (paths, global) = (home.paths.clone(), home.dir.path().join("gitconfig"));
+        let started = Instant::now();
+        let syncing = std::thread::spawn(move || {
+            use_global_config(global);
+            SSH_COMMAND.set(Some("sleep 30 #".into()));
+            sync_within(&paths, Trigger::User, Duration::from_secs(2)).unwrap()
+        });
+        while read_record(&home.paths).state != SyncState::Syncing {
+            assert!(started.elapsed() < Duration::from_secs(20), "never synced");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let locking = Instant::now();
+        let guard = with_lock(&home.paths).unwrap();
+        assert!(locking.elapsed() < Duration::from_secs(1));
+        assert!(!syncing.is_finished());
+        let memory = home.write(MEMORY, "# Acme\n");
+        assert!(commit(&guard, &home.paths, &[&memory], "Save acme memory").unwrap());
+        drop(guard);
+
+        match syncing.join().unwrap().state {
+            SyncState::Error { message } => assert!(message.contains("timed out"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn set_remote_refuses_a_repo_with_history_while_the_remote_has_content() {
+        let m = machines();
+        commit_file(&m.a, MEMORY, "# Acme\n");
+        sync_now(&m.a);
+        let c = paths_under(&m.dir.path().join("c"));
+        init(&with_lock(&c).unwrap(), &c).unwrap();
+        commit_file(&c, "tworky/claude.local.md", "Mine\n");
+
+        let e = set_remote(&c, &m.remote).unwrap_err();
+        assert!(e.to_string().contains("commits of its own"), "{e:#}");
+        assert_eq!(remote_url(&c), None);
+        assert!(
+            git(
+                &c,
+                &c.repo_dir(),
+                &["config", "branch.main.remote"],
+                LOCAL_TIMEOUT
+            )
+            .is_err()
+        );
+        assert_eq!(sync_status(&c).unwrap().state, SyncState::NoRemote);
+
+        let e = set_remote(&m.a, &m.remote).unwrap_err();
+        assert!(e.to_string().contains("already syncs"), "{e:#}");
+    }
+
+    #[test]
+    fn a_debug_build_refuses_the_release_remote_name() {
+        let home = Home::new("");
+        home.init();
+        for url in [
+            "https://github.com/me/tworky-config.git",
+            "git@github.com:me/Tworky-Config",
+            "https://github.com/me/tworky-config/",
+        ] {
+            let e = set_remote(&home.paths, url).unwrap_err();
+            assert!(e.to_string().contains("debug build"), "{url}: {e:#}");
+        }
+        assert_eq!(remote_url(&home.paths), None);
+        assert_eq!(
+            remote_repo_name("git@github.com:me/tworky-config-dev.git"),
+            "tworky-config-dev"
+        );
+    }
+
+    #[test]
+    fn removing_the_remote_stops_syncing() {
+        let m = machines();
+        conflicted(&m);
+        let removed = remove_remote(&m.b).unwrap();
+        assert_eq!(removed.state, SyncState::NoRemote);
+        assert_eq!(remote_url(&m.b), None);
+        assert_eq!(
+            progress(&m.b, &m.b.repo_sync_dir()).unwrap(),
+            Progress::None
+        );
+        assert_eq!(sync_now(&m.b).state, SyncState::NoRemote);
+        assert!(remove_remote(&m.b).is_err());
     }
 
     /// The other process in `writers_in_two_processes_take_turns_on_the_lock`; does nothing in a
