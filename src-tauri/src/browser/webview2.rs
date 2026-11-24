@@ -120,9 +120,8 @@ impl Cdp for TabCdp {
     }
 }
 
-/// Sends the tab's metrics override for its viewport and frame as they are now. Every override
-/// is posted from the main thread, here, so they reach the page in the order the viewport and
-/// frame changed.
+/// Every override is posted from the main thread so they reach the page in the order the
+/// viewport and frame changed.
 fn post_metrics(app: &AppHandle, id: u64, on_done: impl FnOnce(Result<Value, String>) + 'static) {
     let Ok(tab) = app.state::<super::Browser>().tab(id) else {
         on_done(Err(format!("tab {id} is closed")));
@@ -505,7 +504,6 @@ async fn clear(app: &AppHandle, profile: &str, delete: bool) -> Result<(), Strin
     .await
 }
 
-/// A fixed viewport is scaled to fit the tab's frame, so a resize re-sends its metrics.
 pub async fn set_bounds(app: &AppHandle, id: u64, bounds: Bounds) -> Result<(), String> {
     on_main(app, move |app| {
         let rescale = app.state::<super::Browser>().tab(id).is_ok_and(|tab| {

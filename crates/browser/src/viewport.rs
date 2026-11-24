@@ -7,7 +7,6 @@ use crate::cdp::{Calls, Cdp, call_all};
 
 pub const MIN_SIZE: u32 = 200;
 pub const MAX_SIZE: u32 = 3840;
-/// The frame assumed for a tab that has not been shown yet.
 pub const DEFAULT_FRAME: Frame = Frame {
     width: 1280.0,
     height: 800.0,
@@ -57,7 +56,6 @@ pub enum Viewport {
 }
 
 impl Viewport {
-    /// A fixed viewport, refused when a side is outside `MIN_SIZE..=MAX_SIZE`.
     pub fn fixed(width: u32, height: u32, mobile: bool) -> Result<Viewport, String> {
         let viewport = Viewport::Fixed {
             width,
@@ -100,8 +98,6 @@ impl Viewport {
     }
 }
 
-/// How much a fixed viewport is shrunk to fit `frame`. Never enlarged. A side of the frame that
-/// isn't a positive size doesn't constrain it.
 pub fn scale_for(viewport: &Viewport, frame: Frame) -> f64 {
     let fit = |frame: f64, size: u32| {
         if frame > 0.0 {
@@ -166,8 +162,7 @@ fn mobile_on() -> Calls {
     ]
 }
 
-/// Turns touch and the phone user agent on for a mobile viewport, or off when leaving one.
-/// Turning them off never fails: what didn't work comes back as notes.
+/// Turning emulation off never fails; what didn't take comes back as notes.
 pub async fn emulate_mobile(
     cdp: &impl Cdp,
     mobile: bool,
@@ -206,9 +201,8 @@ pub async fn emulate_mobile(
     Ok(notes)
 }
 
-/// Sends `viewport`'s metrics through `metrics`, then matches touch and the user agent to it.
 /// A page must have the phone user agent before its first navigation, or it loads with the
-/// desktop one. The host sends the metrics, because it orders them with the resizes of the tab.
+/// desktop one. The host sends `metrics` so it can order them with the tab's resizes.
 pub async fn apply(
     cdp: &impl Cdp,
     viewport: &Viewport,
@@ -219,22 +213,17 @@ pub async fn apply(
     emulate_mobile(cdp, viewport.mobile(), was_mobile).await
 }
 
-/// The tab whose viewport `change` sets.
 pub trait ViewportTab: Send + Sync {
     /// Stores `viewport` as the tab's and returns the one it replaces.
     fn store(&self, viewport: Viewport) -> Viewport;
-    /// Sends the stored viewport's metrics override to the page.
     fn apply_metrics(&self) -> impl Future<Output = Result<(), String>> + Send;
     /// Reloads the page, if one is loaded.
     fn reload(&self) -> impl Future<Output = Result<(), String>> + Send;
-    /// Tells the tab's viewers the stored viewport changed.
     fn changed(&self);
 }
 
-/// Sets the tab's viewport. A change into or out of mobile emulation reloads the page, so its
-/// user agent applies. On failure the old viewport is stored and re-sent, along with its touch
-/// and user agent, so the page converges on what the tab says it has. Returns what couldn't be
-/// undone when leaving mobile.
+/// Entering or leaving mobile reloads the page so its user agent applies. On failure the old
+/// viewport, touch and user agent are restored; returns what couldn't be undone leaving mobile.
 pub async fn change(
     tab: &impl ViewportTab,
     cdp: &impl Cdp,

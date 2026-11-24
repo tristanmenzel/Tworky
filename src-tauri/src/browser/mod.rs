@@ -1059,7 +1059,6 @@ impl viewport::ViewportTab for ViewportOf<'_> {
     }
 }
 
-/// Sets the tab's viewport, shared by the user and Claude (see `viewport::change`).
 pub async fn set_viewport(app: &AppHandle, tab: &Tab, new: Viewport) -> CmdResult<Vec<String>> {
     new.check()?;
     let _emulating = tab.emulation.lock().await;

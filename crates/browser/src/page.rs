@@ -183,7 +183,6 @@ fn merge(mut into: Value, from: Value) -> Value {
 }
 
 impl<C: Cdp> Page<'_, C> {
-    /// `{ url, title, viewport }`, plus `still_loading` when a wait gave up.
     pub async fn state(&self, still_loading: bool) -> Value {
         let title = evaluate(self.cdp, "document.title")
             .await
@@ -480,7 +479,6 @@ impl<C: Cdp> Page<'_, C> {
         Ok((caption, text))
     }
 
-    /// A base64 PNG at CSS pixel scale, on HiDPI displays and mobile pages too.
     pub async fn screenshot(&self, full_page: bool) -> Result<(Value, String), String> {
         let png = cdp::screenshot(self.cdp, full_page).await?;
         Ok((self.state(false).await, png))
