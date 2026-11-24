@@ -1499,6 +1499,7 @@ fn main() {
             browser::browser_retry,
             browser::browser_history,
             browser::browser_bounds,
+            browser::browser_set_viewport,
             browser::browser_show,
             browser::browser_close,
             browser::browser_sign_in,
@@ -1509,6 +1510,7 @@ fn main() {
         .expect("building tauri app")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                browser::save_tabs_now(app);
                 let sessions = &app.state::<AppState>().sessions;
                 let live = sessions.live();
                 if !live.is_empty()

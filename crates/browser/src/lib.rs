@@ -2,10 +2,10 @@
 
 pub mod cdp;
 pub mod cookies;
-pub mod device;
 pub mod diagnostics;
 pub mod interact;
 pub mod login;
 pub mod page;
 pub mod snapshot;
 pub mod urls;
+pub mod viewport;

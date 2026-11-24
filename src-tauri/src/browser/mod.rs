@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tworky_browser::cookies;
 use tworky_browser::login::{self, Account, LoginField};
 use tworky_browser::page::{Page, PageEvents};
+use tworky_browser::viewport::{self, Frame, Viewport};
 use tworky_core::config::AccountConfig;
 use tworky_core::services::Outcome;
 use tworky_core::state::WorkerRecord;
@@ -44,6 +45,13 @@ pub struct Tab {
     pub status: Mutex<Option<String>>,
     /// Set instead of loading a page whose service isn't running, until the user starts it.
     pub paused: Mutex<Option<Paused>>,
+    pub viewport: Mutex<Viewport>,
+    /// The tab's box in the window, from the last `set_bounds`; `None` until it is shown.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub frame: Mutex<Option<Frame>>,
+    /// Held while touch and the user agent are matched to the viewport, so a mobile flip's
+    /// calls aren't interleaved with another's.
+    emulation: tokio::sync::Mutex<()>,
 }
 
 impl Tab {
@@ -55,12 +63,8 @@ impl Tab {
         self.account.read().unwrap().is_none()
     }
 
-    pub fn mobile(&self) -> bool {
-        self.account
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|a| a.mobile)
+    pub fn viewport(&self) -> Viewport {
+        *self.viewport.lock().unwrap()
     }
 }
 
@@ -78,6 +82,7 @@ pub struct Browser {
     saved: Mutex<Saved>,
     /// Until the saved tabs are reopened, the tab list on disk is theirs and isn't overwritten.
     restored: AtomicBool,
+    save_pending: AtomicBool,
     resetting: Resetting,
 }
 
@@ -138,7 +143,7 @@ pub struct TabView {
     account: Option<String>,
     username: Option<String>,
     color: Option<String>,
-    mobile: bool,
+    viewport: Viewport,
     url: String,
     loading: bool,
     /// A login form for this account is on the page.
@@ -312,6 +317,7 @@ fn saved_tabs(tabs: &[Arc<Tab>]) -> Vec<SavedTab> {
                 id: t.id,
                 worker: t.worker.clone(),
                 account: t.account.read().unwrap().as_ref()?.name.clone(),
+                viewport: Some(t.viewport()),
                 url: t
                     .paused
                     .lock()
@@ -347,7 +353,7 @@ fn view(tab: &Tab) -> TabView {
         id: tab.id,
         worker: tab.worker.clone(),
         project: tab.project.clone(),
-        mobile: account.as_ref().is_some_and(|a| a.mobile),
+        viewport: tab.viewport(),
         username: account.as_ref().map(|a| a.username.clone()),
         account: account.map(|a| a.name),
         color: tab.color.clone(),
@@ -366,17 +372,33 @@ fn has_password(tab: &Tab, account: &Account) -> bool {
     tworky_core::accounts::has_password(&tab.project, &account.name)
 }
 
+/// Same-document navigations can call this per keystroke, so the tab save is coalesced.
 pub fn changed(app: &AppHandle) {
     let browser = app.state::<Browser>();
-    browser.save_tabs();
+    if !browser.save_pending.swap(true, Ordering::AcqRel) {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(SAVE_DELAY).await;
+            let browser = app.state::<Browser>();
+            browser.save_pending.store(false, Ordering::Release);
+            browser.save_tabs();
+        });
+    }
     let _ = app.emit("browser-tabs-changed", browser.views());
+}
+
+const SAVE_DELAY: Duration = Duration::from_millis(500);
+
+/// Writes the tabs a pending save would, for when the app exits before it runs.
+pub fn save_tabs_now(app: &AppHandle) {
+    app.state::<Browser>().save_tabs();
 }
 
 fn page<'a>(cdp: &'a host::TabCdp, tab: &'a Tab) -> Page<'a, host::TabCdp> {
     Page {
         cdp,
         events: &tab.events,
-        mobile: tab.mobile(),
+        viewport: tab.viewport(),
     }
 }
 
@@ -471,9 +493,23 @@ pub fn check_open(account: Option<&str>, url: Option<&str>) -> CmdResult<()> {
 }
 
 /// Opens a tab for one of the worker's accounts, or an anonymous one on a profile of its own
-/// when `account` is `None`, prepared (login detector, mobile emulation) but not yet navigated.
-pub async fn open_tab(app: &AppHandle, worker: &str, account: Option<&str>) -> CmdResult<Arc<Tab>> {
-    open_tab_as(app, worker, account, None, None).await
+/// when `account` is `None`, prepared (login detector, viewport) but not yet navigated. Without
+/// a `viewport` it takes the account's default.
+pub async fn open_tab(
+    app: &AppHandle,
+    worker: &str,
+    account: Option<&str>,
+    viewport: Option<Viewport>,
+) -> CmdResult<Arc<Tab>> {
+    open_tab_as(app, worker, account, None, None, viewport).await
+}
+
+fn default_viewport(account: Option<&Account>) -> Viewport {
+    if account.is_some_and(|a| a.mobile) {
+        viewport::PHONE
+    } else {
+        Viewport::Fit
+    }
 }
 
 async fn open_tab_as(
@@ -482,7 +518,11 @@ async fn open_tab_as(
     account: Option<&str>,
     id: Option<u64>,
     profile: Option<String>,
+    viewport: Option<Viewport>,
 ) -> CmdResult<Arc<Tab>> {
+    if let Some(viewport) = &viewport {
+        viewport.check()?;
+    }
     let (project, found) = {
         let worker = worker.to_string();
         let wanted = account.map(str::to_string);
@@ -504,6 +544,7 @@ async fn open_tab_as(
         .map_err(|e| e.to_string())??
     };
     let (account, color) = found.unzip();
+    let viewport = viewport.unwrap_or_else(|| default_viewport(account.as_ref()));
     let browser = app.state::<Browser>();
     let id = id.unwrap_or_else(|| browser.next_id.fetch_add(1, Ordering::Relaxed) + 1);
     let anonymous = account.is_none();
@@ -521,6 +562,9 @@ async fn open_tab_as(
         events: Arc::new(PageEvents::default()),
         status: Mutex::new(None),
         paused: Mutex::new(None),
+        viewport: Mutex::new(viewport),
+        frame: Mutex::new(None),
+        emulation: tokio::sync::Mutex::new(()),
     })?;
     browser.update_saved(|s| {
         s.next_id = s.next_id.max(id);
@@ -534,7 +578,12 @@ async fn open_tab_as(
     });
     let created = host::create(app, &tab, &profile).await;
     let prepared = match created {
-        Ok(()) => page(&host::TabCdp::new(app, tab.id), &tab).prepare().await,
+        Ok(()) => {
+            let _emulating = tab.emulation.lock().await;
+            page(&host::TabCdp::new(app, tab.id), &tab)
+                .prepare(host::apply_metrics(app, tab.id))
+                .await
+        }
         Err(e) => Err(e),
     };
     if let Err(e) = prepared {
@@ -613,6 +662,7 @@ pub async fn restore(app: AppHandle) {
             Some(&saved.account),
             Some(saved.id),
             None,
+            saved.viewport,
         )
         .await
         {
@@ -895,6 +945,7 @@ fn open_popup(app: &AppHandle, opener: u64, url: String) {
             account.as_deref(),
             None,
             Some(from.profile.clone()),
+            None,
         )
         .await
         {
@@ -921,7 +972,7 @@ pub async fn browser_open(
     url: Option<String>,
 ) -> CmdResult<u64> {
     check_open(account.as_deref(), url.as_deref())?;
-    let tab = open_tab(&app, &worker, account.as_deref()).await?;
+    let tab = open_tab(&app, &worker, account.as_deref(), None).await?;
     let id = tab.id;
     tauri::async_runtime::spawn(async move {
         let target = target_url(&tab, url);
@@ -980,6 +1031,59 @@ pub async fn browser_history(app: AppHandle, tab: u64, action: String) -> CmdRes
 #[tauri::command]
 pub async fn browser_bounds(app: AppHandle, tab: u64, bounds: Bounds) -> CmdResult<()> {
     host::set_bounds(&app, tab, bounds).await
+}
+
+struct ViewportOf<'a> {
+    app: &'a AppHandle,
+    tab: &'a Tab,
+    cdp: &'a host::TabCdp,
+}
+
+impl viewport::ViewportTab for ViewportOf<'_> {
+    fn store(&self, viewport: Viewport) -> Viewport {
+        std::mem::replace(&mut *self.tab.viewport.lock().unwrap(), viewport)
+    }
+
+    async fn apply_metrics(&self) -> Result<(), String> {
+        host::apply_metrics(self.app, self.tab.id).await
+    }
+
+    async fn reload(&self) -> Result<(), String> {
+        if paused_url(self.tab).is_some() {
+            return Ok(());
+        }
+        page(self.cdp, self.tab).reload().await.map(drop)
+    }
+
+    fn changed(&self) {
+        changed(self.app);
+    }
+}
+
+pub async fn set_viewport(app: &AppHandle, tab: &Tab, new: Viewport) -> CmdResult<Vec<String>> {
+    new.check()?;
+    let _emulating = tab.emulation.lock().await;
+    let cdp = host::TabCdp::new(app, tab.id);
+    viewport::change(
+        &ViewportOf {
+            app,
+            tab,
+            cdp: &cdp,
+        },
+        &cdp,
+        new,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn browser_set_viewport(
+    app: AppHandle,
+    tab: u64,
+    viewport: Viewport,
+) -> CmdResult<Vec<String>> {
+    let tab = app.state::<Browser>().tab(tab)?;
+    set_viewport(&app, &tab, viewport).await
 }
 
 /// Raises `tab` above the UI, or lowers every tab when none is shown. `load` names the UI load,
@@ -1239,6 +1343,9 @@ mod tests {
             events: Arc::new(events),
             status: Mutex::new(None),
             paused: Mutex::new(None),
+            viewport: Mutex::new(viewport::TABLET),
+            frame: Mutex::new(None),
+            emulation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1393,6 +1500,7 @@ mod tests {
                 worker: "w".into(),
                 account: "Tester 1".into(),
                 url: "http://localhost:5273/clients".into(),
+                viewport: Some(viewport::TABLET),
             }]
         );
     }

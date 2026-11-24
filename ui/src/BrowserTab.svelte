@@ -1,7 +1,9 @@
 <script lang="ts">
-  import { api, type BrowserTabView } from './api'
+  import { flushSync } from 'svelte'
+  import { api, type BrowserTabView, type Viewport } from './api'
   import { confirmOverBrowser } from './overlay.svelte'
   import PasswordDialog from './PasswordDialog.svelte'
+  import ViewportPicker from './ViewportPicker.svelte'
 
   interface Props {
     tab: BrowserTabView
@@ -11,16 +13,33 @@
 
   let { tab, visible, onError }: Props = $props()
 
+  const FRAME_PADDING = 16
+
+  let body: HTMLDivElement
   let host: HTMLDivElement
+  let bodyWidth = $state(0)
+  let bodyHeight = $state(0)
   let address: HTMLInputElement
   let url = $state('')
+  let editing = $state(false)
   let busy = $state(false)
   let settingPassword = $state(false)
 
   const needsPassword = $derived(tab.can_sign_in && tab.login_fields.includes('password') && !tab.has_password)
+  const fixedWidth = $derived(tab.viewport.kind === 'fixed' ? tab.viewport.width : 0)
+  const fixedHeight = $derived(tab.viewport.kind === 'fixed' ? tab.viewport.height : 0)
+  const scale = $derived(
+    fixedWidth && bodyWidth
+      ? Math.max(
+          0,
+          Math.min(1, (bodyWidth - 2 * FRAME_PADDING) / fixedWidth, (bodyHeight - 2 * FRAME_PADDING) / fixedHeight),
+        )
+      : 1,
+  )
 
   $effect(() => {
-    if (document.activeElement !== address) url = tab.url
+    const current = tab.url
+    if (!editing) url = current
   })
 
   async function call(work: () => Promise<unknown>) {
@@ -32,24 +51,52 @@
   }
 
   function syncBounds() {
-    if (!visible || host.clientWidth === 0) return
+    if (!visible) return
+    if (fixedWidth) {
+      const width = body.clientWidth
+      const height = body.clientHeight
+      if (width === 0) return
+      if (width !== bodyWidth || height !== bodyHeight) {
+        flushSync(() => {
+          bodyWidth = width
+          bodyHeight = height
+        })
+      }
+    }
+    if (host.clientWidth === 0) return
     const r = host.getBoundingClientRect()
     void call(() => api.browserBounds(tab.id, { x: r.left, y: r.top, width: r.width, height: r.height }))
   }
 
   $effect(() => {
+    void [fixedWidth, fixedHeight, scale]
     if (visible) requestAnimationFrame(syncBounds)
   })
 
   $effect(() => {
     const observer = new ResizeObserver(syncBounds)
     observer.observe(host)
+    const bodyObserver = new ResizeObserver(() => {
+      if (body.clientWidth === 0) return
+      bodyWidth = body.clientWidth
+      bodyHeight = body.clientHeight
+      requestAnimationFrame(syncBounds)
+    })
+    bodyObserver.observe(body)
     window.addEventListener('resize', syncBounds)
     return () => {
       observer.disconnect()
+      bodyObserver.disconnect()
       window.removeEventListener('resize', syncBounds)
     }
   })
+
+  async function setViewport(viewport: Viewport) {
+    await call(async () => {
+      const notes = await api.browserSetViewport(tab.id, viewport)
+      if (notes.length) onError(notes.join('\n'))
+    })
+  }
 
   async function signIn() {
     busy = true
@@ -144,12 +191,18 @@
       autocomplete="off"
       onkeydown={(e) => {
         if (e.key === 'Enter') {
+          const target = url
           address.blur()
-          void call(() => api.browserNavigate(tab.id, url))
+          void call(() => api.browserNavigate(tab.id, target))
         }
       }}
-      onblur={() => (url = tab.url)}
+      onfocus={() => (editing = true)}
+      onblur={() => {
+        editing = false
+        url = tab.url
+      }}
     />
+    <ViewportPicker viewport={tab.viewport} {scale} onSelect={setViewport} />
     {#if tab.can_fill_email}
       <button class="chip" disabled={busy} title="Fill the username and remember this login page" onclick={fillEmail}>
         Fill {tab.username}
@@ -182,8 +235,13 @@
   {#if tab.status}
     <pre class="status" class:starting={tab.status.endsWith('…')}>{tab.status}</pre>
   {/if}
-  <div class="body" class:mobile={tab.mobile}>
-    <div class="host" bind:this={host}></div>
+  <div class="body" class:fixed={fixedWidth > 0} bind:this={body}>
+    <div
+      class="host"
+      bind:this={host}
+      style:width={fixedWidth ? `${fixedWidth * scale}px` : null}
+      style:height={fixedWidth ? `${fixedHeight * scale}px` : null}
+    ></div>
     {#if tab.paused}
       <div class="paused">
         <p><strong>{tab.paused.service}</strong> isn't running, so nothing is listening on port {tab.paused.port}.</p>
@@ -324,17 +382,14 @@
     flex: 1;
     min-width: 0;
   }
-  .body.mobile {
+  .body.fixed {
     justify-content: center;
     align-items: center;
     padding: 16px;
     background: var(--panel-2);
   }
-  .body.mobile .host {
+  .body.fixed .host {
     flex: none;
-    height: min(852px, 100%);
-    aspect-ratio: 393 / 852;
-    max-width: 100%;
     border-radius: 12px;
     box-shadow: 0 0 0 8px var(--term-bg);
   }
