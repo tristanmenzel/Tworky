@@ -1097,6 +1097,7 @@ fn watch_activity(app: AppHandle) {
     let Ok(paths) = Paths::resolve() else { return };
     let mut memory_changes = memory_change_names(&paths);
     let mut memory_files = memory_file_stamps(&paths);
+    let mut issues_changed = issues_changed_stamp(&paths);
     let mut freshness = freshness::Freshness::default();
     let mut live_before = HashMap::new();
     loop {
@@ -1107,6 +1108,13 @@ fn watch_activity(app: AppHandle) {
             memory_changes = names;
             memory_files = stamps;
             let _ = app.emit("memory-changes", ());
+        }
+        let stamp = issues_changed_stamp(&paths);
+        if stamp != issues_changed {
+            issues_changed = stamp;
+            if issues_changed.is_some() {
+                let _ = app.emit("issues-changed", ());
+            }
         }
         let state = app.state::<AppState>();
         // Liveness first: a launch between the two reads would otherwise pair its new generation
@@ -1215,6 +1223,10 @@ fn memory_file_stamps(paths: &Paths) -> BTreeMap<String, (Option<std::time::Syst
         }
     }
     stamps
+}
+
+fn issues_changed_stamp(paths: &Paths) -> Option<String> {
+    std::fs::read_to_string(paths.issues_changed_marker()).ok()
 }
 
 #[tauri::command]

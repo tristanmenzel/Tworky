@@ -142,6 +142,26 @@ impl Paths {
     pub fn state_db(&self) -> PathBuf {
         self.data_dir.join("state.db")
     }
+
+    pub fn issues_changed_marker(&self) -> PathBuf {
+        self.data_dir.join("issues-changed")
+    }
+}
+
+/// Tells the app that `tw` changed issues on GitHub, so it reloads them without waiting for its
+/// next poll. The content changes on every call because a write within the filesystem's mtime
+/// resolution would otherwise look unchanged.
+pub fn notify_issues_changed(paths: &Paths) -> Result<()> {
+    let marker = paths.issues_changed_marker();
+    if let Some(dir) = marker.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::fs::write(&marker, stamp.to_string())
+        .with_context(|| format!("writing {}", marker.display()))
 }
 
 /// A repo for a project made from the Repositories picker.
@@ -828,6 +848,21 @@ mod tests {
             config_dir: dir.join("config"),
             data_dir: dir.join("data"),
         }
+    }
+
+    #[test]
+    fn notify_issues_changed_creates_the_marker_and_changes_it_each_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        notify_issues_changed(&p).unwrap();
+        let first = std::fs::read_to_string(p.issues_changed_marker()).unwrap();
+        notify_issues_changed(&p).unwrap();
+        let second = std::fs::read_to_string(p.issues_changed_marker()).unwrap();
+        assert_eq!(
+            p.issues_changed_marker(),
+            dir.path().join("data/issues-changed")
+        );
+        assert_ne!(first, second);
     }
 
     #[test]

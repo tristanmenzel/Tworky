@@ -105,6 +105,11 @@
   let refreshKey = $state(0)
   let issuesRefreshedAt = Date.now()
   let issuesRefreshed = $state(0)
+  let issuesRequest = 0
+  let issuesApplied = 0
+  let issuesRunning: Promise<void> | null = null
+  let issuesQueued: Promise<void> | null = null
+  let queuedRefresh = false
   let paneWidths = $state<Record<string, number>>({})
   const liveSessionCount = $derived(workers.filter((w) => w.session_alive && !exited[w.id]).length)
   let logs = $state<Record<string, string[]>>({})
@@ -291,20 +296,51 @@
     if (!document.hidden && stagesPending) runPendingStagesLoad()
   }
 
-  async function loadIssues(refresh: boolean) {
-    stagesPending = false
-    loadWorkerStages()
+  function loadIssues(refresh: boolean, withStages = true): Promise<void> {
+    if (withStages) {
+      stagesPending = false
+      loadWorkerStages()
+    }
+    if (!issuesRunning) return startIssuesLoad(refresh)
+    queuedRefresh ||= refresh
+    issuesQueued ??= issuesRunning.then(() => {
+      const queued = queuedRefresh
+      issuesQueued = null
+      queuedRefresh = false
+      return startIssuesLoad(queued)
+    })
+    return issuesQueued
+  }
+
+  function startIssuesLoad(refresh: boolean): Promise<void> {
+    const run = fetchIssues(refresh).finally(() => {
+      if (issuesRunning === run) issuesRunning = null
+    })
+    issuesRunning = run
+    return run
+  }
+
+  async function fetchIssues(refresh: boolean) {
+    const request = ++issuesRequest
     loading = true
     if (refresh) issuesRefreshedAt = Date.now()
     try {
-      payload = await api.issues(refresh)
+      const loaded = await api.issues(refresh)
+      if (request <= issuesApplied) return
+      issuesApplied = request
+      payload = loaded
       if (refresh) issuesRefreshed++
-      if (payload.config_error) showError(`Config: ${payload.config_error}`)
+      if (loaded.config_error) showError(`Config: ${loaded.config_error}`)
     } catch (e) {
       showError(String(e))
     } finally {
-      loading = false
+      if (request === issuesRequest && !issuesQueued) loading = false
     }
+  }
+
+  function onIssuesChanged() {
+    if (document.hidden) issuesRefreshedAt = 0
+    else loadIssues(true, false)
   }
 
   function refreshIssuesIfDue() {
@@ -768,6 +804,7 @@
         browserTabs = e.payload
       }),
       listen('memory-changes', loadMemoryChanges),
+      listen('issues-changed', onIssuesChanged),
     ]
     return () => {
       clearInterval(timer)
