@@ -717,7 +717,7 @@ impl TworkyMcp {
         let result = async {
             let worker = self.worker(&ctx)?;
             super::check_open(args.account.as_deref(), args.url.as_deref())?;
-            let tab = super::open_tab(&self.app, &worker, args.account.as_deref()).await?;
+            let tab = super::open_tab(&self.app, &worker, args.account.as_deref(), None).await?;
             let cdp = host::TabCdp::new(&self.app, tab.id);
             let target = super::target_url(&tab, args.url);
             let (services, service_error) =

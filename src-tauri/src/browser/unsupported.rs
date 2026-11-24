@@ -28,6 +28,10 @@ pub async fn create(_: &AppHandle, _: &Arc<Tab>, _: &str) -> Result<(), String> 
 
 pub async fn destroy(_: &AppHandle, _: u64) {}
 
+pub async fn apply_metrics(_: &AppHandle, _: u64) -> Result<(), String> {
+    Err(UNSUPPORTED.into())
+}
+
 pub async fn set_bounds(_: &AppHandle, _: u64, _: Bounds) -> Result<(), String> {
     Ok(())
 }

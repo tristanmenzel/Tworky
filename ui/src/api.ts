@@ -363,6 +363,7 @@ export interface BrowserTabView {
   /** The account's username (its email, for a profile made with Create). */
   username: string | null
   color: string | null
+  viewport: { kind: 'fit' } | { kind: 'fixed'; width: number; height: number; mobile: boolean }
   mobile: boolean
   url: string
   loading: boolean

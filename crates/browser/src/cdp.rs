@@ -86,12 +86,26 @@ fn clip(
     }))
 }
 
-/// A base64 PNG of the viewport, or of the whole page.
-pub async fn screenshot(cdp: &impl Cdp, full_page: bool, scale: f64) -> Result<String, String> {
+/// Device pixels per CSS pixel, from the layout metrics rather than the page's
+/// `window.devicePixelRatio`, which page script can redefine.
+fn device_pixel_ratio(metrics: &Value) -> Option<f64> {
+    let device = metrics["visualViewport"]["clientWidth"].as_f64()?;
+    let css = metrics["cssVisualViewport"]["clientWidth"].as_f64()?;
+    Some(device / css).filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+}
+
+/// A base64 PNG of the viewport, or of the whole page, in CSS pixels.
+pub async fn screenshot(cdp: &impl Cdp, full_page: bool) -> Result<String, String> {
+    let metrics = cdp.call("Page.getLayoutMetrics", json!({})).await;
+    let scale = metrics
+        .as_ref()
+        .ok()
+        .and_then(device_pixel_ratio)
+        .map_or(1.0, |ratio| 1.0 / ratio);
     let params = if !full_page && scale == 1.0 {
         json!({ "format": "png" })
     } else {
-        let metrics = cdp.call("Page.getLayoutMetrics", json!({})).await?;
+        let metrics = metrics?;
         if full_page {
             let size = metrics
                 .get("cssContentSize")
@@ -186,26 +200,79 @@ mod tests {
     use super::fake::FakeCdp;
     use super::*;
 
-    #[tokio::test]
-    async fn viewport_screenshots_skip_layout_metrics() {
-        let cdp = FakeCdp::answering(|_, _| Ok(json!({ "data": "png" })));
-        assert_eq!(screenshot(&cdp, false, 1.0).await.unwrap(), "png");
-        assert_eq!(cdp.methods(), ["Page.captureScreenshot"]);
+    fn metrics(device_width: f64) -> Value {
+        json!({
+            "visualViewport": { "clientWidth": device_width, "clientHeight": 2556 },
+            "cssVisualViewport": {
+                "pageX": 0, "pageY": 120, "clientWidth": 393, "clientHeight": 852 },
+            "cssContentSize": { "width": 393, "height": 3000 },
+        })
+    }
+
+    fn answering_metrics(device_width: f64) -> FakeCdp {
+        FakeCdp::answering(move |method, _| {
+            Ok(match method {
+                "Page.getLayoutMetrics" => metrics(device_width),
+                _ => json!({ "data": "png" }),
+            })
+        })
     }
 
     #[tokio::test]
-    async fn scaled_screenshots_clip_the_visual_viewport() {
-        let cdp = FakeCdp::answering(|method, _| {
+    async fn screenshots_at_one_device_pixel_per_css_pixel_are_not_clipped() {
+        let cdp = answering_metrics(393.0);
+        assert_eq!(screenshot(&cdp, false).await.unwrap(), "png");
+        assert_eq!(
+            cdp.params("Page.captureScreenshot"),
+            [json!({ "format": "png" })]
+        );
+    }
+
+    #[tokio::test]
+    async fn screenshots_are_scaled_to_css_pixels_from_the_layout_metrics() {
+        let cdp = answering_metrics(1179.0);
+        screenshot(&cdp, false).await.unwrap();
+        assert!(!cdp.methods().contains(&"Runtime.evaluate".to_string()));
+        let clip = &cdp.params("Page.captureScreenshot")[0]["clip"];
+        assert_eq!(clip["scale"], 1.0 / 3.0);
+        assert_eq!(clip["y"], 120.0);
+        assert_eq!(clip["width"], 393.0);
+    }
+
+    #[tokio::test]
+    async fn full_page_screenshots_are_scaled_too() {
+        let cdp = answering_metrics(589.5);
+        screenshot(&cdp, true).await.unwrap();
+        let params = &cdp.params("Page.captureScreenshot")[0];
+        assert_eq!(params["captureBeyondViewport"], true);
+        assert_eq!(params["clip"]["scale"], 1.0 / 1.5);
+        assert_eq!(params["clip"]["height"], 3000.0);
+    }
+
+    #[tokio::test]
+    async fn screenshots_assume_a_ratio_of_one_without_layout_metrics() {
+        let cdp = FakeCdp::answering(|method, _| match method {
+            "Page.getLayoutMetrics" => Err("no".into()),
+            _ => Ok(json!({ "data": "png" })),
+        });
+        screenshot(&cdp, false).await.unwrap();
+        assert_eq!(
+            cdp.params("Page.captureScreenshot"),
+            [json!({ "format": "png" })]
+        );
+
+        let partial = FakeCdp::answering(|method, _| {
             Ok(match method {
                 "Page.getLayoutMetrics" => json!({ "cssVisualViewport": {
-                    "pageX": 0, "pageY": 120, "clientWidth": 393, "clientHeight": 852 } }),
+                    "pageX": 0, "pageY": 0, "clientWidth": 1440, "clientHeight": 900 } }),
                 _ => json!({ "data": "png" }),
             })
         });
-        screenshot(&cdp, false, 1.0 / 3.0).await.unwrap();
-        let clip = &cdp.params("Page.captureScreenshot")[0]["clip"];
-        assert_eq!(clip["y"], 120.0);
-        assert_eq!(clip["width"], 393.0);
+        screenshot(&partial, false).await.unwrap();
+        assert_eq!(
+            partial.params("Page.captureScreenshot"),
+            [json!({ "format": "png" })]
+        );
     }
 
     #[tokio::test]

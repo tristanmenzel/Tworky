@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use tworky_browser::cookies::CookieKey;
 use tworky_browser::urls::is_oauth_url;
+use tworky_browser::viewport::Viewport;
 
 /// What the browser keeps across restarts: the open tabs, and each profile's worker, so cleanup
 /// can delete it, with the cookies kept alive for it.
@@ -24,6 +26,17 @@ pub struct SavedTab {
     pub worker: String,
     pub account: String,
     pub url: String,
+    /// A file that fails to parse loses every profile, so a viewport that can't be read is
+    /// dropped on its own.
+    #[serde(default, deserialize_with = "lenient_viewport")]
+    pub viewport: Option<Viewport>,
+}
+
+fn lenient_viewport<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Viewport>, D::Error> {
+    Ok(Value::deserialize(d)
+        .ok()
+        .and_then(|value| serde_json::from_value::<Viewport>(value).ok())
+        .filter(|viewport| viewport.check().is_ok()))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,6 +96,7 @@ mod tests {
             worker: "w".into(),
             account: "Tester 1".into(),
             url: "http://localhost:5273/clients".into(),
+            viewport: Some(tworky_browser::viewport::DESKTOP),
         });
         saved.profiles.insert(
             "tw-w-Tester_1".into(),
@@ -124,6 +138,58 @@ mod tests {
         let saved = load(&file);
         assert_eq!(saved.next_id, 0);
         assert!(!saved.profiles["tw-w-a"].anonymous);
+        assert_eq!(saved.tabs[0].viewport, None);
+    }
+
+    #[test]
+    fn a_viewport_that_cannot_be_read_is_dropped_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("state.json");
+        let tab = |id: u64, viewport: &str| {
+            format!(r#"{{"id":{id},"worker":"w","account":"a","url":"","viewport":{viewport}}}"#)
+        };
+        let tabs = [
+            tab(1, r#"{"kind":"watch"}"#),
+            tab(
+                2,
+                r#"{"kind":"fixed","width":"wide","height":800,"mobile":false}"#,
+            ),
+            tab(
+                3,
+                r#"{"kind":"fixed","width":10,"height":800,"mobile":false}"#,
+            ),
+            tab(4, r#""phone""#),
+            tab(5, "null"),
+            tab(
+                6,
+                r#"{"kind":"fixed","width":390,"height":844,"mobile":true}"#,
+            ),
+            tab(7, r#"{"kind":"fit"}"#),
+        ];
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"tabs":[{}],"profiles":{{"tw-w-a":{{"worker":"w","kept":[]}}}},"next_id":9}}"#,
+                tabs.join(",")
+            ),
+        )
+        .unwrap();
+        let saved = load(&file);
+        assert_eq!(saved.next_id, 9);
+        assert!(saved.profiles.contains_key("tw-w-a"));
+        let viewports: Vec<_> = saved.tabs.iter().map(|t| (t.id, t.viewport)).collect();
+        assert_eq!(
+            viewports,
+            [
+                (1, None),
+                (2, None),
+                (3, None),
+                (4, None),
+                (5, None),
+                (6, Some(Viewport::fixed(390, 844, true).unwrap())),
+                (7, Some(Viewport::Fit)),
+            ]
+        );
     }
 
     #[test]

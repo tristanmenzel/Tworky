@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -5,8 +7,11 @@ use crate::cdp::{Calls, Cdp, call_all};
 
 pub const MIN_SIZE: u32 = 200;
 pub const MAX_SIZE: u32 = 3840;
-/// The frame width assumed for a tab that has not been shown yet.
-pub const DEFAULT_FRAME_WIDTH: f64 = 1280.0;
+/// The frame assumed for a tab that has not been shown yet.
+pub const DEFAULT_FRAME: Frame = Frame {
+    width: 1280.0,
+    height: 800.0,
+};
 const MOBILE_SCALE_FACTOR: f64 = 3.0;
 const USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
 
@@ -31,6 +36,13 @@ pub const DESKTOP: Viewport = Viewport::Fixed {
     height: 900,
     mobile: false,
 };
+
+/// The box a tab is drawn in, in CSS pixels of the app's window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Frame {
+    pub width: f64,
+    pub height: f64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -88,18 +100,25 @@ impl Viewport {
     }
 }
 
-/// How much a fixed viewport is shrunk to fit a frame `frame_width` CSS pixels wide. Never
-/// enlarged.
-pub fn scale_for(viewport: &Viewport, frame_width: f64) -> f64 {
-    match *viewport {
-        Viewport::Fixed { width, .. } if frame_width > 0.0 => {
-            (frame_width / f64::from(width)).min(1.0)
+/// How much a fixed viewport is shrunk to fit `frame`. Never enlarged. A side of the frame that
+/// isn't a positive size doesn't constrain it.
+pub fn scale_for(viewport: &Viewport, frame: Frame) -> f64 {
+    let fit = |frame: f64, size: u32| {
+        if frame > 0.0 {
+            frame / f64::from(size)
+        } else {
+            f64::INFINITY
         }
-        _ => 1.0,
+    };
+    match *viewport {
+        Viewport::Fixed { width, height, .. } => fit(frame.width, width)
+            .min(fit(frame.height, height))
+            .min(1.0),
+        Viewport::Fit => 1.0,
     }
 }
 
-pub fn metrics_call(viewport: &Viewport, frame_width: f64) -> (&'static str, Value) {
+pub fn metrics_call(viewport: &Viewport, frame: Frame) -> (&'static str, Value) {
     match *viewport {
         Viewport::Fit => ("Emulation.clearDeviceMetricsOverride", json!({})),
         Viewport::Fixed {
@@ -122,7 +141,7 @@ pub fn metrics_call(viewport: &Viewport, frame_width: f64) -> (&'static str, Val
                     "screenWidth": width,
                     "screenHeight": height,
                     "screenOrientation": { "type": orientation, "angle": 0 },
-                    "scale": scale_for(viewport, frame_width),
+                    "scale": scale_for(viewport, frame),
                     "dontSetVisibleSize": true,
                 }),
             )
@@ -187,16 +206,16 @@ pub async fn emulate_mobile(
     Ok(notes)
 }
 
-/// Sends `viewport`'s metrics, then matches touch and the user agent to it. A page must have
-/// the phone user agent before its first navigation, or it loads with the desktop one.
+/// Sends `viewport`'s metrics through `metrics`, then matches touch and the user agent to it.
+/// A page must have the phone user agent before its first navigation, or it loads with the
+/// desktop one. The host sends the metrics, because it orders them with the resizes of the tab.
 pub async fn apply(
     cdp: &impl Cdp,
     viewport: &Viewport,
-    frame_width: f64,
     was_mobile: bool,
+    metrics: impl Future<Output = Result<(), String>>,
 ) -> Result<Vec<String>, String> {
-    let (method, params) = metrics_call(viewport, frame_width);
-    cdp.call(method, params).await?;
+    metrics.await?;
     emulate_mobile(cdp, viewport.mobile(), was_mobile).await
 }
 
@@ -204,6 +223,22 @@ pub async fn apply(
 mod tests {
     use super::*;
     use crate::cdp::fake::FakeCdp;
+
+    fn frame(width: f64, height: f64) -> Frame {
+        Frame { width, height }
+    }
+
+    async fn apply_through(
+        cdp: &FakeCdp,
+        viewport: &Viewport,
+        was_mobile: bool,
+    ) -> Result<Vec<String>, String> {
+        apply(cdp, viewport, was_mobile, async {
+            let (method, params) = metrics_call(viewport, DEFAULT_FRAME);
+            cdp.call(method, params).await.map(drop)
+        })
+        .await
+    }
 
     #[test]
     fn presets_are_found_by_name() {
@@ -267,15 +302,29 @@ mod tests {
 
     #[test]
     fn scale_shrinks_to_the_frame_but_never_enlarges() {
-        assert_eq!(scale_for(&DESKTOP, 720.0), 0.5);
-        assert_eq!(scale_for(&PHONE, 900.0), 1.0);
-        assert_eq!(scale_for(&DESKTOP, 0.0), 1.0);
-        assert_eq!(scale_for(&Viewport::Fit, 300.0), 1.0);
+        assert_eq!(scale_for(&DESKTOP, frame(720.0, 900.0)), 0.5);
+        assert_eq!(scale_for(&PHONE, frame(900.0, 900.0)), 1.0);
+        assert_eq!(scale_for(&Viewport::Fit, frame(300.0, 300.0)), 1.0);
+    }
+
+    #[test]
+    fn scale_fits_the_shorter_side_of_the_frame() {
+        assert_eq!(scale_for(&PHONE, frame(1280.0, 426.0)), 0.5);
+        assert_eq!(scale_for(&DESKTOP, frame(1440.0, 450.0)), 0.5);
+        assert_eq!(scale_for(&DESKTOP, frame(360.0, 450.0)), 0.25);
+    }
+
+    #[test]
+    fn a_side_without_a_size_does_not_constrain_the_scale() {
+        assert_eq!(scale_for(&DESKTOP, frame(0.0, 450.0)), 0.5);
+        assert_eq!(scale_for(&DESKTOP, frame(720.0, f64::NAN)), 0.5);
+        assert_eq!(scale_for(&DESKTOP, frame(-1.0, 0.0)), 1.0);
+        assert_eq!(scale_for(&DESKTOP, frame(f64::NAN, f64::NAN)), 1.0);
     }
 
     #[test]
     fn a_landscape_desktop_has_no_device_scale_factor() {
-        let (method, params) = metrics_call(&DESKTOP, 720.0);
+        let (method, params) = metrics_call(&DESKTOP, frame(720.0, 900.0));
         assert_eq!(method, "Emulation.setDeviceMetricsOverride");
         assert_eq!(
             params,
@@ -296,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn a_phone_emulates_touch_and_the_phone_user_agent() {
         let cdp = FakeCdp::default();
-        let notes = apply(&cdp, &PHONE, 1280.0, false).await.unwrap();
+        let notes = apply_through(&cdp, &PHONE, false).await.unwrap();
         assert!(notes.is_empty());
         assert_eq!(
             cdp.methods(),
@@ -310,7 +359,7 @@ mod tests {
         let metrics = &cdp.params("Emulation.setDeviceMetricsOverride")[0];
         assert_eq!(metrics["deviceScaleFactor"], 3.0);
         assert_eq!(metrics["mobile"], true);
-        assert_eq!(metrics["scale"], 1.0);
+        assert_eq!(metrics["scale"], 800.0 / 852.0);
         assert_eq!(metrics["screenOrientation"]["type"], "portraitPrimary");
         assert_eq!(
             cdp.params("Emulation.setUserAgentOverride")[0]["platform"],
@@ -321,14 +370,14 @@ mod tests {
     #[tokio::test]
     async fn fit_from_a_desktop_viewport_only_clears_the_metrics() {
         let cdp = FakeCdp::default();
-        apply(&cdp, &Viewport::Fit, 1280.0, false).await.unwrap();
+        apply_through(&cdp, &Viewport::Fit, false).await.unwrap();
         assert_eq!(cdp.methods(), ["Emulation.clearDeviceMetricsOverride"]);
     }
 
     #[tokio::test]
     async fn leaving_mobile_restores_touch_and_the_user_agent() {
         let cdp = FakeCdp::default();
-        let notes = apply(&cdp, &Viewport::Fit, 1280.0, true).await.unwrap();
+        let notes = apply_through(&cdp, &Viewport::Fit, true).await.unwrap();
         assert!(notes.is_empty());
         assert_eq!(
             cdp.methods(),
@@ -355,7 +404,7 @@ mod tests {
             "Emulation.setUserAgentOverride" => Err("no".into()),
             _ => Ok(json!({})),
         });
-        let notes = apply(&cdp, &DESKTOP, 1280.0, true).await.unwrap();
+        let notes = apply_through(&cdp, &DESKTOP, true).await.unwrap();
         assert_eq!(notes, ["the phone user agent is still set because no"]);
         assert_eq!(cdp.methods().len(), 4);
     }
@@ -363,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_metrics_override_fails() {
         let cdp = FakeCdp::answering(|_, _| Err("no".into()));
-        assert!(apply(&cdp, &PHONE, 1280.0, false).await.is_err());
+        assert!(apply_through(&cdp, &PHONE, false).await.is_err());
         assert_eq!(cdp.methods(), ["Emulation.setDeviceMetricsOverride"]);
     }
 }

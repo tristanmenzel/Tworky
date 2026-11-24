@@ -15,6 +15,7 @@ use tworky_browser::diagnostics::{
 };
 use tworky_browser::login::{BINDING, LoginMessage};
 use tworky_browser::page::PageEvents;
+use tworky_browser::viewport::{self, Frame, Viewport};
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     ICoreWebView2, ICoreWebView2_13, ICoreWebView2Profile2, ICoreWebView2Profile8,
     ICoreWebView2Settings4,
@@ -116,6 +117,40 @@ impl Cdp for TabCdp {
                 Err(_) => Err(format!("{name} got no answer in {CALL_TIMEOUT:?}")),
             }
         }
+    }
+}
+
+/// Sends the tab's metrics override for its viewport and frame as they are now. Every override
+/// is posted from the main thread, here, so they reach the page in the order the viewport and
+/// frame changed.
+fn post_metrics(app: &AppHandle, id: u64, on_done: impl FnOnce(Result<Value, String>) + 'static) {
+    let Ok(tab) = app.state::<super::Browser>().tab(id) else {
+        on_done(Err(format!("tab {id} is closed")));
+        return;
+    };
+    let frame = tab.frame.lock().unwrap().unwrap_or(viewport::DEFAULT_FRAME);
+    let (method, params) = viewport::metrics_call(&tab.viewport(), frame);
+    HOST.with(|h| match h.borrow().views.get(&id) {
+        Some(view) => call_raw(&view.webview(), method, &params, on_done),
+        None => on_done(Err(format!("tab {id} is closed"))),
+    });
+}
+
+pub async fn apply_metrics(app: &AppHandle, id: u64) -> Result<(), String> {
+    let (tx, rx) = oneshot::channel();
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        post_metrics(&handle, id, move |result| {
+            let _ = tx.send(result);
+        });
+    })
+    .map_err(|e| e.to_string())?;
+    match tokio::time::timeout(CALL_TIMEOUT, rx).await {
+        Ok(Ok(result)) => result.map(drop),
+        Ok(Err(_)) => Err(format!("tab {id} closed while its viewport was set")),
+        Err(_) => Err(format!(
+            "the viewport's metrics got no answer in {CALL_TIMEOUT:?}"
+        )),
     }
 }
 
@@ -470,16 +505,36 @@ async fn clear(app: &AppHandle, profile: &str, delete: bool) -> Result<(), Strin
     .await
 }
 
+/// A fixed viewport is scaled to fit the tab's frame, so a resize re-sends its metrics.
 pub async fn set_bounds(app: &AppHandle, id: u64, bounds: Bounds) -> Result<(), String> {
-    on_main(app, move |_| {
-        HOST.with(|h| {
+    on_main(app, move |app| {
+        let rescale = app.state::<super::Browser>().tab(id).is_ok_and(|tab| {
+            let frame = Frame {
+                width: bounds.width,
+                height: bounds.height,
+            };
+            let before = tab.frame.lock().unwrap().replace(frame);
+            before != Some(frame) && matches!(tab.viewport(), Viewport::Fixed { .. })
+        });
+        let (has_view, placed) = HOST.with(|h| {
             let mut h = h.borrow_mut();
             h.last_bounds = Some(bounds);
             match h.views.get(&id) {
-                Some(view) => view.set_bounds(rect(bounds)).map_err(|e| e.to_string()),
-                None => Ok(()),
+                Some(view) => (
+                    true,
+                    view.set_bounds(rect(bounds)).map_err(|e| e.to_string()),
+                ),
+                None => (false, Ok(())),
             }
-        })
+        });
+        if rescale && has_view {
+            post_metrics(app, id, move |result| {
+                if let Err(e) = result {
+                    eprintln!("tab {id}: could not rescale its viewport: {e}");
+                }
+            });
+        }
+        placed
     })
     .await
 }

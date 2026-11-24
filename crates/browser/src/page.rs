@@ -199,12 +199,16 @@ impl<C: Cdp> Page<'_, C> {
 
     /// Prepares a new tab before its first navigation: the login detector, diagnostics, and
     /// its viewport, which must be set first or the first page loads with the desktop user
-    /// agent. A fresh view has no overrides, so Fit sends nothing.
-    pub async fn prepare(&self, frame_width: f64) -> Result<(), String> {
+    /// agent. `metrics` sends the viewport's metrics override (see `viewport::apply`). A fresh
+    /// view has no overrides, so Fit sends nothing.
+    pub async fn prepare(
+        &self,
+        metrics: impl Future<Output = Result<(), String>>,
+    ) -> Result<(), String> {
         login::install_detector(self.cdp).await?;
         self.enable_diagnostics().await;
         if self.viewport != Viewport::Fit {
-            viewport::apply(self.cdp, &self.viewport, frame_width, false).await?;
+            viewport::apply(self.cdp, &self.viewport, false, metrics).await?;
         }
         Ok(())
     }
@@ -474,14 +478,7 @@ impl<C: Cdp> Page<'_, C> {
 
     /// A base64 PNG at CSS pixel scale, on HiDPI displays and mobile pages too.
     pub async fn screenshot(&self, full_page: bool) -> Result<(Value, String), String> {
-        let ratio = evaluate(self.cdp, "window.devicePixelRatio")
-            .await
-            .ok()
-            .and_then(|r| r.as_f64())
-            .filter(|r| r.is_finite() && *r > 0.0)
-            .unwrap_or(1.0);
-        let scale = 1.0 / ratio;
-        let png = cdp::screenshot(self.cdp, full_page, scale).await?;
+        let png = cdp::screenshot(self.cdp, full_page).await?;
         Ok((self.state(false).await, png))
     }
 
@@ -938,6 +935,11 @@ mod tests {
             .collect()
     }
 
+    async fn send_metrics(page: &Page<'_, FakeCdp>) -> Result<(), String> {
+        let (method, params) = viewport::metrics_call(&page.viewport, viewport::DEFAULT_FRAME);
+        page.cdp.call(method, params).await.map(drop)
+    }
+
     #[tokio::test]
     async fn prepare_enables_diagnostics_without_buffering_bodies() {
         let events = PageEvents::default();
@@ -952,7 +954,7 @@ mod tests {
             events: &events,
             viewport: Viewport::Fit,
         };
-        page.prepare(viewport::DEFAULT_FRAME_WIDTH).await.unwrap();
+        page.prepare(send_metrics(&page)).await.unwrap();
         assert!(cdp.methods().contains(&"Log.enable".to_string()));
         assert_eq!(
             cdp.params("Network.enable"),
@@ -974,7 +976,7 @@ mod tests {
             events: &events,
             viewport: viewport::PHONE,
         };
-        page.prepare(viewport::DEFAULT_FRAME_WIDTH).await.unwrap();
+        page.prepare(send_metrics(&page)).await.unwrap();
         assert_eq!(
             cdp.params("Emulation.setDeviceMetricsOverride"),
             [json!({
@@ -985,7 +987,7 @@ mod tests {
                 "screenWidth": 393,
                 "screenHeight": 852,
                 "screenOrientation": { "type": "portraitPrimary", "angle": 0 },
-                "scale": 1.0,
+                "scale": 800.0 / 852.0,
                 "dontSetVisibleSize": true,
             })]
         );
@@ -998,49 +1000,6 @@ mod tests {
             "iPhone"
         );
         assert!(!cdp.methods().contains(&"Page.navigate".to_string()));
-    }
-
-    #[tokio::test]
-    async fn screenshots_are_scaled_to_css_pixels() {
-        let events = PageEvents::default();
-        let cdp = FakeCdp::answering(|method, params| {
-            Ok(match method {
-                "Runtime.evaluate" if params["expression"] == "window.devicePixelRatio" => {
-                    json!({ "result": { "value": 1.5 } })
-                }
-                "Page.getLayoutMetrics" => json!({ "cssVisualViewport": {
-                    "pageX": 0, "pageY": 0, "clientWidth": 1440, "clientHeight": 900 } }),
-                _ => json!({ "data": "png" }),
-            })
-        });
-        let page = Page {
-            cdp: &cdp,
-            events: &events,
-            viewport: viewport::DESKTOP,
-        };
-        page.screenshot(false).await.unwrap();
-        let clip = &cdp.params("Page.captureScreenshot")[0]["clip"];
-        assert_eq!(clip["scale"], 1.0 / 1.5);
-        assert_eq!(clip["width"], 1440.0);
-    }
-
-    #[tokio::test]
-    async fn screenshots_assume_a_ratio_of_one_when_the_page_does_not_say() {
-        let events = PageEvents::default();
-        let cdp = FakeCdp::answering(|method, _| match method {
-            "Runtime.evaluate" => Err("no".into()),
-            _ => Ok(json!({ "data": "png" })),
-        });
-        let page = Page {
-            cdp: &cdp,
-            events: &events,
-            viewport: Viewport::Fit,
-        };
-        page.screenshot(false).await.unwrap();
-        assert_eq!(
-            cdp.params("Page.captureScreenshot"),
-            [json!({ "format": "png" })]
-        );
     }
 
     #[tokio::test]
@@ -1057,7 +1016,7 @@ mod tests {
             events: &events,
             viewport: Viewport::Fit,
         };
-        page.prepare(viewport::DEFAULT_FRAME_WIDTH).await.unwrap();
+        page.prepare(send_metrics(&page)).await.unwrap();
         let calls = cdp.params("Network.enable");
         assert_eq!(calls.len(), 2);
         assert_eq!(
@@ -1085,7 +1044,7 @@ mod tests {
             events: &events,
             viewport: Viewport::Fit,
         };
-        page.prepare(viewport::DEFAULT_FRAME_WIDTH).await.unwrap();
+        page.prepare(send_metrics(&page)).await.unwrap();
         assert!(
             cdp.methods()
                 .contains(&"Page.addScriptToEvaluateOnNewDocument".to_string())

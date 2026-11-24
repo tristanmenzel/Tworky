@@ -1499,6 +1499,7 @@ fn main() {
             browser::browser_retry,
             browser::browser_history,
             browser::browser_bounds,
+            browser::browser_set_viewport,
             browser::browser_show,
             browser::browser_close,
             browser::browser_sign_in,
