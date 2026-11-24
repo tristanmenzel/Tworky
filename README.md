@@ -60,6 +60,19 @@ A release is published for every push to `main` (`.github/workflows/release.yml`
 
 ## Getting started
 
+### Your config
+
+Tworky keeps your guidance for Claude, your projects and their memory in a local git repo, and commits every change. The first time it starts, it asks how to set this up:
+
+- **Start fresh** creates an empty config.
+- **Use my shared config** clones the config you already sync from another machine. Tworky looks for a `tworky-config` repo under your GitHub account and organisations, or takes a URL.
+
+To sync between machines, open **Settings › Remote** and create a private `tworky-config` repo on GitHub, or use one you have. Tworky warns before using a repo that isn't private. Changes then sync in the background. If two machines change the same thing, **Settings › Sync** shows the conflict and **Resolve with Claude** opens a Claude session to fix it. The shared config names repos by `owner/name`, and each machine finds its own clones under your source folders.
+
+**Settings › Guidance** holds your own instructions for every session, with a file per OS for what only applies there.
+
+If you used Tworky before it had this repo, it imports your projects and memory on first start and keeps the old folders as `projects.pre-repo` and `memory.pre-repo` in the config folder (`tw paths` shows where). An older build sees no projects after that. To go back to one, rename those folders to `projects` and `memory`.
+
 ### Add your first item
 
 1. Open **Work Items** and press **+** beside refresh.
