@@ -226,11 +226,16 @@ impl Paths {
 
     /// The user's guidance for every session, then its refinement for `os`.
     pub fn guidance_files(&self, os: Os) -> [PathBuf; 2] {
-        let dir = self.repo_dir().join("tworky");
-        [
-            dir.join("claude.local.md"),
-            dir.join(format!("claude.local.{}.md", os.name())),
-        ]
+        [self.guidance_file(None), self.guidance_file(Some(os))]
+    }
+
+    /// The user's guidance for every session, or with `os` its refinement for that OS.
+    pub fn guidance_file(&self, os: Option<Os>) -> PathBuf {
+        let name = match os {
+            Some(os) => format!("claude.local.{}.md", os.name()),
+            None => "claude.local.md".into(),
+        };
+        self.repo_dir().join("tworky").join(name)
     }
 
     pub fn repo_projects_dir(&self) -> PathBuf {

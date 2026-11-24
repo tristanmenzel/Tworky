@@ -13,6 +13,9 @@ use crate::worker::{Launch, session_settings};
 /// `setup@tworky`, so this can't collide with it.
 pub const SESSION_ID: &str = "settings@tworky";
 
+/// Set in the session's environment, so `tw` can tell it runs there.
+pub const ENV_MARKER: &str = "TW_SETTINGS_SESSION";
+
 /// Its row in `app_sessions`.
 pub const KEY: &str = "settings";
 
@@ -64,6 +67,7 @@ pub fn launch(paths: &Paths, claude_home: Option<&Path>) -> Result<Launch> {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     env.insert("GIT_EDITOR".into(), "true".into());
+    env.insert(ENV_MARKER.into(), "1".into());
     Ok(Launch {
         program: app.claude[0].clone(),
         args,
@@ -145,6 +149,7 @@ mod tests {
         assert!(paths.repo_sync_dir().join(".git").exists());
         assert_eq!(launch.program, "claude");
         assert_eq!(env(&launch, "GIT_EDITOR").as_deref(), Some("true"));
+        assert_eq!(env(&launch, "TW_SETTINGS_SESSION").as_deref(), Some("1"));
         for (key, value) in [
             ("GIT_AUTHOR_NAME", "Tworky"),
             ("GIT_COMMITTER_NAME", "Tworky"),

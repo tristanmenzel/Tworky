@@ -416,7 +416,22 @@ export interface ProjectMemory {
 export interface SessionGuidanceSize {
   os: Os
   bytes: number
+  /** The project whose memory was counted. Without one asked for, the one with the most memory on this OS. */
+  project: string | null
 }
+
+/** Past this, sessions get the guidance and memory files' paths instead of their text. */
+export const SESSION_GUIDANCE_LIMIT = 8192
+
+/** The user's guidance for every session (`os: null`) or one OS's refinement. */
+export interface GuidanceFile {
+  os: Os | null
+  path: string
+  text: string
+  hash: string
+}
+
+export const GUIDANCE_CHANGED_SINCE_EDITING = 'Guidance changed since you started editing'
 
 export type MemoryChangeKind =
   | { kind: 'add'; section: string; text: string }
@@ -508,6 +523,18 @@ export interface ConfigSyncRecord {
   visibility: Visibility | null
 }
 
+export interface ConfigRepoStatus {
+  /** With any credentials redacted. */
+  remote: string | null
+  /** Uncommitted files, such as a project.toml that doesn't parse. */
+  changes: string[]
+  ahead_behind: [number, number] | null
+  stale_index_lock: boolean
+}
+
+/** The id the settings session's terminal runs under. */
+export const SETTINGS_SESSION = 'settings@tworky'
+
 export interface RemoteCheck {
   url: string
   visibility: Visibility
@@ -582,7 +609,10 @@ export const api = {
   linkItem: (name: string, issueUrl: string) => invoke<void>('link_item', { name, issueUrl }),
   removeItem: (name: string) => invoke<void>('remove_item', { name }),
   memories: () => invoke<ProjectMemory[]>('list_memories'),
-  sessionGuidanceSize: (project: string) => invoke<SessionGuidanceSize>('session_guidance_size', { project }),
+  /** Without a project, counts the project with the most memory. */
+  sessionGuidanceSize: (project: string | null) => invoke<SessionGuidanceSize>('session_guidance_size', { project }),
+  guidance: () => invoke<GuidanceFile[]>('list_guidance'),
+  saveGuidance: (os: Os | null, base: string, text: string) => invoke<void>('save_guidance', { os, base, text }),
   saveMemory: (project: string, os: Os | null, base: string, text: string) =>
     invoke<void>('save_memory', { project, os, base, text }),
   memoryChanges: () => invoke<ProjectMemoryChanges[]>('list_memory_changes'),
@@ -626,6 +656,11 @@ export const api = {
   findSharedConfigs: () => invoke<SharedConfig[]>('find_shared_configs'),
   useSharedConfig: (remote: string, confirmed: boolean) =>
     invoke<ConfigConnected>('use_shared_config', { remote, confirmed }),
+  configSyncStatus: () => invoke<ConfigSyncRecord>('config_sync_status'),
+  configRepoStatus: () => invoke<ConfigRepoStatus>('config_repo_status'),
+  syncConfigNow: () => invoke<ConfigSyncRecord>('sync_config_now'),
+  abortConfigSync: () => invoke<ConfigSyncRecord>('abort_config_sync'),
+  dismissConfigIncoming: () => invoke<void>('dismiss_config_incoming'),
   configGithubOwners: () => invoke<string[]>('config_github_owners'),
   checkConfigRemote: (remote: string) => invoke<RemoteCheck>('check_config_remote', { remote }),
   setConfigRemote: (remote: string, confirmed: boolean) =>

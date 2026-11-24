@@ -378,20 +378,88 @@ async fn list_memories() -> CmdResult<Vec<ProjectMemory>> {
 struct SessionGuidanceSize {
     os: Os,
     bytes: u64,
+    /// The project whose memory was counted: the one asked about, or without one the project with
+    /// the most memory on this OS.
+    project: Option<String>,
 }
 
-/// The combined size of the guidance and memory a session of `project` on this OS loads.
+/// The combined size of the guidance and memory a session on this OS loads: one of `project`, or
+/// without a project, one of the project with the most memory.
 #[tauri::command]
-async fn session_guidance_size(project: String) -> CmdResult<SessionGuidanceSize> {
+async fn session_guidance_size(project: Option<String>) -> CmdResult<SessionGuidanceSize> {
     blocking(move || {
-        let ws = workspace()?;
+        let paths = Paths::resolve().map_err(err)?;
         let os = Os::current();
-        let bytes = tworky_core::worker::session_guidance_files(&ws.config.paths, &project, os)
-            .iter()
-            .filter_map(|f| std::fs::metadata(f).ok())
-            .map(|m| m.len())
-            .sum();
-        Ok(SessionGuidanceSize { os, bytes })
+        let size = |files: &[PathBuf]| -> u64 {
+            files
+                .iter()
+                .filter_map(|f| std::fs::metadata(f).ok())
+                .map(|m| m.len())
+                .sum()
+        };
+        let project = match project {
+            Some(project) => Some(project),
+            None => workspace().ok().and_then(|ws| {
+                ws.config
+                    .projects
+                    .iter()
+                    .max_by_key(|p| {
+                        size(&[
+                            paths.memory_file(&p.name, None),
+                            paths.memory_file(&p.name, Some(os)),
+                        ])
+                    })
+                    .map(|p| p.name.clone())
+            }),
+        };
+        let bytes = match &project {
+            Some(project) => size(&tworky_core::worker::session_guidance_files(
+                &paths, project, os,
+            )),
+            None => size(&paths.guidance_files(os)),
+        };
+        Ok(SessionGuidanceSize { os, bytes, project })
+    })
+    .await
+}
+
+#[derive(Serialize)]
+struct GuidanceFile {
+    os: Option<Os>,
+    path: String,
+    text: String,
+    hash: String,
+}
+
+/// The user's guidance for every session, then its refinement for each OS.
+#[tauri::command]
+async fn list_guidance() -> CmdResult<Vec<GuidanceFile>> {
+    blocking(|| {
+        let paths = Paths::resolve().map_err(err)?;
+        std::iter::once(None)
+            .chain(Os::ALL.map(Some))
+            .map(|os| {
+                let path = paths.guidance_file(os);
+                let text = memory::read(&path).map_err(err)?;
+                Ok(GuidanceFile {
+                    os,
+                    hash: memory::hash(&text),
+                    text,
+                    path: path.display().to_string(),
+                })
+            })
+            .collect()
+    })
+    .await
+}
+
+#[tauri::command]
+async fn save_guidance(os: Option<Os>, base: String, text: String) -> CmdResult<()> {
+    blocking(move || {
+        let paths = Paths::resolve().map_err(err)?;
+        memory::save_guidance(&paths, os, &base, &text).map_err(err)?;
+        wake_config_sync();
+        Ok(())
     })
     .await
 }
@@ -1285,9 +1353,18 @@ fn memory_change_names(paths: &Paths) -> BTreeSet<String> {
     names
 }
 
-/// Each memory file's modified time and size, so an edit from anywhere refreshes open diffs.
+/// Each memory and guidance file's modified time and size, so an edit from anywhere, or a sync,
+/// refreshes open diffs and views.
 fn memory_file_stamps(paths: &Paths) -> BTreeMap<String, (Option<std::time::SystemTime>, u64)> {
     let mut stamps = BTreeMap::new();
+    for file in std::iter::once(None)
+        .chain(Os::ALL.map(Some))
+        .map(|os| paths.guidance_file(os))
+    {
+        if let Some(stamp) = file_stamp(&file) {
+            stamps.insert(file.display().to_string(), stamp);
+        }
+    }
     let Ok(projects) = std::fs::read_dir(paths.repo_projects_dir()) else {
         return stamps;
     };
@@ -1336,6 +1413,40 @@ async fn abort_config_sync() -> CmdResult<config_repo::SyncRecord> {
 #[tauri::command]
 async fn dismiss_config_incoming() -> CmdResult<()> {
     blocking(|| config_repo::dismiss_incoming(&Paths::resolve().map_err(err)?).map_err(err)).await
+}
+
+#[derive(Serialize)]
+struct ConfigRepoStatus {
+    /// With any credentials in it redacted.
+    remote: Option<String>,
+    /// Uncommitted allowlisted files, such as a `project.toml` that doesn't parse.
+    changes: Vec<String>,
+    ahead_behind: Option<(u32, u32)>,
+    stale_index_lock: bool,
+}
+
+#[tauri::command]
+async fn config_repo_status() -> CmdResult<ConfigRepoStatus> {
+    blocking(|| {
+        let paths = Paths::resolve().map_err(err)?;
+        let remote = config_repo::remote_url(&paths).map(|url| config_repo::redact_url(&url));
+        if !paths.has_repo() {
+            return Ok(ConfigRepoStatus {
+                remote,
+                changes: Vec::new(),
+                ahead_behind: None,
+                stale_index_lock: false,
+            });
+        }
+        let status = config_repo::status(&paths).map_err(err)?;
+        Ok(ConfigRepoStatus {
+            remote,
+            changes: status.changes,
+            ahead_behind: status.ahead_behind,
+            stale_index_lock: status.stale_index_lock,
+        })
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1750,6 +1861,8 @@ fn main() {
             set_board_status,
             list_memories,
             session_guidance_size,
+            list_guidance,
+            save_guidance,
             save_memory,
             list_memory_changes,
             approve_memory_changes,
@@ -1758,6 +1871,7 @@ fn main() {
             list_project_errors,
             list_config_errors,
             config_sync_status,
+            config_repo_status,
             sync_config_now,
             abort_config_sync,
             dismiss_config_incoming,

@@ -733,9 +733,14 @@ fn print_warnings(warnings: &[String]) {
 /// to point the user's config somewhere else or answer the confirmation for them. `is_set` says
 /// whether an environment variable is set.
 fn refuse_in_session(is_set: impl Fn(&str) -> bool) -> Result<()> {
-    let session = ["TW_WORKER_ID", "WA_WORKER_ID", "TW_SETUP_SESSION"]
-        .iter()
-        .any(|var| is_set(var));
+    let session = [
+        "TW_WORKER_ID",
+        "WA_WORKER_ID",
+        "TW_SETUP_SESSION",
+        tworky_core::settings_session::ENV_MARKER,
+    ]
+    .iter()
+    .any(|var| is_set(var));
     anyhow::ensure!(
         !session,
         "the config's remote can't be changed from a Tworky session; change it in Tworky's Settings, or run this in your own terminal"
@@ -1887,7 +1892,12 @@ mod tests {
 
     #[test]
     fn the_remote_is_never_changed_from_a_session() {
-        for session in ["TW_WORKER_ID", "WA_WORKER_ID", "TW_SETUP_SESSION"] {
+        for session in [
+            "TW_WORKER_ID",
+            "WA_WORKER_ID",
+            "TW_SETUP_SESSION",
+            "TW_SETTINGS_SESSION",
+        ] {
             let e = refuse_in_session(|var| var == session).unwrap_err();
             let message = e.to_string();
             assert!(message.contains("Settings"), "{session}: {message}");

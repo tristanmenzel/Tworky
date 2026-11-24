@@ -1,7 +1,9 @@
 <script lang="ts">
-  import { api, type RemoteCheck, type SharedConfig } from './api'
+  import { api, type SharedConfig } from './api'
   import Dialog from './Dialog.svelte'
   import { overlay } from './overlay.svelte'
+  import { RemoteConfirmation } from './remoteCheck.svelte'
+  import RemoteWarnings from './RemoteWarnings.svelte'
 
   interface Props {
     onDone: () => void
@@ -14,7 +16,7 @@
   let finding = $state(false)
   let picked = $state<string | null>(null)
   let typed = $state('')
-  let check = $state<RemoteCheck | null>(null)
+  const confirmation = new RemoteConfirmation()
   let busy = $state(false)
   let error = $state<string | null>(null)
 
@@ -27,7 +29,7 @@
 
   $effect(() => {
     void remote
-    check = null
+    confirmation.reset()
   })
 
   async function startFresh() {
@@ -64,15 +66,10 @@
     busy = true
     error = null
     try {
-      if (!check) {
-        const checked = await api.checkConfigRemote(remote)
-        if (checked.warnings.length) {
-          check = checked
-          return
-        }
-      }
-      await api.useSharedConfig(remote, check?.needs_confirmation ?? false)
-      onDone()
+      const used = await confirmation.connect(remote, async (confirmed) => {
+        await api.useSharedConfig(remote, confirmed)
+      })
+      if (used) onDone()
     } catch (e) {
       error = String(e)
     } finally {
@@ -117,11 +114,7 @@
       <span>Or a URL or owner/name</span>
       <input bind:value={typed} placeholder="https://github.com/me/tworky-config" disabled={busy} />
     </label>
-    {#if check}
-      <ul class="warnings">
-        {#each check.warnings as warning (warning)}<li>{warning}</li>{/each}
-      </ul>
-    {/if}
+    <RemoteWarnings warnings={confirmation.check?.warnings ?? []} />
   {/if}
 
   {#if error}<pre class="error">{error}</pre>{/if}
@@ -130,7 +123,7 @@
     {#if step === 'shared'}
       <button disabled={busy} onclick={() => (step = 'choose')}>Back</button>
       <button class="primary" disabled={busy || !remote} onclick={useShared}>
-        {busy ? 'Setting up…' : check ? 'Use it anyway' : 'Use this config'}
+        {busy ? 'Setting up…' : confirmation.check ? 'Use it anyway' : 'Use this config'}
       </button>
     {/if}
   {/snippet}
@@ -159,10 +152,5 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-  }
-  .warnings {
-    margin: 0;
-    padding-left: 18px;
-    color: var(--warn);
   }
 </style>

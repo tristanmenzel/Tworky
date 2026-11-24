@@ -330,6 +330,26 @@ pub fn save(paths: &Paths, project: &str, os: Option<Os>, base: &str, text: &str
     Ok(())
 }
 
+/// Saves the user's guidance, or with `os` its refinement for that OS, unless it changed since
+/// the text with hash `base` was read.
+pub fn save_guidance(paths: &Paths, os: Option<Os>, base: &str, text: &str) -> Result<()> {
+    let guard = config_repo::lock_for_write(paths)?;
+    let file = paths.guidance_file(os);
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if hash(&read(&file)?) != base {
+        bail!("Guidance changed since you started editing");
+    }
+    write_atomic(&file, text.as_bytes())?;
+    let message = match os {
+        Some(os) => format!("Save {} guidance", os.label()),
+        None => "Save guidance".into(),
+    };
+    config_repo::commit_logged(&guard, paths, &[&file], &message);
+    Ok(())
+}
+
 pub fn apply(current: &str, change: &Change) -> Result<String> {
     match &change.kind {
         ChangeKind::Add { section, text } => {
@@ -1528,6 +1548,38 @@ mod tests {
             ["projects/acme/memory.md"]
         );
         assert!(!paths.project_dir("acme").join("memory.md.lock").exists());
+    }
+
+    #[test]
+    fn save_guidance_refuses_a_stale_base_and_commits_only_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config_repo::test_home(dir.path());
+        let shared = paths.guidance_file(None);
+        let linux = paths.guidance_file(Some(Os::Linux));
+        std::fs::write(paths.guidance_file(Some(Os::Macos)), "uncommitted\n").unwrap();
+
+        let err = save_guidance(&paths, Some(Os::Linux), &hash("old"), "new\n").unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "Guidance changed since you started editing"
+        );
+        assert_eq!(read(&linux).unwrap(), "");
+
+        save_guidance(&paths, Some(Os::Linux), &hash(""), "# Linux\n").unwrap();
+        assert_eq!(read(&linux).unwrap(), "# Linux\n");
+        assert_eq!(config_repo::log_for_tests(&paths)[0], "Save Linux guidance");
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&paths),
+            ["tworky/claude.local.linux.md"]
+        );
+
+        save_guidance(&paths, None, &hash(&read(&shared).unwrap()), "Be brief.\n").unwrap();
+        assert_eq!(read(&shared).unwrap(), "Be brief.\n");
+        assert_eq!(config_repo::log_for_tests(&paths)[0], "Save guidance");
+        assert_eq!(
+            config_repo::last_commit_files_for_tests(&paths),
+            ["tworky/claude.local.md"]
+        );
     }
 
     fn windows_memory(paths: &Paths) -> String {
