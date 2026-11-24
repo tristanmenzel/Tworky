@@ -1035,27 +1035,48 @@ pub async fn browser_bounds(app: AppHandle, tab: u64, bounds: Bounds) -> CmdResu
     host::set_bounds(&app, tab, bounds).await
 }
 
-/// Sets the tab's viewport, shared by the user and Claude. A change into or out of mobile
-/// emulation reloads the page, so its user agent applies. Returns what couldn't be undone when
-/// leaving mobile.
+struct ViewportOf<'a> {
+    app: &'a AppHandle,
+    tab: &'a Tab,
+    cdp: &'a host::TabCdp,
+}
+
+impl viewport::ViewportTab for ViewportOf<'_> {
+    fn store(&self, viewport: Viewport) -> Viewport {
+        std::mem::replace(&mut *self.tab.viewport.lock().unwrap(), viewport)
+    }
+
+    async fn apply_metrics(&self) -> Result<(), String> {
+        host::apply_metrics(self.app, self.tab.id).await
+    }
+
+    async fn reload(&self) -> Result<(), String> {
+        if paused_url(self.tab).is_some() {
+            return Ok(());
+        }
+        page(self.cdp, self.tab).reload().await.map(drop)
+    }
+
+    fn changed(&self) {
+        changed(self.app);
+    }
+}
+
+/// Sets the tab's viewport, shared by the user and Claude (see `viewport::change`).
 pub async fn set_viewport(app: &AppHandle, tab: &Tab, new: Viewport) -> CmdResult<Vec<String>> {
     new.check()?;
     let _emulating = tab.emulation.lock().await;
-    let old = std::mem::replace(&mut *tab.viewport.lock().unwrap(), new);
-    if let Err(e) = host::apply_metrics(app, tab.id).await {
-        *tab.viewport.lock().unwrap() = old;
-        return Err(e);
-    }
-    changed(app);
-    if new.mobile() == old.mobile() {
-        return Ok(Vec::new());
-    }
     let cdp = host::TabCdp::new(app, tab.id);
-    let notes = viewport::emulate_mobile(&cdp, new.mobile(), old.mobile()).await?;
-    if tab.paused.lock().unwrap().is_none() {
-        page(&cdp, tab).reload().await?;
-    }
-    Ok(notes)
+    viewport::change(
+        &ViewportOf {
+            app,
+            tab,
+            cdp: &cdp,
+        },
+        &cdp,
+        new,
+    )
+    .await
 }
 
 #[tauri::command]

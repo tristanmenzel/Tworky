@@ -219,9 +219,58 @@ pub async fn apply(
     emulate_mobile(cdp, viewport.mobile(), was_mobile).await
 }
 
+/// The tab whose viewport `change` sets.
+pub trait ViewportTab: Send + Sync {
+    /// Stores `viewport` as the tab's and returns the one it replaces.
+    fn store(&self, viewport: Viewport) -> Viewport;
+    /// Sends the stored viewport's metrics override to the page.
+    fn apply_metrics(&self) -> impl Future<Output = Result<(), String>> + Send;
+    /// Reloads the page, if one is loaded.
+    fn reload(&self) -> impl Future<Output = Result<(), String>> + Send;
+    /// Tells the tab's viewers the stored viewport changed.
+    fn changed(&self);
+}
+
+/// Sets the tab's viewport. A change into or out of mobile emulation reloads the page, so its
+/// user agent applies. On failure the old viewport is stored and re-sent, along with its touch
+/// and user agent, so the page converges on what the tab says it has. Returns what couldn't be
+/// undone when leaving mobile.
+pub async fn change(
+    tab: &impl ViewportTab,
+    cdp: &impl Cdp,
+    new: Viewport,
+) -> Result<Vec<String>, String> {
+    let old = tab.store(new);
+    if let Err(e) = tab.apply_metrics().await {
+        tab.store(old);
+        let _ = tab.apply_metrics().await;
+        tab.changed();
+        return Err(e);
+    }
+    tab.changed();
+    if new.mobile() == old.mobile() {
+        return Ok(Vec::new());
+    }
+    let flipped = async {
+        let notes = emulate_mobile(cdp, new.mobile(), old.mobile()).await?;
+        tab.reload().await?;
+        Ok(notes)
+    }
+    .await;
+    if flipped.is_err() {
+        tab.store(old);
+        let _ = tab.apply_metrics().await;
+        let _ = emulate_mobile(cdp, old.mobile(), new.mobile()).await;
+        tab.changed();
+    }
+    flipped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
     use crate::cdp::fake::FakeCdp;
 
     fn frame(width: f64, height: f64) -> Frame {
@@ -407,6 +456,176 @@ mod tests {
         let notes = apply_through(&cdp, &DESKTOP, true).await.unwrap();
         assert_eq!(notes, ["the phone user agent is still set because no"]);
         assert_eq!(cdp.methods().len(), 4);
+    }
+
+    struct FakeTab {
+        viewport: Mutex<Viewport>,
+        events: Mutex<Vec<String>>,
+        failing_metrics: Mutex<usize>,
+        reload_fails: bool,
+    }
+
+    impl FakeTab {
+        fn new(viewport: Viewport) -> Self {
+            FakeTab {
+                viewport: Mutex::new(viewport),
+                events: Mutex::new(Vec::new()),
+                failing_metrics: Mutex::new(0),
+                reload_fails: false,
+            }
+        }
+
+        fn viewport(&self) -> Viewport {
+            *self.viewport.lock().unwrap()
+        }
+
+        fn events(&self) -> Vec<String> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+
+        fn log(&self, event: String) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl ViewportTab for FakeTab {
+        fn store(&self, viewport: Viewport) -> Viewport {
+            std::mem::replace(&mut *self.viewport.lock().unwrap(), viewport)
+        }
+
+        async fn apply_metrics(&self) -> Result<(), String> {
+            self.log(format!("metrics {:?}", self.viewport()));
+            let mut failing = self.failing_metrics.lock().unwrap();
+            if *failing > 0 {
+                *failing -= 1;
+                return Err("timed out".into());
+            }
+            Ok(())
+        }
+
+        async fn reload(&self) -> Result<(), String> {
+            self.log("reload".into());
+            if self.reload_fails {
+                return Err("reload failed".into());
+            }
+            Ok(())
+        }
+
+        fn changed(&self) {
+            self.log("changed".into());
+        }
+    }
+
+    fn metrics_of(viewport: Viewport) -> String {
+        format!("metrics {viewport:?}")
+    }
+
+    #[tokio::test]
+    async fn a_viewport_of_the_same_kind_only_sends_metrics() {
+        let tab = FakeTab::new(LAPTOP);
+        let cdp = FakeCdp::default();
+        assert!(change(&tab, &cdp, DESKTOP).await.unwrap().is_empty());
+        assert_eq!(tab.viewport(), DESKTOP);
+        assert_eq!(tab.events(), [metrics_of(DESKTOP), "changed".into()]);
+        assert!(cdp.methods().is_empty());
+    }
+
+    #[tokio::test]
+    async fn entering_mobile_emulates_it_then_reloads() {
+        let tab = FakeTab::new(Viewport::Fit);
+        let cdp = FakeCdp::default();
+        assert!(change(&tab, &cdp, PHONE).await.unwrap().is_empty());
+        assert_eq!(tab.viewport(), PHONE);
+        assert_eq!(
+            tab.events(),
+            [metrics_of(PHONE), "changed".into(), "reload".into()]
+        );
+        assert_eq!(cdp.methods().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_metrics_restore_and_resend_the_old_viewport() {
+        let tab = FakeTab::new(LAPTOP);
+        *tab.failing_metrics.lock().unwrap() = 1;
+        let cdp = FakeCdp::default();
+        assert_eq!(change(&tab, &cdp, PHONE).await.unwrap_err(), "timed out");
+        assert_eq!(tab.viewport(), LAPTOP);
+        assert_eq!(
+            tab.events(),
+            [metrics_of(PHONE), metrics_of(LAPTOP), "changed".into()]
+        );
+        assert!(cdp.methods().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_partly_failed_switch_to_mobile_is_rolled_back() {
+        let tab = FakeTab::new(LAPTOP);
+        let cdp = FakeCdp::answering(|method, params| match method {
+            "Emulation.setEmitTouchEventsForMouse" if params["enabled"] == true => Err("no".into()),
+            _ => Ok(json!({})),
+        });
+        assert_eq!(change(&tab, &cdp, PHONE).await.unwrap_err(), "no");
+        assert_eq!(tab.viewport(), LAPTOP);
+        assert_eq!(
+            tab.events(),
+            [
+                metrics_of(PHONE),
+                "changed".into(),
+                metrics_of(LAPTOP),
+                "changed".into(),
+            ]
+        );
+        assert_eq!(
+            cdp.methods(),
+            [
+                "Emulation.setTouchEmulationEnabled",
+                "Emulation.setEmitTouchEventsForMouse",
+                "Emulation.setTouchEmulationEnabled",
+                "Emulation.setEmitTouchEventsForMouse",
+                "Emulation.setUserAgentOverride",
+            ]
+        );
+        assert_eq!(
+            cdp.params("Emulation.setUserAgentOverride"),
+            [json!({ "userAgent": "" })]
+        );
+
+        let retry = FakeCdp::default();
+        change(&tab, &retry, PHONE).await.unwrap();
+        assert_eq!(tab.viewport(), PHONE);
+        assert_eq!(
+            tab.events(),
+            [metrics_of(PHONE), "changed".into(), "reload".into()]
+        );
+        assert_eq!(retry.methods().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_reload_after_leaving_mobile_restores_mobile() {
+        let tab = FakeTab {
+            reload_fails: true,
+            ..FakeTab::new(PHONE)
+        };
+        let cdp = FakeCdp::default();
+        assert_eq!(
+            change(&tab, &cdp, DESKTOP).await.unwrap_err(),
+            "reload failed"
+        );
+        assert_eq!(tab.viewport(), PHONE);
+        assert_eq!(
+            tab.events(),
+            [
+                metrics_of(DESKTOP),
+                "changed".into(),
+                "reload".into(),
+                metrics_of(PHONE),
+                "changed".into(),
+            ]
+        );
+        let agents = cdp.params("Emulation.setUserAgentOverride");
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0], json!({ "userAgent": "" }));
+        assert_eq!(agents[1]["platform"], "iPhone");
     }
 
     #[tokio::test]
