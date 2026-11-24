@@ -457,8 +457,21 @@ enum ConfigCommand {
 
 #[derive(Subcommand)]
 enum RemoteCommand {
-    /// Sync with this remote. A config repo with no history of its own takes the remote's.
-    Set { url: String },
+    /// Sync with this remote: a URL, path or GitHub owner/name. A config repo with no history of
+    /// its own takes the remote's; one with history joins it, merging the two.
+    Set {
+        url: String,
+        /// Use a public repo without asking
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Create a private tworky-config repo on GitHub (tworky-config-dev for a debug build), then
+    /// sync with it
+    Create {
+        /// The account or organisation to create it under; defaults to yours
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// Stop syncing and forget the remote
     Rm,
 }
@@ -657,6 +670,12 @@ fn config(paths: &Paths, cmd: ConfigCommand) -> Result<()> {
                 "remote:  {}",
                 config_repo::remote_url(paths).unwrap_or_else(|| "none".into())
             );
+            if let Some(visibility) = status.sync.visibility {
+                println!(
+                    "visible: {} when it was set",
+                    format!("{visibility:?}").to_lowercase()
+                );
+            }
             if let Some((ahead, behind)) = status.ahead_behind {
                 println!("main:    {ahead} ahead, {behind} behind the remote");
             }
@@ -672,12 +691,50 @@ fn config(paths: &Paths, cmd: ConfigCommand) -> Result<()> {
         }
         ConfigCommand::Sync => config_repo::sync(paths, Trigger::User)?,
         ConfigCommand::Abort => config_repo::abort(paths)?,
-        ConfigCommand::Remote(RemoteCommand::Set { url }) => config_repo::set_remote(paths, &url)?,
+        ConfigCommand::Remote(RemoteCommand::Set { url, yes }) => {
+            let check = config_repo::check_remote(&config_repo::Gh, &url)?;
+            print_warnings(&check.warnings);
+            if check.needs_confirmation
+                && !yes
+                && !confirm(&format!("Sync your config with the public {}?", check.url))?
+            {
+                anyhow::bail!("not syncing with {}", check.url);
+            }
+            config_repo::connect_remote(paths, &config_repo::Gh, &check.url, true)?.sync
+        }
+        ConfigCommand::Remote(RemoteCommand::Create { owner }) => {
+            let created = config_repo::create_remote(paths, &config_repo::Gh, owner.as_deref())?;
+            println!("remote:  {}", created.check.url);
+            print_warnings(&created.check.warnings);
+            created.sync
+        }
         ConfigCommand::Remote(RemoteCommand::Rm) => config_repo::remove_remote(paths)?,
     };
     let stopped = print_sync(paths, &record);
     anyhow::ensure!(status || !stopped, "the config sync is stopped");
     Ok(())
+}
+
+fn print_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// Asks a yes/no question on the terminal. Without one, fails, naming the flag that answers it.
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("{question} Pass --yes to confirm");
+    }
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// Prints the sync state and what came in. Returns whether the sync is stopped.

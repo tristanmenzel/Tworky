@@ -30,6 +30,7 @@
   import JobView from './JobView.svelte'
   import NewItemDialog from './NewItemDialog.svelte'
   import NewProjectDialog from './NewProjectDialog.svelte'
+  import FirstRunDialog from './FirstRunDialog.svelte'
   import ProjectDetail from './ProjectDetail.svelte'
   import Terminal from './Terminal.svelte'
   import { redrawTerminal } from './terminals'
@@ -130,6 +131,7 @@
   const pendingMemoryCount = $derived(pendingMemory.reduce((n, p) => n + p.changes.length, 0))
   const projectChangeCount = $derived(memoryChanges.find((p) => p.project === selectedProject)?.changes.length ?? 0)
   let addDialog = $state<'issue' | 'pull_request' | 'custom' | null>(null)
+  let firstRun = $state(false)
   let flashTimer: ReturnType<typeof setTimeout> | undefined
 
   const issues = $derived(new Map<string, Issue>((payload?.issues ?? []).map((i) => [i.id, i])))
@@ -725,6 +727,7 @@
   }
 
   onMount(() => {
+    api.configFirstRun().then((v) => (firstRun = v), showError)
     loadIssues(false)
     loadWorkers()
     loadItems()
@@ -1296,6 +1299,10 @@
 
   {#if newProjectOpen}
     <NewProjectDialog onCreated={projectCreated} onClose={() => (newProjectOpen = false)} />
+  {/if}
+
+  {#if firstRun}
+    <FirstRunDialog onDone={() => location.reload()} />
   {/if}
 
   <ConfirmDialog />

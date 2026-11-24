@@ -1338,6 +1338,79 @@ async fn dismiss_config_incoming() -> CmdResult<()> {
     blocking(|| config_repo::dismiss_incoming(&Paths::resolve().map_err(err)?).map_err(err)).await
 }
 
+#[tauri::command]
+async fn config_first_run() -> CmdResult<bool> {
+    blocking(|| {
+        Ok(config_repo::awaits_first_run(
+            &Paths::resolve().map_err(err)?,
+        ))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn start_fresh_config() -> CmdResult<()> {
+    blocking(|| {
+        let paths = Paths::resolve().map_err(err)?;
+        for line in config_repo::migrate(&paths).map_err(err)? {
+            eprintln!("{line}");
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn find_shared_configs() -> CmdResult<Vec<config_repo::SharedConfig>> {
+    blocking(|| config_repo::find_shared_configs(&config_repo::Gh).map_err(err)).await
+}
+
+#[tauri::command]
+async fn use_shared_config(remote: String, confirmed: bool) -> CmdResult<config_repo::Connected> {
+    blocking(move || {
+        let paths = Paths::resolve().map_err(err)?;
+        let connected =
+            config_repo::use_shared_config(&paths, &config_repo::Gh, &remote, confirmed)
+                .map_err(err)?;
+        wake_config_sync();
+        Ok(connected)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn config_github_owners() -> CmdResult<Vec<String>> {
+    blocking(|| tworky_core::github::viewer_owners().map_err(err)).await
+}
+
+#[tauri::command]
+async fn check_config_remote(remote: String) -> CmdResult<config_repo::RemoteCheck> {
+    blocking(move || config_repo::check_remote(&config_repo::Gh, &remote).map_err(err)).await
+}
+
+#[tauri::command]
+async fn set_config_remote(remote: String, confirmed: bool) -> CmdResult<config_repo::Connected> {
+    blocking(move || {
+        let paths = Paths::resolve().map_err(err)?;
+        config_repo::connect_remote(&paths, &config_repo::Gh, &remote, confirmed).map_err(err)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn create_config_remote(owner: Option<String>) -> CmdResult<config_repo::Connected> {
+    blocking(move || {
+        let paths = Paths::resolve().map_err(err)?;
+        config_repo::create_remote(&paths, &config_repo::Gh, owner.as_deref()).map_err(err)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn remove_config_remote() -> CmdResult<config_repo::SyncRecord> {
+    blocking(|| config_repo::remove_remote(&Paths::resolve().map_err(err)?).map_err(err)).await
+}
+
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// How long the config repo's `main` must stay put after a commit before it's synced, so a burst
@@ -1618,7 +1691,13 @@ fn main() {
         Ok(copied) => copied.iter().for_each(|line| eprintln!("{line}")),
         Err(e) => eprintln!("could not migrate work-app folders: {e:#}"),
     }
-    match tworky_core::config::Paths::resolve().and_then(|p| p.migrate_to_repo()) {
+    match tworky_core::config::Paths::resolve().and_then(|p| {
+        if config_repo::awaits_first_run(&p) {
+            Ok(vec![])
+        } else {
+            p.migrate_to_repo()
+        }
+    }) {
         Ok(lines) => lines.iter().for_each(|line| eprintln!("{line}")),
         Err(e) => eprintln!("{e:#}"),
     }
@@ -1682,6 +1761,15 @@ fn main() {
             sync_config_now,
             abort_config_sync,
             dismiss_config_incoming,
+            config_first_run,
+            start_fresh_config,
+            find_shared_configs,
+            use_shared_config,
+            config_github_owners,
+            check_config_remote,
+            set_config_remote,
+            create_config_remote,
+            remove_config_remote,
             clone_project_repo,
             find_project_clones,
             search_repos,

@@ -491,6 +491,41 @@ export interface KeepAwakeStatus {
 const showLoad = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)
 let showSeq = 0
 
+export type Visibility = 'public' | 'private' | 'internal' | 'unknown'
+
+export type ConfigSyncState =
+  | { kind: 'idle' | 'syncing' | 'no_remote' }
+  | { kind: 'conflict' | 'blocked_by_local' | 'held_in_sync_worktree'; files: string[] }
+  | { kind: 'held_back'; files: string[]; cause: 'invalid' | 'unrecognised' }
+  | { kind: 'error'; message: string }
+
+export interface ConfigSyncRecord {
+  state: ConfigSyncState
+  operation: 'rebase' | 'merge' | null
+  paused: boolean
+  last_sync: number | null
+  incoming: { hooks_or_services: string[]; guidance: string[]; dropped: string[] }
+  visibility: Visibility | null
+}
+
+export interface RemoteCheck {
+  url: string
+  visibility: Visibility
+  warnings: string[]
+  needs_confirmation: boolean
+}
+
+export interface ConfigConnected {
+  check: RemoteCheck
+  sync: ConfigSyncRecord
+}
+
+export interface SharedConfig {
+  owner: string
+  url: string
+  visibility: Visibility
+}
+
 export const api = {
   updateStatus: () => invoke<VersionInfo>('update_status'),
   updateProgress: () => invoke<UpdateProgress>('update_progress'),
@@ -586,5 +621,16 @@ export const api = {
   dismissHandover: (id: string) => invoke<void>('dismiss_handover', { id }),
   dismissAccountRequest: (id: string, name: string) => invoke<void>('dismiss_account_request', { id, name }),
   dismissAccountRequests: (id: string) => invoke<void>('dismiss_account_requests', { id }),
+  configFirstRun: () => invoke<boolean>('config_first_run'),
+  startFreshConfig: () => invoke<void>('start_fresh_config'),
+  findSharedConfigs: () => invoke<SharedConfig[]>('find_shared_configs'),
+  useSharedConfig: (remote: string, confirmed: boolean) =>
+    invoke<ConfigConnected>('use_shared_config', { remote, confirmed }),
+  configGithubOwners: () => invoke<string[]>('config_github_owners'),
+  checkConfigRemote: (remote: string) => invoke<RemoteCheck>('check_config_remote', { remote }),
+  setConfigRemote: (remote: string, confirmed: boolean) =>
+    invoke<ConfigConnected>('set_config_remote', { remote, confirmed }),
+  createConfigRemote: (owner: string | null) => invoke<ConfigConnected>('create_config_remote', { owner }),
+  removeConfigRemote: () => invoke<ConfigSyncRecord>('remove_config_remote'),
   openProjectConfig: (name: string) => invoke<void>('open_project_config', { name }),
 }
