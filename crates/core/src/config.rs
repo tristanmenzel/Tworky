@@ -162,7 +162,10 @@ pub fn notify_issues_changed(paths: &Paths) -> Result<()> {
     let temp = marker.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&temp, stamp.to_string())
         .with_context(|| format!("writing {}", temp.display()))?;
-    std::fs::rename(&temp, &marker).with_context(|| format!("replacing {}", marker.display()))
+    std::fs::rename(&temp, &marker).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        anyhow::Error::new(e).context(format!("replacing {}", marker.display()))
+    })
 }
 
 /// A repo for a project made from the Repositories picker.

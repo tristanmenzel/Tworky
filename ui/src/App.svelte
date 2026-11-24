@@ -629,8 +629,8 @@
         payload = loaded
       }
     } finally {
-      // The running refresh read GitHub before the write and will store that in the backend's index.
-      if (overlapped) loadIssues(true, false)
+      // A refresh that overlapped the write may have read GitHub before it and will store that in the backend's index.
+      if (overlapped || issuesRequest > request || issuesRunning !== null) loadIssues(true, false)
     }
   }
 

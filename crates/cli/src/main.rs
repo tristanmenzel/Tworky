@@ -1068,7 +1068,7 @@ fn subtask(cmd: SubtaskCommand) -> Result<()> {
         ),
         SubtaskCommand::Ls { parent, json } => subtask_ls(&ws, parent, json),
         SubtaskCommand::Assign { subtask } => {
-            let parent = load_parent(&ws, subtask.parent)?;
+            let parent = load_write_parent(&ws, subtask.parent)?;
             let target = load_target(&ws, &parent, &subtask.reference)?;
             github::assign_to_me(&target.repo, target.number)?;
             notify_issues_changed(&ws);
@@ -1076,17 +1076,18 @@ fn subtask(cmd: SubtaskCommand) -> Result<()> {
             Ok(())
         }
         SubtaskCommand::Status { subtask, status } => {
-            let parent = load_parent(&ws, subtask.parent)?;
+            let parent = load_write_parent(&ws, subtask.parent)?;
             let board = status_board(&ws, &parent.issue)?;
             let option = board.option(&status)?;
             let mut target = load_target(&ws, &parent, &subtask.reference)?;
-            github::set_board_option(&mut target, &board, option)?;
+            let set = github::set_board_option(&mut target, &board, option);
             notify_issues_changed(&ws);
+            set?;
             println!("{} Status: {}", parent.label(&target), option.name);
             Ok(())
         }
         SubtaskCommand::Start { subtask } => {
-            let parent = load_parent(&ws, subtask.parent)?;
+            let parent = load_write_parent(&ws, subtask.parent)?;
             let board = status_board(&ws, &parent.issue)?;
             let option = board.option("In Progress")?;
             let mut target = load_target(&ws, &parent, &subtask.reference)?;
@@ -1141,6 +1142,59 @@ fn load_parent(ws: &Workspace, args: ParentArgs) -> Result<SubtaskParent> {
         index: found.index,
         boards_loaded: found.boards_loaded,
     })
+}
+
+fn load_write_parent(ws: &Workspace, args: ParentArgs) -> Result<SubtaskParent> {
+    let env_worker = std::env::var("TW_WORKER_ID")
+        .ok()
+        .filter(|id| !id.is_empty());
+    let arg_worker = args.worker.clone();
+    let worker_issue = match &env_worker {
+        Some(id) => ws.state.get(id)?.context("worker not found")?.issue,
+        None => None,
+    };
+    let parent = load_parent(ws, args)?;
+    ensure_write_scope(
+        env_worker.as_deref(),
+        arg_worker.as_deref(),
+        worker_issue.as_ref(),
+        &parent.issue,
+    )?;
+    ws.config
+        .project_for_repo(&parent.issue.repo)
+        .with_context(|| format!("no project config matches {}", parent.issue.repo))?;
+    Ok(parent)
+}
+
+/// Inside a worker, subtask writes run without a prompt, so they may only touch the worker's own issue's sub-issues.
+fn ensure_write_scope(
+    env_worker: Option<&str>,
+    arg_worker: Option<&str>,
+    worker_issue: Option<&tworky_core::state::IssueRef>,
+    parent: &tworky_core::hierarchy::Issue,
+) -> Result<()> {
+    let Some(env_worker) = env_worker else {
+        return Ok(());
+    };
+    if let Some(arg) = arg_worker.filter(|arg| *arg != env_worker) {
+        anyhow::bail!(
+            "inside worker {env_worker}, this command acts only on its own issue's subtasks; drop -w {arg}"
+        );
+    }
+    let issue = worker_issue.with_context(|| {
+        format!("worker {env_worker} has no issue, so it can't change subtasks")
+    })?;
+    let own = issue.id == parent.id
+        || (issue.repo.eq_ignore_ascii_case(&parent.repo) && issue.number == parent.number);
+    anyhow::ensure!(
+        own,
+        "inside worker {env_worker}, this command acts only on subtasks of {}#{}, not {}#{}",
+        issue.repo,
+        issue.number,
+        parent.repo,
+        parent.number
+    );
+    Ok(())
 }
 
 fn repo_owner(repo: &str) -> &str {
@@ -1331,10 +1385,17 @@ fn subtask_ls(ws: &Workspace, args: ParentArgs, json: bool) -> Result<()> {
         .project_for_repo(&parent.issue.repo)
         .and_then(|p| p.status_board);
     let board = match board_number {
-        Some(number) if parent.boards_loaded => Some(github::resolve_board(
-            repo_owner(&parent.issue.repo),
-            number,
-        )?),
+        Some(number) if parent.boards_loaded => {
+            match github::resolve_board(repo_owner(&parent.issue.repo), number) {
+                Ok(board) => Some(board),
+                Err(e) => {
+                    eprintln!(
+                        "warning: showing every board's Status, because board {number} couldn't be read: {e:#}"
+                    );
+                    None
+                }
+            }
+        }
         _ => None,
     };
     let rows = subtask_rows(
@@ -2016,6 +2077,32 @@ mod tests {
             sub_issues_completed: 0,
             boards: vec![],
         }
+    }
+
+    fn issue_ref(id: &str, repo: &str, number: u64) -> tworky_core::state::IssueRef {
+        tworky_core::state::IssueRef {
+            id: id.into(),
+            number,
+            repo: repo.into(),
+            title: format!("Issue {number}"),
+            url: format!("https://github.com/{repo}/issues/{number}"),
+        }
+    }
+
+    #[test]
+    fn subtask_writes_inside_a_worker_act_only_on_its_issue() {
+        let own = issue_ref("I_1", "acme/api", 1);
+        let parent = issue("I_1", "acme/api", 1, None);
+        let other = issue("I_2", "acme/api", 2, None);
+        let w = Some("acme-1");
+        assert!(ensure_write_scope(w, w, Some(&own), &parent).is_ok());
+        let err = ensure_write_scope(w, w, Some(&own), &other).unwrap_err();
+        assert!(err.to_string().contains("not acme/api#2"), "{err}");
+        let err = ensure_write_scope(w, Some("acme-2"), Some(&own), &parent).unwrap_err();
+        assert!(err.to_string().contains("drop -w acme-2"), "{err}");
+        assert!(ensure_write_scope(w, w, None, &parent).is_err());
+        assert!(ensure_write_scope(None, None, None, &other).is_ok());
+        assert!(ensure_write_scope(None, Some("acme-2"), None, &other).is_ok());
     }
 
     #[test]
