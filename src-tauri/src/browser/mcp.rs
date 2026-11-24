@@ -25,6 +25,7 @@ use tworky_browser::diagnostics::{
 };
 use tworky_browser::interact::{self, Button, KeyPress, Target, WaitCondition};
 use tworky_browser::snapshot::parse_ref;
+use tworky_browser::viewport::{MAX_SIZE, MIN_SIZE, Viewport};
 use tworky_core::activity::{self, AccountRequest, Handover};
 use tworky_core::config::{AccountConfig, Config, Paths, ServiceConfig};
 use tworky_core::ports::PortMap;
@@ -246,6 +247,62 @@ struct OpenTabArgs {
     account: Option<String>,
     /// Page to open. Defaults to the account's start URL on this worker's ports. Required without account.
     url: Option<String>,
+    #[serde(flatten)]
+    viewport: ViewportArgs,
+}
+
+#[derive(Default, Deserialize, JsonSchema)]
+struct ViewportArgs {
+    /// A breakpoint preset: "fit" (the user's pane, the default for desktop accounts), "phone" (393x852, mobile, the default for mobile accounts), "tablet" (820x1180, mobile), "laptop" (1280x800) or "desktop" (1440x900). Give either preset, or width and height.
+    preset: Option<String>,
+    /// Viewport width in CSS pixels, 200 to 3840. Use with height instead of preset.
+    width: Option<u32>,
+    /// Viewport height in CSS pixels, 200 to 3840. Use with width instead of preset.
+    height: Option<u32>,
+    /// Emulate a phone: touch input, a phone user agent and a device pixel ratio of 3. With width and height it defaults to false; with a preset it overrides the preset's own. Changing it reloads the page.
+    mobile: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetViewportArgs {
+    /// Tab id returned by open_tab or list_tabs.
+    tab: u64,
+    #[serde(flatten)]
+    viewport: ViewportArgs,
+}
+
+fn viewport_from(args: &ViewportArgs) -> Result<Option<Viewport>, String> {
+    let sized = args.width.is_some() || args.height.is_some();
+    if let Some(preset) = &args.preset {
+        if sized {
+            return Err("give either preset, or width and height, not both".into());
+        }
+        let viewport = Viewport::preset(preset)?;
+        return match (viewport, args.mobile) {
+            (_, None) => Ok(Some(viewport)),
+            (Viewport::Fit, Some(_)) => Err(
+                "the fit preset takes no mobile flag; give width and height to emulate a phone"
+                    .into(),
+            ),
+            (Viewport::Fixed { width, height, .. }, Some(mobile)) => Ok(Some(Viewport::Fixed {
+                width,
+                height,
+                mobile,
+            })),
+        };
+    }
+    match (args.width, args.height) {
+        (Some(width), Some(height)) => {
+            Viewport::fixed(width, height, args.mobile.unwrap_or(false)).map(Some)
+        }
+        (Some(_), None) | (None, Some(_)) => Err(format!(
+            "give both width and height ({MIN_SIZE} to {MAX_SIZE} CSS pixels), or a preset"
+        )),
+        (None, None) if args.mobile.is_some() => {
+            Err("mobile needs a preset, or width and height".into())
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -665,7 +722,7 @@ fn wait_condition(args: &WaitForArgs) -> Result<WaitCondition, String> {
 #[tool_router]
 impl TworkyMcp {
     #[tool(
-        description = "List the test accounts of this worker's project: name, username, start URL (on this worker's ports), whether it is a mobile account, and whether it has a stored password. Each account gets its own isolated, persistent browser session for this worker. Call this first to find the account to pass to open_tab."
+        description = "List the test accounts of this worker's project: name, username, start URL (on this worker's ports), whether it is a mobile account (its tabs open at the phone viewport by default), and whether it has a stored password. Each account gets its own isolated, persistent browser session for this worker. Call this first to find the account to pass to open_tab."
     )]
     async fn list_accounts(
         &self,
@@ -707,7 +764,7 @@ impl TworkyMcp {
     }
 
     #[tool(
-        description = "Open a new browser tab signed in as one of this worker's accounts, load the page and return its tab id with the page state. The tab appears beside this session's terminal in the user's Tworky window without taking focus, and reuses the account's existing session (cookies, logins) for this worker. Opens the account's start URL unless url is given. Omit account for an anonymous tab, signed in as nobody, on a fresh browser profile that is discarded when the tab closes; it needs url (list_services gives the URLs). If the project has a service serving that URL's port (a dev server) and it isn't running, it is started first and waited for, so don't start it yourself."
+        description = "Open a new browser tab signed in as one of this worker's accounts, load the page and return its tab id with the page state. The tab appears beside this session's terminal in the user's Tworky window without taking focus, and reuses the account's existing session (cookies, logins) for this worker. Opens the account's start URL unless url is given. Give preset, or width and height, to open it at that viewport (a breakpoint), set before the first page loads; it defaults to the account's (phone for mobile accounts, else fit). Omit account for an anonymous tab, signed in as nobody, on a fresh browser profile that is discarded when the tab closes; it needs url (list_services gives the URLs). If the project has a service serving that URL's port (a dev server) and it isn't running, it is started first and waited for, so don't start it yourself."
     )]
     async fn open_tab(
         &self,
@@ -717,7 +774,9 @@ impl TworkyMcp {
         let result = async {
             let worker = self.worker(&ctx)?;
             super::check_open(args.account.as_deref(), args.url.as_deref())?;
-            let tab = super::open_tab(&self.app, &worker, args.account.as_deref(), None).await?;
+            let viewport = viewport_from(&args.viewport)?;
+            let tab =
+                super::open_tab(&self.app, &worker, args.account.as_deref(), viewport).await?;
             let cdp = host::TabCdp::new(&self.app, tab.id);
             let target = super::target_url(&tab, args.url);
             let (services, service_error) =
@@ -737,6 +796,7 @@ impl TworkyMcp {
             let mut state = page(&cdp, &tab).navigate(&target).await?;
             state["tab"] = tab.id.into();
             state["account"] = tab.account().map(|a| a.name).into();
+            state["viewport"] = json!(tab.viewport());
             if let Some(e) = service_error {
                 state["service_error"] = e.into();
             }
@@ -835,7 +895,7 @@ impl TworkyMcp {
     }
 
     #[tool(
-        description = "List this worker's open browser tabs, including ones the user opened, with their tab id, account (null for an anonymous tab), current URL and whether a login form for the account is showing. Tab ids are required by every other tab tool."
+        description = "List this worker's open browser tabs, including ones the user opened, with their tab id, account (null for an anonymous tab), current URL, viewport and whether a login form for the account is showing. Tab ids are required by every other tab tool."
     )]
     async fn list_tabs(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
         let result = self.worker(&ctx).map(|worker| {
@@ -850,6 +910,7 @@ impl TworkyMcp {
                         "tab": view.id,
                         "account": view.account,
                         "url": view.url,
+                        "viewport": tab.viewport(),
                         "loading": view.loading,
                         "login_form": view.can_sign_in,
                     })
@@ -873,6 +934,30 @@ impl TworkyMcp {
             super::load_page(&self.app, &tab, Some(&args.url))
                 .await
                 .map(Reply::Json)
+        }
+        .await;
+        respond(result)
+    }
+
+    #[tool(
+        description = "Set the tab's viewport (a breakpoint) to test responsive layouts: a preset, or an exact width and height, optionally with mobile emulation. The page is laid out at exactly width x height and shown scaled to fit the user's pane; the \"fit\" preset returns to the pane's own size. The user sees the viewport, and can change it, from the tab's address bar. Screenshots capture the viewport at its CSS size. Changing mobile reloads the page. Returns the page state with the viewport."
+    )]
+    async fn set_viewport(
+        &self,
+        Parameters(args): Parameters<SetViewportArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = async {
+            let viewport = viewport_from(&args.viewport)?
+                .ok_or("give preset, or width and height (with mobile if wanted)")?;
+            let (tab, cdp) = self.tab(&ctx, args.tab)?;
+            let notes = super::set_viewport(&self.app, &tab, viewport).await?;
+            let mut state = page(&cdp, &tab).state(false).await;
+            state["viewport"] = json!(tab.viewport());
+            if !notes.is_empty() {
+                state["notes"] = notes.into();
+            }
+            Ok(Reply::Json(state))
         }
         .await;
         respond(result)
@@ -945,7 +1030,7 @@ impl TworkyMcp {
     }
 
     #[tool(
-        description = "Take a PNG screenshot of the tab's page. Captures the visible viewport by default, or the whole scrollable page when full_page is true. Mobile accounts are captured at phone size."
+        description = "Take a PNG screenshot of the tab's page. Captures the visible viewport by default, or the whole scrollable page when full_page is true. Captures the tab's viewport at its CSS pixel size (e.g. 393x852 for phone), whatever the size of the user's pane."
     )]
     async fn screenshot(
         &self,
@@ -1348,7 +1433,7 @@ impl TworkyMcp {
 impl ServerHandler for TworkyMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Drives browser tabs in Tworky, beside this session's terminal, signed in as this worker's project test accounts. Each account has its own isolated browser session per worker, and start URLs point at this worker's dev server ports. Call list_accounts, then open_tab to get a tab id, then use navigate, read_page, screenshot and sign_in with that id. To interact, call snapshot to get element refs, then click, hover, drag, type, press_key, scroll or select_option with a ref, and wait_for to wait for the result. open_tab with no account gives an anonymous tab, signed in as nobody, for checking what a visitor sees. The user sees the same tabs and may open their own; list_tabs shows them all.\n\nTo test a UI change: open_tab as the account the change is for, which starts the dev server its page needs if the project defines it as a service (list_services; start others with start_service). When the project defines no service for a dev server you need, you can run it yourself, but tell the user they can't start or see it as a service, and suggest adding [[services]] in the project's setup session, sign_in if the page asks, then check the change with snapshot and screenshot, fixing what you find. When it works, leave tabs open on the pages to check and call hand_over with the steps for the user to accept it.
+            "Drives browser tabs in Tworky, beside this session's terminal, signed in as this worker's project test accounts. Each account has its own isolated browser session per worker, and start URLs point at this worker's dev server ports. Call list_accounts, then open_tab to get a tab id, then use navigate, read_page, screenshot and sign_in with that id. To interact, call snapshot to get element refs, then click, hover, drag, type, press_key, scroll or select_option with a ref, and wait_for to wait for the result. open_tab with no account gives an anonymous tab, signed in as nobody, for checking what a visitor sees. To test responsive layouts at breakpoints, call set_viewport with a preset or a width and height (or give them to open_tab). The user sees the same tabs and may open their own; list_tabs shows them all.\n\nTo test a UI change: open_tab as the account the change is for, which starts the dev server its page needs if the project defines it as a service (list_services; start others with start_service). When the project defines no service for a dev server you need, you can run it yourself, but tell the user they can't start or see it as a service, and suggest adding [[services]] in the project's setup session, sign_in if the page asks, then check the change with snapshot and screenshot, fixing what you find. When it works, leave tabs open on the pages to check and call hand_over with the steps for the user to accept it.
 
 If a page looks blank or stuck, check read_console and read_network before anything else; if both are empty, tell the user.
 
@@ -1428,6 +1513,126 @@ mod tests {
         let error = crate::browser::check_open(neither.account.as_deref(), neither.url.as_deref())
             .unwrap_err();
         assert!(error.contains("url"), "{error}");
+    }
+
+    fn viewport_of(json: Value) -> Result<Option<Viewport>, String> {
+        viewport_from(&serde_json::from_value::<ViewportArgs>(json).unwrap())
+    }
+
+    #[test]
+    fn no_viewport_fields_keep_the_default() {
+        assert_eq!(viewport_of(json!({})), Ok(None));
+    }
+
+    #[test]
+    fn a_preset_gives_its_viewport() {
+        use tworky_browser::viewport::{DESKTOP, PHONE};
+        assert_eq!(
+            viewport_of(json!({ "preset": "fit" })),
+            Ok(Some(Viewport::Fit))
+        );
+        assert_eq!(viewport_of(json!({ "preset": "phone" })), Ok(Some(PHONE)));
+        assert_eq!(
+            viewport_of(json!({ "preset": "Desktop" })),
+            Ok(Some(DESKTOP))
+        );
+        let error = viewport_of(json!({ "preset": "watch" })).unwrap_err();
+        assert!(error.contains("phone"), "{error}");
+    }
+
+    #[test]
+    fn mobile_overrides_a_presets_flag() {
+        assert_eq!(
+            viewport_of(json!({ "preset": "phone", "mobile": false })),
+            Ok(Some(Viewport::Fixed {
+                width: 393,
+                height: 852,
+                mobile: false
+            }))
+        );
+        assert_eq!(
+            viewport_of(json!({ "preset": "laptop", "mobile": true })),
+            Ok(Some(Viewport::Fixed {
+                width: 1280,
+                height: 800,
+                mobile: true
+            }))
+        );
+        assert!(viewport_of(json!({ "preset": "fit", "mobile": true })).is_err());
+    }
+
+    #[test]
+    fn width_and_height_give_a_fixed_viewport() {
+        assert_eq!(
+            viewport_of(json!({ "width": 1024, "height": 768 })),
+            Ok(Some(Viewport::Fixed {
+                width: 1024,
+                height: 768,
+                mobile: false
+            }))
+        );
+        assert_eq!(
+            viewport_of(json!({ "width": 360, "height": 640, "mobile": true })),
+            Ok(Some(Viewport::Fixed {
+                width: 360,
+                height: 640,
+                mobile: true
+            }))
+        );
+    }
+
+    #[test]
+    fn a_preset_with_a_size_is_refused() {
+        assert!(viewport_of(json!({ "preset": "phone", "width": 400 })).is_err());
+        assert!(viewport_of(json!({ "preset": "fit", "width": 400, "height": 800 })).is_err());
+    }
+
+    #[test]
+    fn one_side_alone_is_refused() {
+        assert!(viewport_of(json!({ "width": 400 })).is_err());
+        assert!(viewport_of(json!({ "height": 800, "mobile": true })).is_err());
+    }
+
+    #[test]
+    fn mobile_alone_is_refused() {
+        assert!(viewport_of(json!({ "mobile": true })).is_err());
+    }
+
+    #[test]
+    fn sizes_out_of_range_are_refused_with_the_range() {
+        for (width, height) in [(199, 800), (400, 3841)] {
+            let error = viewport_of(json!({ "width": width, "height": height })).unwrap_err();
+            assert!(error.contains("200") && error.contains("3840"), "{error}");
+        }
+        assert!(viewport_of(json!({ "width": 200, "height": 3840 })).is_ok());
+    }
+
+    #[test]
+    fn viewport_fields_flatten_into_the_tool_args() {
+        let open = serde_json::from_value::<OpenTabArgs>(
+            json!({ "account": "Tester 1", "preset": "tablet" }),
+        )
+        .unwrap();
+        assert_eq!(open.viewport.preset.as_deref(), Some("tablet"));
+        let set = serde_json::from_value::<SetViewportArgs>(
+            json!({ "tab": 3, "width": 800, "height": 600, "mobile": true }),
+        )
+        .unwrap();
+        assert_eq!(set.tab, 3);
+        assert_eq!(
+            viewport_from(&set.viewport),
+            Ok(Some(Viewport::Fixed {
+                width: 800,
+                height: 600,
+                mobile: true
+            }))
+        );
+        let schema = serde_json::to_value(schemars::schema_for!(SetViewportArgs)).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        for name in ["tab", "preset", "width", "height", "mobile"] {
+            assert!(properties.contains_key(name), "{schema}");
+        }
+        assert_eq!(schema["required"], json!(["tab"]));
     }
 
     #[test]
