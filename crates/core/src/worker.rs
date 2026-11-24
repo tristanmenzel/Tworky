@@ -1511,7 +1511,10 @@ pub fn worker_claude_md(
     push(
         &mut md,
         "\n## Writing to GitHub\n\n\
-         `tw subtask add` runs without a prompt, so agree subtasks with the user before adding them. Creating \
+         `tw subtask ls` lists the issue's subtasks. `tw subtask assign <n>` assigns one to the user, \
+         `tw subtask status <n> \"<status>\"` sets its Status on the project's board and `tw subtask start <n>` \
+         does both with In Progress; use these rather than `gh`. They and `tw subtask add` run without a prompt, \
+         so agree subtasks with the user before adding them. Creating \
          issues and posting comments or reviews show the user a permission prompt with the exact command, even in \
          auto mode, so the user approves each one there. Use these commands, which the prompt recognises, rather \
          than `gh api`:\n\n\
