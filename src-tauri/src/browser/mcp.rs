@@ -234,7 +234,9 @@ impl TworkyMcp {
     ) -> Result<Reply, String> {
         let (tab, cdp) = self.tab(ctx, id)?;
         let page = page(&cdp, &tab);
-        page.act(action(&cdp, tab.mobile())).await.map(Reply::Json)
+        page.act(action(&cdp, page.viewport.mobile()))
+            .await
+            .map(Reply::Json)
     }
 }
 

@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tworky_browser::cookies;
 use tworky_browser::login::{self, Account, LoginField};
 use tworky_browser::page::{Page, PageEvents};
+use tworky_browser::viewport::{self, Viewport};
 use tworky_core::config::AccountConfig;
 use tworky_core::services::Outcome;
 use tworky_core::state::WorkerRecord;
@@ -393,7 +394,11 @@ fn page<'a>(cdp: &'a host::TabCdp, tab: &'a Tab) -> Page<'a, host::TabCdp> {
     Page {
         cdp,
         events: &tab.events,
-        mobile: tab.mobile(),
+        viewport: if tab.mobile() {
+            viewport::PHONE
+        } else {
+            Viewport::Fit
+        },
     }
 }
 
@@ -551,7 +556,11 @@ async fn open_tab_as(
     });
     let created = host::create(app, &tab, &profile).await;
     let prepared = match created {
-        Ok(()) => page(&host::TabCdp::new(app, tab.id), &tab).prepare().await,
+        Ok(()) => {
+            page(&host::TabCdp::new(app, tab.id), &tab)
+                .prepare(viewport::DEFAULT_FRAME_WIDTH)
+                .await
+        }
         Err(e) => Err(e),
     };
     if let Err(e) = prepared {

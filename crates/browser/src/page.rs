@@ -7,12 +7,12 @@ use tokio::sync::watch;
 use url::Url;
 
 use crate::cdp::{self, Cdp, evaluate};
-use crate::device;
 use crate::diagnostics::{Diagnostics, Part, cut_url, redact};
 use crate::interact::{self, WaitCondition};
 use crate::login::{self, Account, LoginField, LoginMessage};
 use crate::snapshot;
 use crate::urls::normalize_url;
+use crate::viewport::{self, Viewport};
 
 pub const LOAD_WAIT: Duration = Duration::from_secs(15);
 pub const SUBMIT_WAIT: Duration = Duration::from_secs(8);
@@ -160,7 +160,7 @@ impl PageEvents {
 pub struct Page<'a, C: Cdp> {
     pub cdp: &'a C,
     pub events: &'a PageEvents,
-    pub mobile: bool,
+    pub viewport: Viewport,
 }
 
 fn names(list: &Value, key: Option<&str>) -> Value {
@@ -198,12 +198,13 @@ impl<C: Cdp> Page<'_, C> {
     }
 
     /// Prepares a new tab before its first navigation: the login detector, diagnostics, and
-    /// mobile emulation for a mobile account.
-    pub async fn prepare(&self) -> Result<(), String> {
+    /// its viewport, which must be set first or the first page loads with the desktop user
+    /// agent. A fresh view has no overrides, so Fit sends nothing.
+    pub async fn prepare(&self, frame_width: f64) -> Result<(), String> {
         login::install_detector(self.cdp).await?;
         self.enable_diagnostics().await;
-        if self.mobile {
-            device::emulate(self.cdp).await?;
+        if self.viewport != Viewport::Fit {
+            viewport::apply(self.cdp, &self.viewport, frame_width, false).await?;
         }
         Ok(())
     }
@@ -471,13 +472,15 @@ impl<C: Cdp> Page<'_, C> {
         Ok((caption, text))
     }
 
-    /// A base64 PNG, at CSS pixel scale even on a mobile page.
+    /// A base64 PNG at CSS pixel scale, on HiDPI displays and mobile pages too.
     pub async fn screenshot(&self, full_page: bool) -> Result<(Value, String), String> {
-        let scale = if self.mobile {
-            1.0 / device::SCALE_FACTOR
-        } else {
-            1.0
-        };
+        let ratio = evaluate(self.cdp, "window.devicePixelRatio")
+            .await
+            .ok()
+            .and_then(|r| r.as_f64())
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .unwrap_or(1.0);
+        let scale = 1.0 / ratio;
         let png = cdp::screenshot(self.cdp, full_page, scale).await?;
         Ok((self.state(false).await, png))
     }
@@ -541,7 +544,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let host = events.clone();
         let loader = tokio::spawn(async move {
@@ -567,7 +570,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let state = page.reload().await.unwrap();
         assert_eq!(state["still_loading"], true);
@@ -580,7 +583,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         assert!(page.navigate("file:///etc/passwd").await.is_err());
         assert!(cdp.methods().is_empty());
@@ -594,7 +597,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         assert!(page.go_back().await.is_err());
     }
@@ -607,7 +610,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let result = page
             .act(async {
@@ -633,7 +636,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let error = page
             .sign_in(
@@ -657,7 +660,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let outcome = page
             .sign_in(&account(), true, || true, || Ok(Some("s3cret".into())))
@@ -682,7 +685,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let error = page
             .sign_in(&account(), true, || true, || Ok(None))
@@ -711,7 +714,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let state = page
             .wait_for(&WaitCondition::Text("Done".into()), Duration::from_secs(1))
@@ -729,7 +732,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let read = page.read_page(3).await.unwrap();
         assert_eq!(read["text"], "abc");
@@ -767,7 +770,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let listing = page.list_storage().await;
         assert_eq!(
@@ -799,7 +802,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         page.list_storage().await;
         assert_eq!(
@@ -832,7 +835,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let listing = page.list_storage().await;
         assert_eq!(listing["local_storage"], Value::Null);
@@ -857,7 +860,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let listing = page.list_storage().await;
         assert_eq!(listing["cookies"], json!(["sid", "pref"]));
@@ -893,7 +896,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         let started = tokio::time::Instant::now();
         let listing = page.list_storage().await;
@@ -920,7 +923,7 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
         page.list_storage().await;
         assert_eq!(cdp.params("Network.getCookies"), [json!({})]);
@@ -947,9 +950,9 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
-        page.prepare().await.unwrap();
+        page.prepare(viewport::DEFAULT_FRAME_WIDTH).await.unwrap();
         assert!(cdp.methods().contains(&"Log.enable".to_string()));
         assert_eq!(
             cdp.params("Network.enable"),
@@ -959,6 +962,85 @@ mod tests {
         for part in [Part::Console, Part::Network, Part::MainFrame] {
             assert!(notes(&events, part).is_empty());
         }
+        assert!(!cdp.methods().iter().any(|m| m.starts_with("Emulation.")));
+    }
+
+    #[tokio::test]
+    async fn prepare_emulates_a_phone_before_the_first_navigation() {
+        let events = PageEvents::default();
+        let cdp = FakeCdp::default();
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            viewport: viewport::PHONE,
+        };
+        page.prepare(viewport::DEFAULT_FRAME_WIDTH).await.unwrap();
+        assert_eq!(
+            cdp.params("Emulation.setDeviceMetricsOverride"),
+            [json!({
+                "width": 393,
+                "height": 852,
+                "deviceScaleFactor": 3.0,
+                "mobile": true,
+                "screenWidth": 393,
+                "screenHeight": 852,
+                "screenOrientation": { "type": "portraitPrimary", "angle": 0 },
+                "scale": 1.0,
+                "dontSetVisibleSize": true,
+            })]
+        );
+        assert_eq!(
+            cdp.params("Emulation.setTouchEmulationEnabled"),
+            [json!({ "enabled": true, "maxTouchPoints": 5 })]
+        );
+        assert_eq!(
+            cdp.params("Emulation.setUserAgentOverride")[0]["platform"],
+            "iPhone"
+        );
+        assert!(!cdp.methods().contains(&"Page.navigate".to_string()));
+    }
+
+    #[tokio::test]
+    async fn screenshots_are_scaled_to_css_pixels() {
+        let events = PageEvents::default();
+        let cdp = FakeCdp::answering(|method, params| {
+            Ok(match method {
+                "Runtime.evaluate" if params["expression"] == "window.devicePixelRatio" => {
+                    json!({ "result": { "value": 1.5 } })
+                }
+                "Page.getLayoutMetrics" => json!({ "cssVisualViewport": {
+                    "pageX": 0, "pageY": 0, "clientWidth": 1440, "clientHeight": 900 } }),
+                _ => json!({ "data": "png" }),
+            })
+        });
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            viewport: viewport::DESKTOP,
+        };
+        page.screenshot(false).await.unwrap();
+        let clip = &cdp.params("Page.captureScreenshot")[0]["clip"];
+        assert_eq!(clip["scale"], 1.0 / 1.5);
+        assert_eq!(clip["width"], 1440.0);
+    }
+
+    #[tokio::test]
+    async fn screenshots_assume_a_ratio_of_one_when_the_page_does_not_say() {
+        let events = PageEvents::default();
+        let cdp = FakeCdp::answering(|method, _| match method {
+            "Runtime.evaluate" => Err("no".into()),
+            _ => Ok(json!({ "data": "png" })),
+        });
+        let page = Page {
+            cdp: &cdp,
+            events: &events,
+            viewport: Viewport::Fit,
+        };
+        page.screenshot(false).await.unwrap();
+        assert_eq!(
+            cdp.params("Page.captureScreenshot"),
+            [json!({ "format": "png" })]
+        );
     }
 
     #[tokio::test]
@@ -973,9 +1055,9 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
-        page.prepare().await.unwrap();
+        page.prepare(viewport::DEFAULT_FRAME_WIDTH).await.unwrap();
         let calls = cdp.params("Network.enable");
         assert_eq!(calls.len(), 2);
         assert_eq!(
@@ -1001,9 +1083,9 @@ mod tests {
         let page = Page {
             cdp: &cdp,
             events: &events,
-            mobile: false,
+            viewport: Viewport::Fit,
         };
-        page.prepare().await.unwrap();
+        page.prepare(viewport::DEFAULT_FRAME_WIDTH).await.unwrap();
         assert!(
             cdp.methods()
                 .contains(&"Page.addScriptToEvaluateOnNewDocument".to_string())
