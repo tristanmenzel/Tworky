@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { flushSync } from 'svelte'
   import { api, type BrowserTabView, type Viewport } from './api'
   import { confirmOverBrowser } from './overlay.svelte'
   import PasswordDialog from './PasswordDialog.svelte'
@@ -50,7 +51,19 @@
   }
 
   function syncBounds() {
-    if (!visible || host.clientWidth === 0) return
+    if (!visible) return
+    if (fixedWidth) {
+      const width = body.clientWidth
+      const height = body.clientHeight
+      if (width === 0) return
+      if (width !== bodyWidth || height !== bodyHeight) {
+        flushSync(() => {
+          bodyWidth = width
+          bodyHeight = height
+        })
+      }
+    }
+    if (host.clientWidth === 0) return
     const r = host.getBoundingClientRect()
     void call(() => api.browserBounds(tab.id, { x: r.left, y: r.top, width: r.width, height: r.height }))
   }

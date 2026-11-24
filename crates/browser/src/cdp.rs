@@ -101,9 +101,10 @@ fn positive(ratio: f64) -> Option<f64> {
 /// A base64 PNG of the viewport, or of the whole page, in CSS pixels.
 pub async fn screenshot(cdp: &impl Cdp, full_page: bool) -> Result<String, String> {
     let metrics = cdp.call("Page.getLayoutMetrics", json!({})).await;
-    let ratio = match metrics.as_ref().ok().and_then(device_pixel_ratio) {
-        Some(ratio) => Some(ratio),
-        None => evaluate(cdp, "window.devicePixelRatio")
+    let ratio = match metrics.as_ref().map(device_pixel_ratio) {
+        Err(_) => None,
+        Ok(Some(ratio)) => Some(ratio),
+        Ok(None) => evaluate(cdp, "window.devicePixelRatio")
             .await
             .ok()
             .and_then(|ratio| ratio.as_f64())
@@ -288,6 +289,21 @@ mod tests {
                 [json!({ "format": "png" })]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn screenshots_are_unclipped_when_the_layout_metrics_fail() {
+        let cdp = FakeCdp::answering(|method, _| match method {
+            "Page.getLayoutMetrics" => Err("no".into()),
+            "Runtime.evaluate" => Ok(json!({ "result": { "value": 2 } })),
+            _ => Ok(json!({ "data": "png" })),
+        });
+        assert_eq!(screenshot(&cdp, false).await.unwrap(), "png");
+        assert!(cdp.params("Runtime.evaluate").is_empty());
+        assert_eq!(
+            cdp.params("Page.captureScreenshot"),
+            [json!({ "format": "png" })]
+        );
     }
 
     #[tokio::test]
