@@ -682,7 +682,7 @@ fn config(paths: &Paths, cmd: ConfigCommand) -> Result<()> {
 
 /// Prints the sync state and what came in. Returns whether the sync is stopped.
 fn print_sync(paths: &Paths, record: &tworky_core::config_repo::SyncRecord) -> bool {
-    use tworky_core::config_repo::SyncState;
+    use tworky_core::config_repo::{HeldBackCause, SyncState};
     let files = |files: &[String]| files.join(", ");
     let worktree = paths.repo_sync_dir();
     let (line, stopped) = match &record.state {
@@ -704,7 +704,18 @@ fn print_sync(paths: &Paths, record: &tworky_core::config_repo::SyncRecord) -> b
             ),
             true,
         ),
-        SyncState::HeldBack { files: f } => (
+        SyncState::HeldBack {
+            files: f,
+            cause: HeldBackCause::Unrecognised,
+        } => (
+            format!(
+                "held back: the remote's {} are valid TOML but not project config this tw understands, most likely written by a newer Tworky; update Tworky, or fix and commit them in {} if they're wrong, then run `tw config sync`",
+                files(f),
+                worktree.display()
+            ),
+            true,
+        ),
+        SyncState::HeldBack { files: f, .. } => (
             format!(
                 "held back: the remote's {} don't parse; fix and commit them in {}, then run `tw config sync`",
                 files(f),
@@ -716,6 +727,14 @@ fn print_sync(paths: &Paths, record: &tworky_core::config_repo::SyncRecord) -> b
             format!(
                 "blocked: uncommitted local {} would be overwritten by incoming changes; fix or remove them",
                 files(f)
+            ),
+            true,
+        ),
+        SyncState::HeldInSyncWorktree { files: f } => (
+            format!(
+                "held: {} in {} have uncommitted changes; commit them to carry on, or run `tw config abort` and `tw config sync` to discard them",
+                files(f),
+                worktree.display()
             ),
             true,
         ),
@@ -739,6 +758,12 @@ fn print_sync(paths: &Paths, record: &tworky_core::config_repo::SyncRecord) -> b
         println!(
             "incoming guidance or memory: {}",
             record.incoming.guidance.join(", ")
+        );
+    }
+    if !record.incoming.dropped.is_empty() {
+        println!(
+            "warning: resolving a conflict left out this machine's commits: {}",
+            record.incoming.dropped.join("; ")
         );
     }
     stopped

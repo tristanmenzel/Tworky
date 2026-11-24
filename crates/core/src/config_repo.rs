@@ -978,15 +978,34 @@ pub enum SyncState {
     /// `project.toml` files from the remote that don't parse.
     HeldBack {
         files: Vec<String>,
+        #[serde(default)]
+        cause: HeldBackCause,
     },
     /// Uncommitted files in `repo/` that incoming changes would overwrite.
     BlockedByLocal {
+        files: Vec<String>,
+    },
+    /// Uncommitted files in `repo-sync`, which a sync won't discard: committing them resumes, and
+    /// an abort discards them.
+    HeldInSyncWorktree {
         files: Vec<String>,
     },
     Error {
         message: String,
     },
     NoRemote,
+}
+
+/// Why held-back `project.toml` files don't parse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldBackCause {
+    /// At least one isn't valid TOML.
+    #[default]
+    Invalid,
+    /// Every one is valid TOML but not project config this build understands, as config written by
+    /// a newer Tworky would be.
+    Unrecognised,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1005,17 +1024,20 @@ pub struct Incoming {
     pub hooks_or_services: Vec<String>,
     /// Guidance and memory files that changed, relative to the repo.
     pub guidance: Vec<String>,
+    /// Subjects of this machine's commits that a conflict resolution left out of the result.
+    pub dropped: Vec<String>,
 }
 
 impl Incoming {
     pub fn is_empty(&self) -> bool {
-        self.hooks_or_services.is_empty() && self.guidance.is_empty()
+        self.hooks_or_services.is_empty() && self.guidance.is_empty() && self.dropped.is_empty()
     }
 
     fn add(&mut self, other: Incoming) {
         for (mine, theirs) in [
             (&mut self.hooks_or_services, other.hooks_or_services),
             (&mut self.guidance, other.guidance),
+            (&mut self.dropped, other.dropped),
         ] {
             mine.extend(theirs);
             mine.sort();
@@ -1078,9 +1100,19 @@ pub fn dismiss_incoming(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// `main`'s loose ref, which changes with every commit, for noticing commits without running git.
+/// Something that changes with every commit, for noticing commits without running git: `main`'s
+/// loose ref, else the times the packed refs or the reftable last changed.
 pub fn main_ref_stamp(paths: &Paths) -> Option<String> {
-    std::fs::read_to_string(paths.repo_dir().join(".git/refs/heads/main")).ok()
+    let git_dir = paths.repo_dir().join(".git");
+    if let Ok(loose) = std::fs::read_to_string(git_dir.join("refs/heads/main")) {
+        return Some(loose);
+    }
+    let times: Vec<String> = ["packed-refs", "reftable", "reftable/tables.list"]
+        .iter()
+        .filter_map(|file| std::fs::metadata(git_dir.join(file)).ok())
+        .map(|m| format!("{:?}/{}", m.modified().ok(), m.len()))
+        .collect();
+    (!times.is_empty()).then(|| times.join(" "))
 }
 
 /// Brings `repo/` and the remote together: fetches, rebases this machine's commits onto the
@@ -1117,12 +1149,26 @@ fn sync_locked(paths: &Paths, trigger: Trigger, network: Duration) -> Result<Syn
     if trigger == Trigger::Background && before.paused {
         return Ok(before);
     }
-    let step = run_sync(paths, &before, network).unwrap_or_else(|e| Step {
-        state: SyncState::Error {
-            message: failure_message(&e),
-        },
-        ..Default::default()
-    });
+    let step = match run_sync(paths, &before, network) {
+        Ok(step) => step,
+        Err(e) if e.is::<Held>() => {
+            let held = e.downcast_ref::<Held>().expect("checked above");
+            let record = if held.uncommitted.is_empty() {
+                read_record(paths)
+            } else {
+                update_record(paths, |r| {
+                    r.state = SyncState::HeldInSyncWorktree {
+                        files: held.uncommitted.clone(),
+                    }
+                })?
+            };
+            return match trigger {
+                Trigger::Background => Ok(record),
+                Trigger::User => Err(e),
+            };
+        }
+        Err(e) => Step::failed(&e),
+    };
     update_record(paths, |r| step.apply(r))
 }
 
@@ -1135,10 +1181,38 @@ struct Step {
     result: Option<String>,
     operation: Option<Operation>,
     finished: bool,
+    /// The push was rejected because the remote moved, so the sync starts over.
+    rejected: bool,
     incoming: Incoming,
 }
 
+/// A sync that won't start over because `repo-sync` holds work starting over would discard. The
+/// record keeps its base, so the work resumes once it's committed.
+#[derive(Debug)]
+struct Held {
+    message: String,
+    /// The uncommitted changes in `repo-sync`, if that's why.
+    uncommitted: Vec<String>,
+}
+
+impl std::fmt::Display for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Held {}
+
 impl Step {
+    fn failed(e: &anyhow::Error) -> Step {
+        Step {
+            state: SyncState::Error {
+                message: failure_message(e),
+            },
+            ..Default::default()
+        }
+    }
+
     fn stopped(
         state: SyncState,
         base: &str,
@@ -1191,59 +1265,121 @@ fn run_sync(paths: &Paths, before: &SyncRecord, network: Duration) -> Result<Ste
             ..Default::default()
         });
     }
-    update_record(paths, |r| r.state = SyncState::Syncing)?;
-    let mut step = match resumable(paths, &dir, before)? {
-        Some((base, upstream)) => match integrate(paths, &dir, base, Some(upstream), network) {
-            Err(e) if e.downcast_ref::<PushRejected>().is_none() => {
-                return Ok(Step {
-                    state: SyncState::Error {
-                        message: failure_message(&e),
-                    },
-                    base: before.base.clone(),
-                    upstream: before.upstream.clone(),
-                    ..Default::default()
-                });
-            }
-            step => step,
-        },
-        None => start(paths, &dir, network),
+    let failed_keeping_base = |e: &anyhow::Error| Step {
+        base: before.base.clone(),
+        upstream: before.upstream.clone(),
+        result: before.result.clone(),
+        ..Step::failed(e)
     };
+    let resume = match resumable(paths, &dir, before) {
+        Ok(resume) => resume,
+        Err(e) if e.is::<Held>() => return Err(e),
+        Err(e) => return Ok(failed_keeping_base(&e)),
+    };
+    update_record(paths, |r| r.state = SyncState::Syncing)?;
+    let mut step = match resume {
+        Some((base, upstream)) => match integrate(paths, &dir, base, upstream, network) {
+            Ok(step) => step,
+            Err(e) => return Ok(failed_keeping_base(&e)),
+        },
+        None => start(paths, &dir, before.paused, network)?,
+    };
+    let mut incoming = Incoming::default();
     for _ in 0..2 {
-        match &step {
-            Err(e) if e.downcast_ref::<PushRejected>().is_some() => {
-                step = start(paths, &dir, network)
-            }
-            _ => break,
+        if !step.rejected {
+            break;
         }
+        incoming.add(std::mem::take(&mut step.incoming));
+        step = start(paths, &dir, false, network).unwrap_or_else(|e| Step::failed(&e));
     }
-    step
+    step.incoming.add(incoming);
+    Ok(step)
 }
 
 /// The base and upstream to resume a stopped sync from, once the user has fixed it in `repo-sync`:
-/// a conflict whose rebase or merge has finished, a held-back result with a commit on top, or a
-/// resumed sync that failed, which keeps its base so the fix in `repo-sync` isn't thrown away.
+/// a conflict whose rebase or merge has finished, a held-back result with a commit on top, a
+/// result blocked by local files, or a resumed sync that failed before moving `main`. `None` starts
+/// over, as for a held-back result nothing was committed on, which the remote may have fixed. Fails
+/// with [`Held`] while starting over would throw away work in `repo-sync`: uncommitted changes, or
+/// commits that can't be resumed.
 fn resumable<'a>(
     paths: &Paths,
     dir: &Path,
     before: &'a SyncRecord,
-) -> Result<Option<(&'a str, &'a str)>> {
-    let (Some(base), Some(upstream)) = (&before.base, &before.upstream) else {
-        return Ok(None);
-    };
+) -> Result<Option<(&'a str, Option<&'a str>)>> {
     if before.paused {
         return Ok(None);
     }
-    let head = rev_parse(paths, dir, "HEAD")?;
-    let fixed = match &before.state {
-        SyncState::Conflict { .. } | SyncState::Error { .. } => true,
-        SyncState::HeldBack { .. } => before.result.as_deref() != Some(head.as_str()),
-        _ => false,
+    if let Some(held) = uncommitted_in(paths, dir)? {
+        return Err(held.into());
+    }
+    let Some(base) = before.base.as_deref() else {
+        return Ok(None);
     };
-    Ok((fixed && is_ancestor(paths, dir, upstream, &head)?).then_some((base, upstream)))
+    let head = rev_parse(paths, dir, "HEAD")?;
+    let main = rev_parse(paths, &paths.repo_dir(), "refs/heads/main")?;
+    if is_ancestor(paths, dir, &head, &main)? {
+        return Ok(None);
+    }
+    let upstream = before.upstream.as_deref();
+    let fixed = match &before.state {
+        SyncState::Conflict { .. }
+        | SyncState::Error { .. }
+        | SyncState::BlockedByLocal { .. }
+        | SyncState::Syncing => true,
+        SyncState::HeldBack { .. } | SyncState::HeldInSyncWorktree { .. } => {
+            if before.result.as_deref() == Some(head.as_str()) {
+                return Ok(None);
+            }
+            true
+        }
+        SyncState::Idle | SyncState::NoRemote => false,
+    };
+    let builds_on_both = is_ancestor(paths, dir, base, &main)?
+        && match upstream {
+            Some(upstream) => is_ancestor(paths, dir, upstream, &head)?,
+            None => true,
+        };
+    if fixed && builds_on_both {
+        return Ok(Some((base, upstream)));
+    }
+    let worktree = dir.display();
+    let abort = "or run `tw config abort` and sync again to start over";
+    let message = match &before.state {
+        SyncState::Conflict { files } => format!(
+            "the config sync stopped on a conflict in {}; resolve it and commit in {worktree}, {abort}",
+            files.join(", ")
+        ),
+        _ => format!(
+            "the stopped config sync's result in {worktree} doesn't build on both the remote's config and this machine's; fix it there, {abort}"
+        ),
+    };
+    Err(Held {
+        message,
+        uncommitted: Vec::new(),
+    }
+    .into())
 }
 
-/// Steps 1 and 2: fetches, then rebases `main`'s commits onto the remote's in `repo-sync`.
-fn start(paths: &Paths, dir: &Path, network: Duration) -> Result<Step> {
+/// Why `repo-sync` can't be reset: the uncommitted changes in it.
+fn uncommitted_in(paths: &Paths, dir: &Path) -> Result<Option<Held>> {
+    let files = changes(paths, dir)?;
+    Ok((!files.is_empty()).then(|| Held {
+        message: format!(
+            "the config sync's worktree {} has uncommitted changes to {}; commit them to carry on, or run `tw config abort` and sync again to discard them",
+            dir.display(),
+            files.join(", ")
+        ),
+        uncommitted: files,
+    }))
+}
+
+/// Steps 1 and 2: fetches, then rebases `main`'s commits onto the remote's in `repo-sync`. Refuses
+/// to discard uncommitted changes there unless `discard`.
+fn start(paths: &Paths, dir: &Path, discard: bool, network: Duration) -> Result<Step> {
+    if !discard && let Some(held) = uncommitted_in(paths, dir)? {
+        bail!(held.message);
+    }
     git(paths, dir, &["fetch", "-q", "--prune", REMOTE], network)?;
     let base = rev_parse(paths, &paths.repo_dir(), "refs/heads/main")?;
     let upstream = remote_main(paths, dir)?;
@@ -1335,27 +1471,79 @@ fn integrate(
         .filter(|f| incoming_files.contains(f))
         .collect();
     if !blocked.is_empty() {
-        return Ok(Step {
-            state: SyncState::BlockedByLocal { files: blocked },
-            ..Default::default()
-        });
+        return Ok(Step::stopped(
+            SyncState::BlockedByLocal { files: blocked },
+            &main,
+            upstream,
+            None,
+            None,
+        ));
     }
+    let dropped = match upstream {
+        Some(upstream) => dropped_commits(paths, dir, upstream, &main, &result)?,
+        None => Vec::new(),
+    };
     git(
         paths,
         &repo,
         &["reset", "-q", "--keep", &result],
         LOCAL_TIMEOUT,
     )?;
-    let incoming = summarize(paths, &repo, &main, &result, &incoming_files);
+    let mut incoming = summarize(paths, &repo, &main, &result, &incoming_files);
+    incoming.dropped = dropped;
     drop(guard);
-    if upstream != Some(result.as_str()) {
-        push(paths, dir, network)?;
-    }
-    Ok(Step {
-        finished: true,
-        incoming,
-        ..Default::default()
+    let pushed = if upstream == Some(result.as_str()) {
+        Ok(())
+    } else {
+        push(paths, dir, &result, network)
+    };
+    Ok(match pushed {
+        Ok(()) => Step {
+            finished: true,
+            incoming,
+            ..Default::default()
+        },
+        Err(e) => Step {
+            rejected: e.is::<PushRejected>(),
+            incoming,
+            ..Step::failed(&e)
+        },
     })
+}
+
+/// Subjects of this machine's commits (those on `main` since `upstream`) that `result` has no copy
+/// of. A copy has the same changes, or, for a commit whose conflict was resolved, the same author,
+/// author date and subject.
+fn dropped_commits(
+    paths: &Paths,
+    dir: &Path,
+    upstream: &str,
+    main: &str,
+    result: &str,
+) -> Result<Vec<String>> {
+    let log = |args: &[&str]| -> Result<Vec<String>> {
+        let out = git(
+            paths,
+            dir,
+            &[
+                &["log", "--no-merges", "--format=%an%x1f%ae%x1f%at%x1f%s"],
+                args,
+            ]
+            .concat(),
+            LOCAL_TIMEOUT,
+        )?;
+        Ok(out.lines().map(String::from).collect())
+    };
+    let kept = log(&[&format!("{upstream}..{result}")])?;
+    Ok(log(&[
+        "--cherry-pick",
+        "--right-only",
+        &format!("{result}...{main}"),
+    ])?
+    .into_iter()
+    .filter(|commit| !kept.contains(commit))
+    .filter_map(|commit| commit.splitn(4, '\x1f').nth(3).map(String::from))
+    .collect())
 }
 
 /// Why `result` can't become `main`: unmerged files in `repo-sync`, conflict markers it adds to
@@ -1365,47 +1553,12 @@ fn check(paths: &Paths, dir: &Path, base: &str, result: &str) -> Result<Option<S
     if !files.is_empty() {
         return Ok(Some(SyncState::Conflict { files }));
     }
-    let diff = git(
-        paths,
-        dir,
-        &[
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-renames",
-            "-U0",
-            base,
-            result,
-        ],
-        LOCAL_TIMEOUT,
-    )?;
-    let mut marked: Vec<String> = Vec::new();
-    let (mut file, mut in_header) = (None, false);
-    for line in diff.lines() {
-        if line.starts_with("diff --git ") {
-            in_header = true;
-        } else if line.starts_with("@@") {
-            in_header = false;
-        } else if in_header {
-            if let Some(path) = line.strip_prefix("+++ ") {
-                file = path.strip_prefix("b/").map(String::from);
-            }
-        } else if let Some(added) = line.strip_prefix('+')
-            && is_conflict_marker(added)
-            && let Some(file) = &file
-            && is_allowlisted(file)
-            && !marked.contains(file)
-        {
-            marked.push(file.clone());
-        }
-    }
-    if !marked.is_empty() {
-        return Ok(Some(SyncState::Conflict { files: marked }));
-    }
     let changed = git(
         paths,
         dir,
         &[
+            "-c",
+            "core.quotePath=false",
             "diff",
             "--name-only",
             "--no-renames",
@@ -1416,22 +1569,44 @@ fn check(paths: &Paths, dir: &Path, base: &str, result: &str) -> Result<Option<S
         ],
         LOCAL_TIMEOUT,
     )?;
-    let mut broken = Vec::new();
-    for file in changed
-        .split('\0')
-        .filter(|f| is_project_file(Path::new(f)))
-    {
-        let text = git(
+    let show = |commit: &str, file: &str| {
+        git(
             paths,
             dir,
-            &["show", &format!("{result}:{file}")],
+            &["show", &format!("{commit}:{file}")],
             LOCAL_TIMEOUT,
-        )?;
-        if toml::from_str::<ProjectConfig>(&text).is_err() {
-            broken.push(file.to_string());
+        )
+    };
+    let markers = |text: &str| text.lines().filter(|l| is_conflict_marker(l)).count();
+    let mut marked = Vec::new();
+    let mut projects = Vec::new();
+    for file in changed.split('\0').filter(|f| is_allowlisted(f)) {
+        let text = show(result, file)?;
+        let added = markers(&text);
+        if added > 0 && added > show(base, file).map_or(0, |old| markers(&old)) {
+            marked.push(file.to_string());
+        }
+        if is_project_file(Path::new(file)) {
+            projects.push((file, text));
         }
     }
-    Ok((!broken.is_empty()).then_some(SyncState::HeldBack { files: broken }))
+    if !marked.is_empty() {
+        return Ok(Some(SyncState::Conflict { files: marked }));
+    }
+    let mut broken = Vec::new();
+    let mut cause = HeldBackCause::Unrecognised;
+    for (file, text) in projects {
+        if toml::from_str::<ProjectConfig>(&text).is_err() {
+            broken.push(file.to_string());
+            if toml::from_str::<toml::Table>(&text).is_err() {
+                cause = HeldBackCause::Invalid;
+            }
+        }
+    }
+    Ok((!broken.is_empty()).then_some(SyncState::HeldBack {
+        files: broken,
+        cause,
+    }))
 }
 
 fn is_conflict_marker(line: &str) -> bool {
@@ -1506,11 +1681,11 @@ impl std::fmt::Display for PushRejected {
 
 impl std::error::Error for PushRejected {}
 
-fn push(paths: &Paths, dir: &Path, network: Duration) -> Result<()> {
+fn push(paths: &Paths, dir: &Path, result: &str, network: Duration) -> Result<()> {
     match git(
         paths,
         dir,
-        &["push", "-q", REMOTE, "HEAD:refs/heads/main"],
+        &["push", "-q", REMOTE, &format!("{result}:refs/heads/main")],
         network,
     ) {
         Ok(_) => Ok(()),
@@ -3015,7 +3190,9 @@ mod tests {
         ));
 
         finish_rebase(&m.b, MEMORY, "# Acme\n- from A\n- from B\n");
-        assert_eq!(sync_now(&m.b).state, SyncState::Idle);
+        let synced = sync_now(&m.b);
+        assert_eq!(synced.state, SyncState::Idle);
+        assert!(synced.incoming.dropped.is_empty(), "{synced:?}");
         assert_eq!(read_file(&m.b, MEMORY), "# Acme\n- from A\n- from B\n");
         assert_eq!(m.remote_head(), head(&m.b));
         assert_eq!(sync_now(&m.a).state, SyncState::Idle);
@@ -3031,6 +3208,7 @@ mod tests {
         finish_rebase(&m.b, MEMORY, "# Acme\n- from A\n- from B\n");
         let synced = sync_now(&m.b);
         assert_eq!(synced.state, SyncState::Idle);
+        assert!(synced.incoming.dropped.is_empty(), "{synced:?}");
         assert_eq!(read_file(&m.b, "tworky/claude.local.md"), "B guidance\n");
         assert_eq!(read_file(&m.b, MEMORY), "# Acme\n- from A\n- from B\n");
         assert_eq!(m.remote_head(), head(&m.b));
@@ -3074,6 +3252,155 @@ mod tests {
     }
 
     #[test]
+    fn markers_are_found_whatever_the_users_diff_config_and_path() {
+        let m = machines();
+        std::fs::write(
+            m.global_config(),
+            "[diff]\n\tnoprefix = true\n\tmnemonicPrefix = true\n\tsrcPrefix = x/\n\tdstPrefix = y/\n",
+        )
+        .unwrap();
+        let file = "projects/café/memory.md";
+        commit_file(&m.a, file, "# Café\n- from A\n");
+        assert_eq!(sync_now(&m.a).state, SyncState::Idle);
+        commit_file(&m.b, file, "# Café\n- from B\n");
+        let before = head(&m.b);
+        assert_eq!(
+            sync_now(&m.b).state,
+            SyncState::Conflict {
+                files: vec![file.into()]
+            }
+        );
+        let marked = std::fs::read_to_string(m.b.repo_sync_dir().join(file)).unwrap();
+        assert!(marked.contains("<<<<<<< "), "{marked}");
+        finish_rebase(&m.b, file, &marked);
+
+        let refused = sync_now(&m.b);
+        assert_eq!(
+            refused.state,
+            SyncState::Conflict {
+                files: vec![file.into()]
+            }
+        );
+        assert_eq!(head(&m.b), before);
+    }
+
+    #[test]
+    fn a_failed_push_after_a_resolution_never_replays_it() {
+        let m = machines();
+        let before = conflicted(&m);
+        let upstream = m.remote_head();
+        let resolved = "# Acme\n- from A\n- from B\n";
+        finish_rebase(&m.b, MEMORY, resolved);
+        let remote = m.dir.path().join("remote.git");
+        let away = m.dir.path().join("remote.away");
+        std::fs::rename(&remote, &away).unwrap();
+
+        let failed = sync_now(&m.b);
+        assert!(
+            matches!(failed.state, SyncState::Error { .. }),
+            "{failed:?}"
+        );
+        assert_eq!(
+            (failed.base.as_deref(), failed.upstream.as_deref()),
+            (None, None)
+        );
+        assert_eq!(failed.incoming.guidance, [MEMORY]);
+        assert_eq!(read_file(&m.b, MEMORY), resolved);
+        std::fs::rename(&away, &remote).unwrap();
+
+        update_record(&m.b, |r| {
+            r.base = Some(before);
+            r.upstream = Some(upstream);
+        })
+        .unwrap();
+        let synced = sync_now(&m.b);
+        assert_eq!(synced.state, SyncState::Idle, "{synced:?}");
+        assert_eq!(read_file(&m.b, MEMORY), resolved);
+        assert_eq!(m.remote_head(), head(&m.b));
+        assert_eq!(sync_now(&m.a).state, SyncState::Idle);
+        assert_eq!(head(&m.a), head(&m.b));
+    }
+
+    #[test]
+    fn a_resolution_blocked_by_a_local_file_resumes_once_it_is_fixed() {
+        let m = machines();
+        commit_file(&m.a, PROJECT_FILE, PROJECT);
+        commit_file(&m.a, MEMORY, "# Acme\n- from A\n");
+        sync_now(&m.a);
+        commit_file(&m.b, MEMORY, "# Acme\n- from B\n");
+        assert!(matches!(sync_now(&m.b).state, SyncState::Conflict { .. }));
+        write_file(&m.b, PROJECT_FILE, "name = [");
+        let resolved = "# Acme\n- from A\n- from B\n";
+        finish_rebase(&m.b, MEMORY, resolved);
+        let resolution = in_sync_dir(&m.b, &["rev-parse", "HEAD"]);
+
+        let blocked = sync_now(&m.b);
+        assert_eq!(
+            blocked.state,
+            SyncState::BlockedByLocal {
+                files: vec![PROJECT_FILE.into()]
+            }
+        );
+        assert!(blocked.base.is_some() && blocked.upstream.is_some());
+        let again = sync(&m.b, Trigger::Background).unwrap();
+        assert_eq!(again.state, blocked.state);
+        assert_eq!(in_sync_dir(&m.b, &["rev-parse", "HEAD"]), resolution);
+
+        std::fs::remove_file(m.b.repo_dir().join(PROJECT_FILE)).unwrap();
+        let synced = sync_now(&m.b);
+        assert_eq!(synced.state, SyncState::Idle, "{synced:?}");
+        assert_eq!(read_file(&m.b, MEMORY), resolved);
+        assert_eq!(read_file(&m.b, PROJECT_FILE), PROJECT);
+        assert_eq!(m.remote_head(), head(&m.b));
+    }
+
+    #[test]
+    fn a_resolution_that_drops_this_machines_commit_is_recorded() {
+        let m = machines();
+        conflicted(&m);
+        in_sync_dir(&m.b, &["rebase", "--skip"]);
+
+        let synced = sync_now(&m.b);
+        assert_eq!(synced.state, SyncState::Idle);
+        assert_eq!(read_file(&m.b, MEMORY), "# Acme\n- from A\n");
+        assert_eq!(synced.incoming.dropped, [format!("Save {MEMORY}")]);
+        dismiss_incoming(&m.b).unwrap();
+        assert!(sync_status(&m.b).unwrap().incoming.dropped.is_empty());
+    }
+
+    #[test]
+    fn the_main_stamp_changes_with_packed_refs_and_reftables() {
+        let home = Home::new("");
+        home.init();
+        let loose = main_ref_stamp(&home.paths).unwrap();
+        home.git(&["pack-refs", "--all"]);
+        let packed = main_ref_stamp(&home.paths).unwrap();
+        assert_ne!(packed, loose);
+        let memory = home.write(MEMORY, "# Acme\n");
+        assert!(
+            commit(
+                &with_lock(&home.paths).unwrap(),
+                &home.paths,
+                &[&memory],
+                "Save"
+            )
+            .unwrap()
+        );
+        home.git(&["pack-refs", "--all"]);
+        assert_ne!(main_ref_stamp(&home.paths).unwrap(), packed);
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_under(dir.path());
+        assert_eq!(main_ref_stamp(&paths), None);
+        let tables = paths.repo_dir().join(".git/reftable/tables.list");
+        std::fs::create_dir_all(tables.parent().unwrap()).unwrap();
+        std::fs::write(&tables, "0x1.ref\n").unwrap();
+        let first = main_ref_stamp(&paths).unwrap();
+        std::fs::write(&tables, "0x1.ref\n0x2.ref\n").unwrap();
+        assert_ne!(main_ref_stamp(&paths).unwrap(), first);
+    }
+
+    #[test]
     fn abort_stops_the_rebase_and_pauses_background_syncs() {
         let m = machines();
         let before = conflicted(&m);
@@ -3093,11 +3420,10 @@ mod tests {
         assert_eq!(again.operation, Some(Operation::Rebase));
     }
 
-    #[test]
-    fn a_remote_project_toml_that_does_not_parse_is_held_back() {
-        let m = machines();
+    /// Commits `text` as `projects/beta/project.toml` in A, past the parse check, and pushes it.
+    fn push_broken_project(m: &Machines, text: &str) -> &'static str {
         let broken = "projects/beta/project.toml";
-        write_file(&m.a, broken, "name = [");
+        write_file(&m.a, broken, text);
         let a = m.a.repo_dir();
         for args in [
             &["add", broken][..],
@@ -3115,30 +3441,12 @@ mod tests {
         ] {
             git(&m.a, &a, args, LOCAL_TIMEOUT).unwrap();
         }
-        let before = head(&m.b);
+        broken
+    }
 
-        let held = sync_now(&m.b);
-        assert_eq!(
-            held.state,
-            SyncState::HeldBack {
-                files: vec![broken.into()]
-            }
-        );
-        assert_eq!(head(&m.b), before);
-        assert!(!m.b.project_file("beta").exists());
-        assert_eq!(
-            sync(&m.b, Trigger::Background).unwrap().state,
-            held.state,
-            "fetched again, and still broken"
-        );
-
-        std::fs::write(
-            m.b.repo_sync_dir().join(broken),
-            PROJECT.replace("acme", "beta"),
-        )
-        .unwrap();
+    fn commit_in_sync_dir(paths: &Paths, message: &str) {
         in_sync_dir(
-            &m.b,
+            paths,
             &[
                 "-c",
                 "user.name=Resolver",
@@ -3147,12 +3455,116 @@ mod tests {
                 "commit",
                 "-q",
                 "-am",
-                "Fix beta",
+                message,
             ],
         );
+    }
+
+    #[test]
+    fn a_remote_project_toml_that_does_not_parse_is_held_back() {
+        let m = machines();
+        let broken = push_broken_project(&m, "name = [");
+        let before = head(&m.b);
+
+        let held = sync_now(&m.b);
+        assert_eq!(
+            held.state,
+            SyncState::HeldBack {
+                files: vec![broken.into()],
+                cause: HeldBackCause::Invalid,
+            }
+        );
+        assert_eq!(head(&m.b), before);
+        assert!(!m.b.project_file("beta").exists());
+        assert_eq!(
+            sync(&m.b, Trigger::Background).unwrap().state,
+            held.state,
+            "still held back"
+        );
+
+        std::fs::write(
+            m.b.repo_sync_dir().join(broken),
+            PROJECT.replace("acme", "beta"),
+        )
+        .unwrap();
+        commit_in_sync_dir(&m.b, "Fix beta");
         assert_eq!(sync_now(&m.b).state, SyncState::Idle);
         assert!(m.b.project_file("beta").exists());
         assert_eq!(m.remote_head(), head(&m.b));
+    }
+
+    #[test]
+    fn a_held_back_sync_takes_a_fix_made_on_the_remote() {
+        let m = machines();
+        let broken = push_broken_project(&m, "name = [");
+        assert!(matches!(sync_now(&m.b).state, SyncState::HeldBack { .. }));
+
+        commit_file(&m.a, broken, &PROJECT.replace("acme", "beta"));
+        assert_eq!(sync_now(&m.a).state, SyncState::Idle);
+        let synced = sync(&m.b, Trigger::Background).unwrap();
+        assert_eq!(synced.state, SyncState::Idle, "{synced:?}");
+        assert_eq!(synced.base, None);
+        assert!(m.b.project_file("beta").exists());
+        assert_eq!(head(&m.b), head(&m.a));
+    }
+
+    #[test]
+    fn syncs_keep_an_uncommitted_fix_in_repo_sync_until_aborted() {
+        let m = machines();
+        let broken = push_broken_project(&m, "name = 5\n");
+        let held = sync_now(&m.b);
+        assert_eq!(
+            held.state,
+            SyncState::HeldBack {
+                files: vec![broken.into()],
+                cause: HeldBackCause::Unrecognised,
+            }
+        );
+        let fix = PROJECT.replace("acme", "beta");
+        let in_progress = m.b.repo_sync_dir().join(broken);
+        std::fs::write(&in_progress, &fix).unwrap();
+
+        let on_hold = SyncRecord {
+            state: SyncState::HeldInSyncWorktree {
+                files: vec![broken.into()],
+            },
+            ..held.clone()
+        };
+        assert_eq!(sync(&m.b, Trigger::Background).unwrap(), on_hold);
+        assert_eq!(std::fs::read_to_string(&in_progress).unwrap(), fix);
+        let written = std::fs::metadata(m.b.config_sync_file())
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(sync(&m.b, Trigger::Background).unwrap(), on_hold);
+        assert_eq!(
+            std::fs::metadata(m.b.config_sync_file())
+                .unwrap()
+                .modified()
+                .unwrap(),
+            written,
+            "an unchanged hold isn't written again"
+        );
+        let e = sync(&m.b, Trigger::User).unwrap_err();
+        assert!(
+            e.to_string().contains("uncommitted") && e.to_string().contains(broken),
+            "{e:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&in_progress).unwrap(), fix);
+        assert_eq!(read_record(&m.b), on_hold);
+
+        abort(&m.b).unwrap();
+        assert!(matches!(sync_now(&m.b).state, SyncState::HeldBack { .. }));
+        assert_eq!(std::fs::read_to_string(&in_progress).unwrap(), "name = 5\n");
+
+        std::fs::write(&in_progress, &fix).unwrap();
+        commit_in_sync_dir(&m.b, "Fix beta");
+        assert_eq!(
+            sync(&m.b, Trigger::Background).unwrap().state,
+            SyncState::Idle
+        );
+        assert!(m.b.project_file("beta").exists());
     }
 
     #[test]

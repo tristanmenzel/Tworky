@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use crate::claude_config;
 use crate::config::{AppConfig, Paths};
-use crate::config_repo::{self, Operation, SyncRecord, SyncState};
+use crate::config_repo::{self, HeldBackCause, Operation, SyncRecord, SyncState};
 use crate::state::{ProjectSession, State};
 use crate::worker::{Launch, session_settings};
 
@@ -88,7 +88,21 @@ fn prompt(record: &SyncRecord) -> String {
             "A Tworky config sync stopped because these files still have conflicts or conflict markers: {}. Fix them, keeping what both sides meant, then `git add` them and run `git commit`.",
             list(files)
         ),
-        (SyncState::HeldBack { files }, _) => format!(
+        (
+            SyncState::HeldBack {
+                files,
+                cause: HeldBackCause::Unrecognised,
+            },
+            _,
+        ) => format!(
+            "A Tworky config sync held back the remote's changes because these project configs are valid TOML but not project config this Tworky understands: {}. They were most likely written by a newer Tworky on another machine. If so, don't edit them: tell me to update Tworky on this machine, after which the sync goes through. Only if they hold a genuine mistake, fix them so they parse as Tworky project config, then `git add` them and run `git commit`.",
+            list(files)
+        ),
+        (SyncState::HeldInSyncWorktree { files }, _) => format!(
+            "Tworky config syncs are on hold because these files in this folder have uncommitted changes: {}. If they're a fix in progress, finish it, then `git add` them and run `git commit`. If they're unwanted, tell me to abort the sync, which discards them.",
+            list(files)
+        ),
+        (SyncState::HeldBack { files, .. }, _) => format!(
             "A Tworky config sync held back the remote's changes because these project configs don't parse: {}. Fix them so they parse as Tworky project config, then `git add` them and run `git commit`.",
             list(files)
         ),
@@ -187,13 +201,31 @@ mod tests {
         let merge = prompt(&conflict(Some(Operation::Merge)));
         assert!(merge.contains("`git commit`"), "{merge}");
         assert!(!merge.contains("rebase --continue"), "{merge}");
-        let held = prompt(&SyncRecord {
-            state: SyncState::HeldBack {
+        let held_back = |cause| {
+            prompt(&SyncRecord {
+                state: SyncState::HeldBack {
+                    files: vec!["projects/beta/project.toml".into()],
+                    cause,
+                },
+                ..Default::default()
+            })
+        };
+        let held = held_back(HeldBackCause::Invalid);
+        assert!(held.contains("projects/beta/project.toml"), "{held}");
+        assert!(held.contains("don't parse"), "{held}");
+        assert!(!held.contains("newer Tworky"), "{held}");
+        let newer = held_back(HeldBackCause::Unrecognised);
+        assert!(newer.contains("projects/beta/project.toml"), "{newer}");
+        assert!(newer.contains("newer Tworky"), "{newer}");
+        assert!(newer.contains("update Tworky"), "{newer}");
+        assert!(newer.contains("genuine mistake"), "{newer}");
+        let on_hold = prompt(&SyncRecord {
+            state: SyncState::HeldInSyncWorktree {
                 files: vec!["projects/beta/project.toml".into()],
             },
             ..Default::default()
         });
-        assert!(held.contains("projects/beta/project.toml"), "{held}");
-        assert!(held.contains("don't parse"), "{held}");
+        assert!(on_hold.contains("uncommitted"), "{on_hold}");
+        assert!(on_hold.contains("projects/beta/project.toml"), "{on_hold}");
     }
 }
