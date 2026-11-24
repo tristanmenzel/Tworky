@@ -15,6 +15,8 @@ export function syncProblem(state: ConfigSyncState): string | null {
       return `Config sync is blocked: incoming changes would overwrite ${fileCount(state.files)} not committed here`
     case 'error':
       return `Config sync failed: ${state.message}`
+    case 'unconfirmed_remote':
+      return `Config sync stopped: the remote ${state.url} wasn't connected through Tworky`
     default:
       return null
   }

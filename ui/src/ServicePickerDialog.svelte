@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import Dialog from './Dialog.svelte'
   import ServiceList, { type ServiceLink } from './ServiceList.svelte'
   import { overlay } from './overlay.svelte'
@@ -16,7 +17,7 @@
   const chosen = $derived(services.find((s) => s.name === picked))
 
   $effect(() => {
-    overlay.open++
+    untrack(() => overlay.open++)
     return () => overlay.open--
   })
 </script>

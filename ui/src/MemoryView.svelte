@@ -5,6 +5,7 @@
     MEMORY_CHANGED_SINCE_EDITING,
     OS_LABEL,
     SESSION_GUIDANCE_LIMIT,
+    guidanceLimitNote,
     type Os,
     type ProjectMemory,
     type SessionGuidanceSize,
@@ -77,9 +78,11 @@
       changes for you to approve in the Changes tab.
     {/if}
     Stored in <code>{current.path}</code>.
-    {#if sessionSize?.project === current.project && sessionSize.bytes > SESSION_GUIDANCE_LIMIT}<span class="warn"
-        >Sessions on {OS_LABEL[sessionSize.os]} load {Math.ceil(sessionSize.bytes / 1024)} KB of guidance and memory, over
-        8 KB, so they get the file paths to read instead of the text. Trim it.</span
+    {#if sessionSize?.project === current.project && (sessionSize.bytes > SESSION_GUIDANCE_LIMIT || sessionSize.measured > sessionSize.budget)}<span
+        class="warn"
+        >Sessions on {OS_LABEL[sessionSize.os]} load {Math.ceil(sessionSize.bytes / 1024)} KB of guidance and memory. {guidanceLimitNote(
+          sessionSize,
+        )}</span
       >{/if}
   {/if}
 {/snippet}

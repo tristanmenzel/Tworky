@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import { api, type SharedConfig } from './api'
   import Dialog from './Dialog.svelte'
   import { overlay } from './overlay.svelte'
@@ -23,7 +24,7 @@
   const remote = $derived(typed.trim() || picked || '')
 
   $effect(() => {
-    overlay.open++
+    untrack(() => overlay.open++)
     return () => overlay.open--
   })
 
@@ -66,9 +67,10 @@
     busy = true
     error = null
     try {
-      const used = await confirmation.connect(remote, async (confirmed) => {
-        await api.useSharedConfig(remote, confirmed)
-      })
+      const used = await confirmation.connect(
+        () => api.checkConfigRemote(remote),
+        (seen) => api.useSharedConfig(remote, seen),
+      )
       if (used) onDone()
     } catch (e) {
       error = String(e)

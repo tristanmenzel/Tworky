@@ -418,10 +418,20 @@ export interface SessionGuidanceSize {
   bytes: number
   /** The project whose memory was counted. Without one asked for, the one with the most memory on this OS. */
   project: string | null
+  /** What the session's guidance hook weighs, headers included. Past `budget`, sessions get the files' paths instead of their text. */
+  measured: number
+  budget: number
 }
 
-/** Past this, sessions get the guidance and memory files' paths instead of their text. */
+/** Past this, the guidance and memory a session loads are getting close to what its hook shows in full. */
 export const SESSION_GUIDANCE_LIMIT = 8192
+
+/** What happens to a session's guidance and memory at `size`, for a warning once it passes `SESSION_GUIDANCE_LIMIT`. */
+export function guidanceLimitNote(size: SessionGuidanceSize): string {
+  return size.measured > size.budget
+    ? `With their headers that's ${size.measured.toLocaleString()} bytes, past the ${size.budget.toLocaleString()} sessions are shown in full, so they get the file paths to read instead of the text. Trim it.`
+    : `That's close to the limit: once they pass ${size.budget.toLocaleString()} bytes with their headers (${size.measured.toLocaleString()} now), sessions get the file paths to read instead of the text.`
+}
 
 /** The user's guidance for every session (`os: null`) or one OS's refinement. */
 export interface GuidanceFile {
@@ -513,6 +523,7 @@ export type ConfigSyncState =
   | { kind: 'conflict' | 'blocked_by_local' | 'held_in_sync_worktree'; files: string[] }
   | { kind: 'held_back'; files: string[]; cause: 'invalid' | 'unrecognised' }
   | { kind: 'error'; message: string }
+  | { kind: 'unconfirmed_remote'; url: string }
 
 export interface ConfigSyncRecord {
   state: ConfigSyncState
@@ -521,6 +532,8 @@ export interface ConfigSyncRecord {
   last_sync: number | null
   incoming: { hooks_or_services: string[]; guidance: string[]; dropped: string[] }
   visibility: Visibility | null
+  /** Where the remote the user connected fetched from and pushed to, redacted. */
+  remote: { fetch: string[]; push: string[] } | null
 }
 
 export interface ConfigRepoStatus {
@@ -540,7 +553,19 @@ export interface RemoteCheck {
   visibility: Visibility
   warnings: string[]
   needs_confirmation: boolean
+  foreign_owner: boolean
 }
+
+/** What the user was shown of a remote's check when they chose to connect it. */
+export interface RemoteSeen {
+  visibility: Visibility
+  foreign_owner: boolean
+}
+
+export type ConnectOutcome =
+  | { kind: 'connected'; connected: ConfigConnected }
+  /** The remote's check found more than the user saw. */
+  | { kind: 'changed'; check: RemoteCheck }
 
 export interface ConfigConnected {
   check: RemoteCheck
@@ -654,17 +679,22 @@ export const api = {
   configFirstRun: () => invoke<boolean>('config_first_run'),
   startFreshConfig: () => invoke<void>('start_fresh_config'),
   findSharedConfigs: () => invoke<SharedConfig[]>('find_shared_configs'),
-  useSharedConfig: (remote: string, confirmed: boolean) =>
-    invoke<ConfigConnected>('use_shared_config', { remote, confirmed }),
+  useSharedConfig: (remote: string, seen: RemoteSeen | null) =>
+    invoke<ConnectOutcome>('use_shared_config', { remote, seen }),
   configSyncStatus: () => invoke<ConfigSyncRecord>('config_sync_status'),
   configRepoStatus: () => invoke<ConfigRepoStatus>('config_repo_status'),
   syncConfigNow: () => invoke<ConfigSyncRecord>('sync_config_now'),
   abortConfigSync: () => invoke<ConfigSyncRecord>('abort_config_sync'),
+  /** Readies the settings session to resolve the stopped sync. True when it was restarted for a new conversation. */
+  prepareSettingsResolve: () => invoke<boolean>('prepare_settings_resolve'),
   dismissConfigIncoming: () => invoke<void>('dismiss_config_incoming'),
   configGithubOwners: () => invoke<string[]>('config_github_owners'),
-  checkConfigRemote: (remote: string) => invoke<RemoteCheck>('check_config_remote', { remote }),
-  setConfigRemote: (remote: string, confirmed: boolean) =>
-    invoke<ConfigConnected>('set_config_remote', { remote, confirmed }),
+  /** Checks `remote`, or with null the config repo's current remote. */
+  checkConfigRemote: (remote: string | null) => invoke<RemoteCheck>('check_config_remote', { remote }),
+  setConfigRemote: (remote: string, seen: RemoteSeen | null) =>
+    invoke<ConnectOutcome>('set_config_remote', { remote, seen }),
+  /** Connects the config repo's current remote, which was added outside Tworky. */
+  confirmConfigRemote: (seen: RemoteSeen | null) => invoke<ConnectOutcome>('confirm_config_remote', { seen }),
   createConfigRemote: (owner: string | null) => invoke<ConfigConnected>('create_config_remote', { owner }),
   removeConfigRemote: () => invoke<ConfigSyncRecord>('remove_config_remote'),
   openProjectConfig: (name: string) => invoke<void>('open_project_config', { name }),

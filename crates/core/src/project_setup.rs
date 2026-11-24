@@ -60,6 +60,7 @@ impl Workspace {
             .unwrap_or_else(|| ProjectSession {
                 claude_session: uuid::Uuid::new_v4().to_string(),
                 claude_started: false,
+                prompted_for: None,
             }))
     }
 
@@ -80,6 +81,7 @@ impl Workspace {
             session = ProjectSession {
                 claude_session: uuid::Uuid::new_v4().to_string(),
                 claude_started: false,
+                prompted_for: None,
             };
             replaced_missing = true;
         }
@@ -151,6 +153,7 @@ impl Workspace {
             &ProjectSession {
                 claude_session: uuid::Uuid::new_v4().to_string(),
                 claude_started: false,
+                prompted_for: None,
             },
         )
     }

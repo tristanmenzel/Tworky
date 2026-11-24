@@ -1,9 +1,10 @@
-import { api, type RemoteCheck } from './api'
+import type { ConfigConnected, ConnectOutcome, RemoteCheck, RemoteSeen } from './api'
 
 /**
  * Connects the config to a remote in two steps when Tworky has warnings about it: the first call checks it and, if
- * there are warnings, keeps them for the user to read and returns false; the next call connects, confirming a remote
- * that needs it. Call `reset` when the remote changes.
+ * there are warnings, keeps them for the user to read and returns null; the next call connects, sending what the user
+ * saw. When the server's own check finds more than that, its new check is kept to show and the call returns null
+ * again. Call `reset` when the remote changes.
  */
 export class RemoteConfirmation {
   check = $state<RemoteCheck | null>(null)
@@ -12,15 +13,24 @@ export class RemoteConfirmation {
     this.check = null
   }
 
-  async connect(remote: string, connect: (confirmed: boolean) => Promise<void>): Promise<boolean> {
-    if (!this.check) {
-      const checked = await api.checkConfigRemote(remote)
+  async connect(
+    check: () => Promise<RemoteCheck>,
+    connect: (seen: RemoteSeen) => Promise<ConnectOutcome>,
+  ): Promise<ConfigConnected | null> {
+    let seen = this.check
+    if (!seen) {
+      const checked = await check()
       if (checked.warnings.length) {
         this.check = checked
-        return false
+        return null
       }
+      seen = checked
     }
-    await connect(this.check?.needs_confirmation ?? false)
-    return true
+    const outcome = await connect({ visibility: seen.visibility, foreign_owner: seen.foreign_owner })
+    if (outcome.kind === 'changed') {
+      this.check = outcome.check
+      return null
+    }
+    return outcome.connected
   }
 }

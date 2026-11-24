@@ -56,7 +56,7 @@
     const ok = await ask({
       title: 'Abort this sync?',
       message:
-        "Tworky stops the rebase or merge in the sync worktree, dropping what was resolved there, and pauses background syncs. This machine's config isn't changed. Sync now starts over.",
+        "Tworky stops any rebase or merge in the sync worktree, dropping what was resolved there, and pauses background syncs. This machine's config isn't changed. Sync now then starts over, discarding anything else left uncommitted in the sync worktree.",
       confirmLabel: 'Abort',
       danger: true,
     })
@@ -94,6 +94,7 @@
       <dd>
         {#if problem}<span class="bad">{problem}</span>
         {:else if syncState.kind === 'syncing'}Syncing…
+        {:else if sync?.paused}<span class="warn">Paused: you aborted the last sync</span>
         {:else}Up to date{/if}
       </dd>
       <dt>Last sync</dt>
@@ -133,8 +134,8 @@
         {:else}
           <h2>On hold</h2>
           <p class="small">
-            The sync worktree has uncommitted changes, probably a fix in progress. Committing them resumes syncing;
-            aborting discards them.
+            The sync worktree has uncommitted changes, probably a fix in progress. Committing them resumes syncing. To
+            give them up, abort, then Sync now, which discards them.
           </p>
         {/if}
         <ul class="files">
@@ -155,6 +156,15 @@
         <ul class="files">
           {#each files as file (file)}<li><code>{file}</code></li>{/each}
         </ul>
+      </section>
+    {:else if syncState.kind === 'unconfirmed_remote'}
+      <section class="card problem">
+        <h2>Remote not connected through Tworky</h2>
+        <p class="small">
+          The config repo's remote, <code>{syncState.url}</code>, was added or changed outside Tworky, so nothing is
+          fetched from it or pushed to it. <button class="link" onclick={onShowRemote}>Connect it or remove it</button> in
+          Remote.
+        </p>
       </section>
     {:else if syncState.kind === 'error'}
       <section class="card problem">

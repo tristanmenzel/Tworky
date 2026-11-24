@@ -6,6 +6,7 @@
     GUIDANCE_CHANGED_SINCE_EDITING,
     OS_LABEL,
     SESSION_GUIDANCE_LIMIT,
+    guidanceLimitNote,
     type GuidanceFile,
     type Os,
     type SessionGuidanceSize,
@@ -71,10 +72,11 @@
     Claudes don't propose changes to it; only you edit it, here. Saving commits it to your config repo, which syncs it to
     your other machines. Stored in
     <code>{current.path}</code>.
-    {#if sessionSize && sessionSize.bytes > SESSION_GUIDANCE_LIMIT}<span class="warn"
+    {#if sessionSize && (sessionSize.bytes > SESSION_GUIDANCE_LIMIT || sessionSize.measured > sessionSize.budget)}<span
+        class="warn"
         >Sessions on {OS_LABEL[sessionSize.os]}{sessionSize.project ? ` for ${sessionSize.project}` : ''} load {Math.ceil(
           sessionSize.bytes / 1024,
-        )} KB of guidance and memory, over 8 KB, so they get the file paths to read instead of the text. Trim it.</span
+        )} KB of guidance and memory. {guidanceLimitNote(sessionSize)}</span
       >{/if}
   {/if}
 {/snippet}

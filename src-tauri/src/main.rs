@@ -381,6 +381,10 @@ struct SessionGuidanceSize {
     /// The project whose memory was counted: the one asked about, or without one the project with
     /// the most memory on this OS.
     project: Option<String>,
+    /// What the session's guidance hook weighs, headers included: past `budget`, sessions get the
+    /// files' paths instead of their text.
+    measured: usize,
+    budget: usize,
 }
 
 /// The combined size of the guidance and memory a session on this OS loads: one of `project`, or
@@ -418,7 +422,13 @@ async fn session_guidance_size(project: Option<String>) -> CmdResult<SessionGuid
             )),
             None => size(&paths.guidance_files(os)),
         };
-        Ok(SessionGuidanceSize { os, bytes, project })
+        Ok(SessionGuidanceSize {
+            os,
+            bytes,
+            measured: tworky_core::worker::guidance_hook_size(&paths, project.as_deref(), os),
+            budget: tworky_core::worker::GUIDANCE_BUDGET,
+            project,
+        })
     })
     .await
 }
@@ -1405,6 +1415,23 @@ async fn sync_config_now() -> CmdResult<config_repo::SyncRecord> {
     .await
 }
 
+/// Readies the settings session to resolve the stopped sync, stopping it when its conversation is
+/// about another one. Returns whether it was restarted.
+#[tauri::command]
+async fn prepare_settings_resolve(app: AppHandle) -> CmdResult<bool> {
+    blocking(move || {
+        let restarted =
+            settings_session::prepare_resolve(&Paths::resolve().map_err(err)?).map_err(err)?;
+        if restarted {
+            app.state::<AppState>()
+                .sessions
+                .kill(settings_session::SESSION_ID);
+        }
+        Ok(restarted)
+    })
+    .await
+}
+
 #[tauri::command]
 async fn abort_config_sync() -> CmdResult<config_repo::SyncRecord> {
     blocking(|| config_repo::abort(&Paths::resolve().map_err(err)?).map_err(err)).await
@@ -1477,16 +1504,44 @@ async fn find_shared_configs() -> CmdResult<Vec<config_repo::SharedConfig>> {
 }
 
 #[tauri::command]
-async fn use_shared_config(remote: String, confirmed: bool) -> CmdResult<config_repo::Connected> {
+async fn use_shared_config(
+    remote: String,
+    seen: Option<config_repo::Seen>,
+) -> CmdResult<ConnectOutcome> {
     blocking(move || {
         let paths = Paths::resolve().map_err(err)?;
-        let connected =
-            config_repo::use_shared_config(&paths, &config_repo::Gh, &remote, confirmed)
-                .map_err(err)?;
+        let outcome = connect_outcome(config_repo::use_shared_config(
+            &paths,
+            &config_repo::Gh,
+            &remote,
+            seen,
+        ))?;
         wake_config_sync();
-        Ok(connected)
+        Ok(outcome)
     })
     .await
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ConnectOutcome {
+    Connected {
+        connected: Box<config_repo::Connected>,
+    },
+    /// The remote's check found more than the user saw; they're shown it to confirm again.
+    Changed { check: config_repo::RemoteCheck },
+}
+
+fn connect_outcome(result: anyhow::Result<config_repo::Connected>) -> CmdResult<ConnectOutcome> {
+    match result {
+        Ok(connected) => Ok(ConnectOutcome::Connected {
+            connected: Box::new(connected),
+        }),
+        Err(e) => match e.downcast::<config_repo::CheckChanged>() {
+            Ok(changed) => Ok(ConnectOutcome::Changed { check: changed.0 }),
+            Err(e) => Err(err(e)),
+        },
+    }
 }
 
 #[tauri::command]
@@ -1495,15 +1550,42 @@ async fn config_github_owners() -> CmdResult<Vec<String>> {
 }
 
 #[tauri::command]
-async fn check_config_remote(remote: String) -> CmdResult<config_repo::RemoteCheck> {
-    blocking(move || config_repo::check_remote(&config_repo::Gh, &remote).map_err(err)).await
+async fn check_config_remote(remote: Option<String>) -> CmdResult<config_repo::RemoteCheck> {
+    blocking(move || {
+        match remote {
+            Some(remote) => config_repo::check_remote(&config_repo::Gh, &remote),
+            None => {
+                config_repo::check_current_remote(&Paths::resolve().map_err(err)?, &config_repo::Gh)
+            }
+        }
+        .map_err(err)
+    })
+    .await
 }
 
 #[tauri::command]
-async fn set_config_remote(remote: String, confirmed: bool) -> CmdResult<config_repo::Connected> {
+async fn set_config_remote(
+    remote: String,
+    seen: Option<config_repo::Seen>,
+) -> CmdResult<ConnectOutcome> {
     blocking(move || {
         let paths = Paths::resolve().map_err(err)?;
-        config_repo::connect_remote(&paths, &config_repo::Gh, &remote, confirmed).map_err(err)
+        connect_outcome(config_repo::connect_remote(
+            &paths,
+            &config_repo::Gh,
+            &remote,
+            seen,
+        ))
+    })
+    .await
+}
+
+/// Connects the repo's current remote, added outside Tworky, once the user has seen its check.
+#[tauri::command]
+async fn confirm_config_remote(seen: Option<config_repo::Seen>) -> CmdResult<ConnectOutcome> {
+    blocking(move || {
+        let paths = Paths::resolve().map_err(err)?;
+        connect_outcome(config_repo::confirm_remote(&paths, &config_repo::Gh, seen))
     })
     .await
 }
@@ -1874,6 +1956,7 @@ fn main() {
             config_repo_status,
             sync_config_now,
             abort_config_sync,
+            prepare_settings_resolve,
             dismiss_config_incoming,
             config_first_run,
             start_fresh_config,
@@ -1882,6 +1965,7 @@ fn main() {
             config_github_owners,
             check_config_remote,
             set_config_remote,
+            confirm_config_remote,
             create_config_remote,
             remove_config_remote,
             clone_project_repo,

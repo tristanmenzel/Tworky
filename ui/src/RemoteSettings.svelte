@@ -26,8 +26,17 @@
   /** What Tworky warned about the remote it just connected. */
   let connectedWarnings = $state<string[]>([])
   const confirmation = new RemoteConfirmation()
+  /** For a remote that was added outside Tworky. */
+  const adoption = new RemoteConfirmation()
 
   const ownerIsOrg = $derived(!!owners?.length && owner !== owners[0])
+  const unconfirmed = $derived(sync?.state.kind === 'unconfirmed_remote')
+  const visibility = $derived(unconfirmed ? 'unknown' : (sync?.visibility ?? 'unknown'))
+
+  $effect(() => {
+    void remote
+    adoption.reset()
+  })
 
   $effect(() => {
     void typed
@@ -85,7 +94,21 @@
     const target = typed.trim()
     if (!target) return
     return run(async () => {
-      await confirmation.connect(target, async (confirmed) => connected(await api.setConfigRemote(target, confirmed)))
+      const result = await confirmation.connect(
+        () => api.checkConfigRemote(target),
+        (seen) => api.setConfigRemote(target, seen),
+      )
+      if (result) await connected(result)
+    })
+  }
+
+  function adopt() {
+    return run(async () => {
+      const result = await adoption.connect(
+        () => api.checkConfigRemote(null),
+        (seen) => api.confirmConfigRemote(seen),
+      )
+      if (result) await connected(result)
     })
   }
 
@@ -122,26 +145,32 @@
         <dd><code>{remote}</code></dd>
         <dt>Visibility</dt>
         <dd>
-          {#if sync?.visibility}
-            <span class:warn={sync.visibility !== 'private'}>{sync.visibility}</span>
-            <span class="muted">when it was set</span>
-          {:else}
-            <span class="muted">not recorded</span>
-          {/if}
+          <span class:warn={visibility !== 'private'}>{visibility}</span>
+          {#if !unconfirmed && sync?.visibility}<span class="muted">when it was set</span>{/if}
         </dd>
         <dt>Last sync</dt>
         <dd>{formatSyncTime(sync?.last_sync ?? null)}</dd>
       </dl>
-      {#if sync?.visibility && sync.visibility !== 'private'}
+      {#if unconfirmed}
         <p class="warn small">
-          {sync.visibility === 'unknown'
+          This remote wasn't connected through Tworky, so your config doesn't sync with it. Connect it to check who can
+          see it and start syncing, or remove it.
+        </p>
+      {:else if visibility !== 'private'}
+        <p class="warn small">
+          {visibility === 'unknown'
             ? "Tworky couldn't tell who can see this repo. Make sure it's private."
-            : `This repo is ${sync.visibility}: more people than you can read your guidance, project config and memory.`}
+            : `This repo is ${visibility}: more people than you can read your guidance, project config and memory.`}
         </p>
       {/if}
-      <RemoteWarnings warnings={connectedWarnings} />
+      <RemoteWarnings warnings={unconfirmed ? (adoption.check?.warnings ?? []) : connectedWarnings} />
       <div class="actions">
         <button class="danger" disabled={busy} onclick={remove}>Remove</button>
+        {#if unconfirmed}
+          <button class="primary" disabled={busy} onclick={adopt}>
+            {adoption.check ? 'Connect it anyway' : 'Connect it'}
+          </button>
+        {/if}
       </div>
     </section>
   {:else}

@@ -449,7 +449,8 @@ enum ConfigCommand {
     /// Sync with the remote now, resuming a sync that stopped once it's fixed in the sync worktree
     Sync,
     /// Abort the rebase or merge a stopped sync left in the sync worktree. Background syncs then
-    /// wait for the next `tw config sync`, which starts over
+    /// wait for the next `tw config sync`, which starts over and discards anything else left
+    /// uncommitted there
     Abort,
     #[command(subcommand)]
     Remote(RemoteCommand),
@@ -661,9 +662,7 @@ fn apply_session_change(paths: &Paths, id: &str, change: SessionChange) -> Resul
 
 fn config(paths: &Paths, cmd: ConfigCommand) -> Result<()> {
     use tworky_core::config_repo::{self, Trigger};
-    if matches!(cmd, ConfigCommand::Remote(_)) {
-        refuse_in_session(|var| std::env::var_os(var).is_some())?;
-    }
+    refuse_config_in_session(&cmd, |var| std::env::var_os(var).is_some())?;
     let status = matches!(cmd, ConfigCommand::Status);
     let record = match cmd {
         ConfigCommand::Status => {
@@ -708,7 +707,13 @@ fn config(paths: &Paths, cmd: ConfigCommand) -> Result<()> {
             {
                 anyhow::bail!("not syncing with {}", config_repo::redact_url(&check.url));
             }
-            config_repo::connect_remote(paths, &config_repo::Gh, &check.url, true)?.sync
+            config_repo::connect_remote(
+                paths,
+                &config_repo::Gh,
+                &check.url,
+                Some(config_repo::Seen::of(&check)),
+            )?
+            .sync
         }
         ConfigCommand::Remote(RemoteCommand::Create { owner }) => {
             let created = config_repo::create_remote(paths, &config_repo::Gh, owner.as_deref())?;
@@ -729,10 +734,26 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-/// Refuses to change the config's remote inside a Tworky session, whose Claude must not be able
-/// to point the user's config somewhere else or answer the confirmation for them. `is_set` says
-/// whether an environment variable is set.
-fn refuse_in_session(is_set: impl Fn(&str) -> bool) -> Result<()> {
+fn refuse_config_in_session(cmd: &ConfigCommand, is_set: impl Fn(&str) -> bool) -> Result<()> {
+    match cmd {
+        ConfigCommand::Remote(_) => refuse_in_session(
+            "change the config's remote",
+            "the user changes it in Tworky's Settings › Remote",
+            is_set,
+        ),
+        ConfigCommand::Abort => refuse_in_session(
+            "abort the config sync",
+            "the user aborts it in Tworky's Settings › Sync",
+            is_set,
+        ),
+        ConfigCommand::Status | ConfigCommand::Sync => Ok(()),
+    }
+}
+
+/// Refuses, inside a Tworky session, what only the user should do: a guard against a Claude doing
+/// it by mistake, such as changing the config's remote or aborting a sync the user is resolving.
+/// `is_set` says whether an environment variable is set.
+fn refuse_in_session(action: &str, instead: &str, is_set: impl Fn(&str) -> bool) -> Result<()> {
     let session = [
         "TW_WORKER_ID",
         "WA_WORKER_ID",
@@ -741,10 +762,7 @@ fn refuse_in_session(is_set: impl Fn(&str) -> bool) -> Result<()> {
     ]
     .iter()
     .any(|var| is_set(var));
-    anyhow::ensure!(
-        !session,
-        "the config's remote can't be changed from a Tworky session; change it in Tworky's Settings, or run this in your own terminal"
-    );
+    anyhow::ensure!(!session, "a Tworky session can't {action}; {instead}");
     Ok(())
 }
 
@@ -770,9 +788,19 @@ fn print_sync(paths: &Paths, record: &tworky_core::config_repo::SyncRecord) -> b
     let files = |files: &[String]| files.join(", ");
     let worktree = paths.repo_sync_dir();
     let (line, stopped) = match &record.state {
+        SyncState::Idle if record.paused => (
+            "paused: the last sync was aborted; `tw config sync` starts over".to_string(),
+            false,
+        ),
         SyncState::Idle => ("idle".to_string(), false),
         SyncState::Syncing => ("syncing".to_string(), false),
         SyncState::NoRemote => ("no remote".to_string(), false),
+        SyncState::UnconfirmedRemote { url } => (
+            format!(
+                "stopped: the remote {url} wasn't connected through Tworky, so nothing syncs with it; connect it in Tworky's Settings › Remote, or remove it"
+            ),
+            true,
+        ),
         SyncState::Conflict { files: f } if record.paused => (
             format!(
                 "paused after a conflict in {}; `tw config sync` starts over",
@@ -1891,19 +1919,39 @@ mod tests {
     }
 
     #[test]
-    fn the_remote_is_never_changed_from_a_session() {
+    fn the_remote_is_never_changed_nor_a_sync_aborted_from_a_session() {
         for session in [
             "TW_WORKER_ID",
             "WA_WORKER_ID",
             "TW_SETUP_SESSION",
             "TW_SETTINGS_SESSION",
         ] {
-            let e = refuse_in_session(|var| var == session).unwrap_err();
+            let e = refuse_in_session(
+                "abort the config sync",
+                "the user aborts it in Settings",
+                |var| var == session,
+            )
+            .unwrap_err();
             let message = e.to_string();
+            assert!(
+                message.contains("abort the config sync"),
+                "{session}: {message}"
+            );
             assert!(message.contains("Settings"), "{session}: {message}");
+            assert!(!message.contains("terminal"), "{session}: {message}");
             assert!(!message.contains("--yes"), "{session}: {message}");
         }
-        refuse_in_session(|_| false).unwrap();
+        refuse_in_session("abort the config sync", "", |_| false).unwrap();
+
+        let in_worker = |var: &str| var == "TW_WORKER_ID";
+        let abort = refuse_config_in_session(&ConfigCommand::Abort, in_worker).unwrap_err();
+        assert!(abort.to_string().contains("abort"), "{abort:#}");
+        let remote = refuse_config_in_session(&ConfigCommand::Remote(RemoteCommand::Rm), in_worker)
+            .unwrap_err();
+        assert!(remote.to_string().contains("remote"), "{remote:#}");
+        refuse_config_in_session(&ConfigCommand::Sync, in_worker).unwrap();
+        refuse_config_in_session(&ConfigCommand::Status, in_worker).unwrap();
+        refuse_config_in_session(&ConfigCommand::Abort, |_| false).unwrap();
     }
 
     #[test]

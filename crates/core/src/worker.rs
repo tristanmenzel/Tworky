@@ -65,15 +65,15 @@ pub fn session_guidance_files(paths: &Paths, project: &str, os: Os) -> [PathBuf;
 
 /// Claude Code shows a hook's output past 10,000 characters only as a preview and a file path,
 /// which would cut the levels that take precedence, so past this the hook lists the files instead.
-const GUIDANCE_BUDGET: usize = 9000;
+pub const GUIDANCE_BUDGET: usize = 9000;
 
 /// Shows each non-empty level of [`session_guidance_files`] under its header, or, when they'd
 /// exceed [`GUIDANCE_BUDGET`], their paths for Claude to read. One command, because Claude Code
 /// runs a group's hooks in parallel and the levels must arrive in order.
-fn guidance_command(paths: &Paths, project: &str, os: Os) -> String {
+fn guidance_headers(project: &str, os: Os) -> [String; 4] {
     let (name, label) = (os.name(), os.label());
     let precedence = "Where it conflicts with the guidance above, it takes precedence.";
-    let headers = [
+    [
         format!(
             "Tworky user guidance for every session (claude.local.md, edited in Tworky's \
              Settings). It refines Tworky's own guidance. {precedence}"
@@ -96,7 +96,29 @@ fn guidance_command(paths: &Paths, project: &str, os: Os) -> String {
             "Tworky shared memory for project {project} on {label} (latest: tw memory show --os \
              {name}), under the same rules; propose changes to it with --os {name}. {precedence}"
         ),
-    ];
+    ]
+}
+
+/// What [`guidance_command`] weighs against [`GUIDANCE_BUDGET`] for a session on `os`: each
+/// non-empty level with its header. Without a project, only the user's guidance.
+pub fn guidance_hook_size(paths: &Paths, project: Option<&str>, os: Os) -> usize {
+    let headers = guidance_headers(project.unwrap_or_default(), os);
+    let files = match project {
+        Some(project) => session_guidance_files(paths, project, os).to_vec(),
+        None => paths.guidance_files(os).to_vec(),
+    };
+    files
+        .iter()
+        .zip(&headers)
+        .filter_map(|(file, header)| {
+            let len = std::fs::metadata(file).ok()?.len() as usize;
+            (len > 0).then_some(header.len() + 3 + len)
+        })
+        .sum()
+}
+
+fn guidance_command(paths: &Paths, project: &str, os: Os) -> String {
+    let headers = guidance_headers(project, os);
     let quote = |file: &Path| sh_quote(&file.to_string_lossy().replace('\\', "/"));
     let [guidance, os_guidance, memory, os_memory] = session_guidance_files(paths, project, os);
     let repo_memory = paths.repo_memory_file(project, None);
@@ -3114,6 +3136,7 @@ run = "{sleep}"
         let out =
             process::run("bash", &["-c", &guidance_command(&paths, "acme", os)], None).unwrap();
         assert!(out.len() < GUIDANCE_BUDGET, "{out}");
+        assert!(guidance_hook_size(&paths, Some("acme"), os) > GUIDANCE_BUDGET);
         assert!(out.starts_with("Tworky: this session's guidance"), "{out}");
         assert!(!out.contains("guidance line"), "{out}");
         assert!(!out.contains("memory line"), "{out}");
@@ -3133,6 +3156,28 @@ run = "{sleep}"
             process::run("bash", &["-c", &guidance_command(&paths, "acme", os)], None).unwrap();
         assert!(!out.contains("too long to show here"), "{out}");
         assert!(out.contains("memory line"), "{out}");
+        assert!(guidance_hook_size(&paths, Some("acme"), os) <= GUIDANCE_BUDGET);
+    }
+
+    #[test]
+    fn the_guidance_hook_size_counts_each_non_empty_level_with_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::config_repo::test_home(dir.path());
+        let os = Os::current();
+        let [guidance, os_guidance, memory, _] = session_guidance_files(&paths, "acme", os);
+        std::fs::create_dir_all(memory.parent().unwrap()).unwrap();
+        std::fs::write(&guidance, "abc").unwrap();
+        std::fs::write(&os_guidance, "").unwrap();
+        std::fs::write(&memory, "memory").unwrap();
+        let headers = guidance_headers("acme", os);
+        assert_eq!(
+            guidance_hook_size(&paths, Some("acme"), os),
+            headers[0].len() + 3 + 3 + headers[2].len() + 3 + 6
+        );
+        assert_eq!(
+            guidance_hook_size(&paths, None, os),
+            headers[0].len() + 3 + 3
+        );
     }
 
     #[cfg(unix)]

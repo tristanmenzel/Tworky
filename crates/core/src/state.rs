@@ -404,6 +404,10 @@ impl State {
 pub struct ProjectSession {
     pub claude_session: String,
     pub claude_started: bool,
+    /// What the conversation's first prompt was about, for a session that tells apart prompts it
+    /// should resume from ones it should start over for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompted_for: Option<String>,
 }
 
 #[cfg(test)]

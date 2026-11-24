@@ -552,6 +552,17 @@
     }
   }
 
+  /** Opens the settings session on the stopped sync, in a new conversation unless its current one is about that sync. */
+  async function resolveWithClaude() {
+    try {
+      if (await api.prepareSettingsResolve()) exited[SETTINGS_SESSION] = true
+    } catch (e) {
+      showError(String(e))
+      return
+    }
+    openSettingsSession()
+  }
+
   async function newSettingsConversation() {
     const ok = await ask({
       title: 'Start a new settings conversation?',
@@ -1279,7 +1290,7 @@
             visible={view === 'settings' && settingsTab === 'sync'}
             sync={configSync}
             onSync={(r) => (configSync = r)}
-            onResolve={openSettingsSession}
+            onResolve={resolveWithClaude}
             onShowRemote={() => showSettings('remote')}
             onError={showError}
           />

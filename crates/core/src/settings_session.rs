@@ -23,6 +23,7 @@ fn new_session() -> ProjectSession {
     ProjectSession {
         claude_session: uuid::Uuid::new_v4().to_string(),
         claude_started: false,
+        prompted_for: None,
     }
 }
 
@@ -37,6 +38,7 @@ pub fn launch(paths: &Paths, claude_home: Option<&Path>) -> Result<Launch> {
     let app = AppConfig::read(paths)?;
     let cwd = config_repo::sync_worktree_dir(paths)?;
     let state = open_state(paths)?;
+    let record = config_repo::sync_status(paths)?;
     let mut session = state.app_session(KEY)?.unwrap_or_else(new_session);
     let mut replaced_missing = false;
     if session.claude_started
@@ -45,6 +47,9 @@ pub fn launch(paths: &Paths, claude_home: Option<&Path>) -> Result<Launch> {
     {
         session = new_session();
         replaced_missing = true;
+    }
+    if !session.claude_started {
+        session.prompted_for = stopped_sync(&record);
     }
     state.save_app_session(KEY, &session)?;
 
@@ -59,7 +64,7 @@ pub fn launch(paths: &Paths, claude_home: Option<&Path>) -> Result<Launch> {
         args.extend([
             "--session-id".into(),
             session.claude_session,
-            prompt(&config_repo::sync_status(paths)?),
+            prompt(&record),
         ]);
     }
     let mut env: BTreeMap<String, String> = config_repo::identity_env(paths, &cwd)
@@ -75,6 +80,41 @@ pub fn launch(paths: &Paths, claude_home: Option<&Path>) -> Result<Launch> {
         env,
         replaced_missing,
     })
+}
+
+/// Which stopped sync a prompt for `record` is about, or `None` when there's none to resolve. A
+/// sync stays the same one, keeping its base and upstream, while its files are being fixed.
+fn stopped_sync(record: &SyncRecord) -> Option<String> {
+    match &record.state {
+        SyncState::Conflict { .. }
+        | SyncState::HeldBack { .. }
+        | SyncState::HeldInSyncWorktree { .. } => Some(match &record.base {
+            Some(base) => format!("{base}..{}", record.upstream.as_deref().unwrap_or("")),
+            None => serde_json::to_string(&record.state).unwrap_or_default(),
+        }),
+        _ => None,
+    }
+}
+
+/// Readies the settings session to resolve the stopped sync: the next launch resumes its
+/// conversation only when that started about the same stopped sync, and otherwise starts a new
+/// one with the current prompt. Returns whether it started over, so a running session must be
+/// stopped first.
+pub fn prepare_resolve(paths: &Paths) -> Result<bool> {
+    let state = open_state(paths)?;
+    let Some(session) = state.app_session(KEY)? else {
+        return Ok(false);
+    };
+    if !starts_over(&session, &config_repo::sync_status(paths)?) {
+        return Ok(false);
+    }
+    state.save_app_session(KEY, &new_session())?;
+    Ok(true)
+}
+
+fn starts_over(session: &ProjectSession, record: &SyncRecord) -> bool {
+    let current = stopped_sync(record);
+    session.claude_started && (current.is_none() || session.prompted_for != current)
 }
 
 fn prompt(record: &SyncRecord) -> String {
@@ -103,7 +143,7 @@ fn prompt(record: &SyncRecord) -> String {
             list(files)
         ),
         (SyncState::HeldInSyncWorktree { files }, _) => format!(
-            "Tworky config syncs are on hold because these files in this folder have uncommitted changes: {}. If they're a fix in progress, finish it, then `git add` them and run `git commit`. If they're unwanted, tell me to abort the sync, which discards them.",
+            "Tworky config syncs are on hold because these files in this folder have uncommitted changes: {}. If they're a fix in progress, finish it, then `git add` them and run `git commit`. If they're unwanted, tell me to abort the sync and then sync again: the abort pauses syncing, and the next sync I start discards them.",
             list(files)
         ),
         (SyncState::HeldBack { files, .. }, _) => format!(
@@ -177,6 +217,49 @@ mod tests {
     }
 
     #[test]
+    fn resolving_resumes_only_a_conversation_about_the_same_stopped_sync() {
+        let stopped = |state, base: &str| SyncRecord {
+            state,
+            base: Some(base.into()),
+            upstream: Some("u".into()),
+            ..Default::default()
+        };
+        let files = || vec!["projects/acme/memory.md".to_string()];
+        let conflict = stopped(SyncState::Conflict { files: files() }, "b1");
+        let session = |started, record: &SyncRecord| ProjectSession {
+            claude_started: started,
+            prompted_for: stopped_sync(record),
+            ..new_session()
+        };
+        let about_conflict = session(true, &conflict);
+        assert!(!starts_over(&about_conflict, &conflict));
+        let held = stopped(SyncState::HeldInSyncWorktree { files: files() }, "b1");
+        assert!(
+            !starts_over(&about_conflict, &held),
+            "fixing the same sync keeps the conversation"
+        );
+        let another = stopped(SyncState::Conflict { files: files() }, "b2");
+        assert!(starts_over(&about_conflict, &another));
+        let idle = SyncRecord::default();
+        assert!(starts_over(&session(true, &idle), &conflict));
+        assert!(starts_over(&about_conflict, &idle));
+        assert!(!starts_over(&session(false, &idle), &conflict));
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config_repo::test_home(dir.path());
+        assert!(!prepare_resolve(&paths).unwrap());
+        launch(&paths, None).unwrap();
+        mark_started(&paths).unwrap();
+        assert!(prepare_resolve(&paths).unwrap());
+        assert!(
+            launch(&paths, None)
+                .unwrap()
+                .args
+                .contains(&"--session-id".to_string())
+        );
+    }
+
+    #[test]
     fn leaves_the_identity_to_git_when_the_user_has_one() {
         let dir = tempfile::tempdir().unwrap();
         let paths = config_repo::test_home(dir.path());
@@ -231,6 +314,7 @@ mod tests {
             ..Default::default()
         });
         assert!(on_hold.contains("uncommitted"), "{on_hold}");
+        assert!(on_hold.contains("sync again"), "{on_hold}");
         assert!(on_hold.contains("projects/beta/project.toml"), "{on_hold}");
     }
 }
