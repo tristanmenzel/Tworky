@@ -461,7 +461,7 @@ enum RemoteCommand {
     /// its own takes the remote's; one with history joins it, merging the two.
     Set {
         url: String,
-        /// Use a public repo without asking
+        /// Use a public repo, or one whose visibility can't be checked, without asking
         #[arg(long)]
         yes: bool,
     },
@@ -661,6 +661,9 @@ fn apply_session_change(paths: &Paths, id: &str, change: SessionChange) -> Resul
 
 fn config(paths: &Paths, cmd: ConfigCommand) -> Result<()> {
     use tworky_core::config_repo::{self, Trigger};
+    if matches!(cmd, ConfigCommand::Remote(_)) {
+        refuse_in_session(|var| std::env::var_os(var).is_some())?;
+    }
     let status = matches!(cmd, ConfigCommand::Status);
     let record = match cmd {
         ConfigCommand::Status => {
@@ -668,7 +671,9 @@ fn config(paths: &Paths, cmd: ConfigCommand) -> Result<()> {
             println!("repo:    {}", paths.repo_dir().display());
             println!(
                 "remote:  {}",
-                config_repo::remote_url(paths).unwrap_or_else(|| "none".into())
+                config_repo::remote_url(paths)
+                    .map(|url| config_repo::redact_url(&url))
+                    .unwrap_or_else(|| "none".into())
             );
             if let Some(visibility) = status.sync.visibility {
                 println!(
@@ -696,15 +701,18 @@ fn config(paths: &Paths, cmd: ConfigCommand) -> Result<()> {
             print_warnings(&check.warnings);
             if check.needs_confirmation
                 && !yes
-                && !confirm(&format!("Sync your config with the public {}?", check.url))?
+                && !confirm(&format!(
+                    "{}. Sync your config with it anyway?",
+                    check.risk()
+                ))?
             {
-                anyhow::bail!("not syncing with {}", check.url);
+                anyhow::bail!("not syncing with {}", config_repo::redact_url(&check.url));
             }
             config_repo::connect_remote(paths, &config_repo::Gh, &check.url, true)?.sync
         }
         ConfigCommand::Remote(RemoteCommand::Create { owner }) => {
             let created = config_repo::create_remote(paths, &config_repo::Gh, owner.as_deref())?;
-            println!("remote:  {}", created.check.url);
+            println!("remote:  {}", config_repo::redact_url(&created.check.url));
             print_warnings(&created.check.warnings);
             created.sync
         }
@@ -721,11 +729,25 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-/// Asks a yes/no question on the terminal. Without one, fails, naming the flag that answers it.
+/// Refuses to change the config's remote inside a Tworky session, whose Claude must not be able
+/// to point the user's config somewhere else or answer the confirmation for them. `is_set` says
+/// whether an environment variable is set.
+fn refuse_in_session(is_set: impl Fn(&str) -> bool) -> Result<()> {
+    let session = ["TW_WORKER_ID", "WA_WORKER_ID", "TW_SETUP_SESSION"]
+        .iter()
+        .any(|var| is_set(var));
+    anyhow::ensure!(
+        !session,
+        "the config's remote can't be changed from a Tworky session; change it in Tworky's Settings, or run this in your own terminal"
+    );
+    Ok(())
+}
+
+/// Asks a yes/no question on the terminal. Without one, fails.
 fn confirm(question: &str) -> Result<bool> {
     use std::io::{IsTerminal, Write};
     if !std::io::stdin().is_terminal() {
-        anyhow::bail!("{question} Pass --yes to confirm");
+        anyhow::bail!("{question} This needs confirming, and there's no terminal to ask on");
     }
     eprint!("{question} [y/N] ");
     std::io::stderr().flush()?;
@@ -1861,6 +1883,17 @@ mod tests {
             change(Activity::Working, SessionFlags::default(), main),
             SessionChange::Record(Activity::Working)
         );
+    }
+
+    #[test]
+    fn the_remote_is_never_changed_from_a_session() {
+        for session in ["TW_WORKER_ID", "WA_WORKER_ID", "TW_SETUP_SESSION"] {
+            let e = refuse_in_session(|var| var == session).unwrap_err();
+            let message = e.to_string();
+            assert!(message.contains("Settings"), "{session}: {message}");
+            assert!(!message.contains("--yes"), "{session}: {message}");
+        }
+        refuse_in_session(|_| false).unwrap();
     }
 
     #[test]

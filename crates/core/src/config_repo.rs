@@ -21,6 +21,7 @@ const FALLBACK_EMAIL_ARG: &str = "user.email=tworky@localhost";
 
 const INIT_MESSAGE: &str = "Start the Tworky config";
 const JOIN_MESSAGE: &str = "Join the shared Tworky config";
+const MERGE_MESSAGE: &str = "Merge the shared Tworky config";
 
 const REMOTE: &str = "origin";
 
@@ -168,7 +169,44 @@ pub fn git(paths: &Paths, dir: &Path, args: &[&str], timeout: Duration) -> Resul
     }
     #[cfg(test)]
     tests::isolate(&mut cmd, args)?;
-    process::output_timeout(cmd, &process::describe("git", args), timeout)
+    let shown: Vec<String> = args.iter().map(|arg| redact_url(arg)).collect();
+    let shown: Vec<&str> = shown.iter().map(String::as_str).collect();
+    process::output_timeout(cmd, &process::describe("git", &shown), timeout).map_err(|e| {
+        let message = format!("{e:#}");
+        let redacted = redact_url(&message);
+        if redacted == message {
+            e
+        } else {
+            anyhow::anyhow!(redacted)
+        }
+    })
+}
+
+/// `text` with the user name and password of every `scheme://user:password@host` URL in it
+/// replaced by `***`, for errors and anything else Tworky shows or records.
+pub fn redact_url(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| {
+                matches!(c, '/' | '\\' | '?' | '#' | '\'' | '"' | '`') || c.is_whitespace()
+            })
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str("***@");
+                out.push_str(&authority[at + 1..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn forward_slashes(path: &Path) -> String {
@@ -205,7 +243,18 @@ fn create(
     if built.is_err() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
-    built.with_context(|| format!("creating the config repo {}", repo.display()))
+    built.with_context(|| format!("creating the config repo {}", repo.display()))?;
+    forget_sync_record(paths);
+    Ok(())
+}
+
+/// Starts a new sync record for a repo that was just created or cloned, since the commits an
+/// older repo's record names aren't in it. A record that can't be reset is only logged:
+/// [`resumable`] starts over from commits it can't find anyway.
+fn forget_sync_record(paths: &Paths) {
+    if let Err(e) = update_record(paths, |r| *r = SyncRecord::default()) {
+        eprintln!("resetting the config sync record: {e:#}");
+    }
 }
 
 fn scaffold(paths: &Paths, dir: &Path) -> Result<()> {
@@ -1327,6 +1376,21 @@ fn resumable<'a>(
     let Some(base) = before.base.as_deref() else {
         return Ok(None);
     };
+    let recorded = [
+        Some(base),
+        before.upstream.as_deref(),
+        before.result.as_deref(),
+    ];
+    if let Some(missing) = recorded
+        .into_iter()
+        .flatten()
+        .find(|rev| rev_parse(paths, dir, rev).is_err())
+    {
+        eprintln!(
+            "the stopped config sync names {missing}, which the config repo doesn't have; starting over"
+        );
+        return Ok(None);
+    }
     let head = rev_parse(paths, dir, "HEAD")?;
     let main = rev_parse(paths, &paths.repo_dir(), "refs/heads/main")?;
     if is_ancestor(paths, dir, &head, &main)? {
@@ -1385,8 +1449,9 @@ fn uncommitted_in(paths: &Paths, dir: &Path) -> Result<Option<Held>> {
     }))
 }
 
-/// Steps 1 and 2: fetches, then rebases `main`'s commits onto the remote's in `repo-sync`. Refuses
-/// to discard uncommitted changes there unless `discard`.
+/// Steps 1 and 2: fetches, then rebases `main`'s commits onto the remote's in `repo-sync`, or
+/// merges where the two histories haven't joined on both sides. Refuses to discard uncommitted
+/// changes there unless `discard`.
 fn start(paths: &Paths, dir: &Path, discard: bool, network: Duration) -> Result<Step> {
     if !discard && let Some(held) = uncommitted_in(paths, dir)? {
         bail!(held.message);
@@ -1400,7 +1465,20 @@ fn start(paths: &Paths, dir: &Path, discard: bool, network: Duration) -> Result<
     if let Some(upstream) = &upstream
         && !is_ancestor(paths, dir, upstream, &base)?
     {
-        let integrated = if shares_history(paths, dir, upstream, &base)? {
+        let ours = roots(paths, dir, &base)?;
+        let theirs = roots(paths, dir, upstream)?;
+        let shared = ours.iter().any(|root| theirs.contains(root));
+        let unpushed_join = shared && ours.iter().any(|root| !theirs.contains(root));
+        let integrated = if unpushed_join {
+            // `main` holds a join the remote hasn't taken yet. Rebasing would make the join's
+            // merge again and raise every clash it settled, so the remote's commits are merged in.
+            git_committing(
+                paths,
+                dir,
+                &["merge", "-q", "--no-edit", "-m", MERGE_MESSAGE, upstream],
+            )
+            .map(drop)
+        } else if shared {
             git_committing(paths, dir, &["rebase", "-q", "--rebase-merges", upstream]).map(drop)
         } else {
             match git_committing(
@@ -1455,22 +1533,18 @@ fn settle_empty_sides(paths: &Paths, dir: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Whether `a` and `b` grew from a common first commit. Two machines' config repos that each
-/// started on their own don't, until one joins the other's history.
-fn shares_history(paths: &Paths, dir: &Path, a: &str, b: &str) -> Result<bool> {
-    let roots = |rev: &str| -> Result<Vec<String>> {
-        Ok(git(
-            paths,
-            dir,
-            &["rev-list", "--max-parents=0", rev],
-            LOCAL_TIMEOUT,
-        )?
-        .lines()
-        .map(String::from)
-        .collect())
-    };
-    let theirs = roots(b)?;
-    Ok(roots(a)?.iter().any(|root| theirs.contains(root)))
+/// The first commits `rev` grew from. Two machines' config repos that each started on their own
+/// share none until one joins the other's history, and a join has both.
+fn roots(paths: &Paths, dir: &Path, rev: &str) -> Result<Vec<String>> {
+    Ok(git(
+        paths,
+        dir,
+        &["rev-list", "--max-parents=0", rev],
+        LOCAL_TIMEOUT,
+    )?
+    .lines()
+    .map(String::from)
+    .collect())
 }
 
 /// A rebase or merge in `repo-sync` failed: a conflict if it stopped, else the failure.
@@ -1986,7 +2060,9 @@ fn abort_in_progress(paths: &Paths) -> Result<()> {
 
 /// Makes `url` the repo's remote and syncs with it. A repo holding only its first commit takes the
 /// remote's history when the remote has any. A repo with history of its own joins the remote's: the
-/// sync merges the two in `repo-sync`, and a conflict stops it there like any other.
+/// sync merges the two in `repo-sync`, and a conflict stops it there like any other. A failure
+/// removes the remote again, unless the repo already took the remote's history: then the remote
+/// stays and the sync record shows why it stopped.
 fn set_remote(paths: &Paths, url: &str) -> Result<SyncRecord> {
     set_remote_within(paths, url, NETWORK_TIMEOUT)
 }
@@ -2006,41 +2082,73 @@ fn set_remote_within(paths: &Paths, url: &str, network: Duration) -> Result<Sync
     let _sync = with_sync_lock(paths)?;
     if let Some(current) = remote_url(paths) {
         bail!(
-            "the config repo already syncs with {current}; remove it first with `tw config remote rm`"
+            "the config repo already syncs with {}; remove it first with `tw config remote rm`",
+            redact_url(&current)
         );
     }
     let repo = paths.repo_dir();
     git(paths, &repo, &["remote", "add", REMOTE, url], LOCAL_TIMEOUT)?;
-    let incoming = match take_remote_history(paths, network) {
-        Ok(incoming) => incoming,
+    let taken = match take_remote_history(paths, network) {
+        Ok(taken) => taken,
         Err(e) => {
-            let _ = git(paths, &repo, &["remote", "remove", REMOTE], LOCAL_TIMEOUT);
+            forget_remote(paths);
             bail!("{}", failure_message(&e));
         }
     };
-    sync_locked(paths, Trigger::User, network)?;
-    update_record(paths, |r| r.incoming.add(incoming))
+    if let Err(e) = sync_locked(paths, Trigger::User, network) {
+        if taken.is_none() {
+            forget_remote(paths);
+            return Err(e);
+        }
+        update_record(paths, |r| {
+            if !matches!(r.state, SyncState::HeldInSyncWorktree { .. }) {
+                r.state = SyncState::Error {
+                    message: failure_message(&e),
+                };
+            }
+        })?;
+    }
+    update_record(paths, |r| r.incoming.add(taken.unwrap_or_default()))
 }
 
-/// Takes the remote's history into a repo that has only its first commit. Nothing to take while
-/// the remote is empty, or when the repo has history of its own, which the sync joins to the
-/// remote's.
-fn take_remote_history(paths: &Paths, network: Duration) -> Result<Incoming> {
+/// Removes the remote and what [`set_remote`] configured for it, and resets the sync record, so
+/// the repo is as it was before the remote was set. Best effort: it runs after another failure.
+fn forget_remote(paths: &Paths) {
+    let repo = paths.repo_dir();
+    let run = |args: &[&str]| git(paths, &repo, args, LOCAL_TIMEOUT);
+    let _ = run(&["remote", "remove", REMOTE]);
+    for key in ["branch.main.remote", "branch.main.merge"] {
+        let _ = run(&["config", "--unset-all", key]);
+    }
+    let _ = update_record(paths, reset_to_no_remote);
+}
+
+fn reset_to_no_remote(r: &mut SyncRecord) {
+    *r = SyncRecord {
+        state: SyncState::NoRemote,
+        last_sync: r.last_sync,
+        incoming: std::mem::take(&mut r.incoming),
+        ..Default::default()
+    }
+}
+
+/// Takes the remote's history into a repo that has only its first commit, returning what came in.
+/// `None`, having taken nothing, while the remote is empty, or when the repo has history of its
+/// own, which the sync joins to the remote's.
+fn take_remote_history(paths: &Paths, network: Duration) -> Result<Option<Incoming>> {
     let repo = paths.repo_dir();
     let run = |args: &[&str]| git(paths, &repo, args, LOCAL_TIMEOUT);
     run(&["config", "branch.main.remote", REMOTE])?;
     run(&["config", "branch.main.merge", "refs/heads/main"])?;
     git(paths, &repo, &["fetch", "-q", "--prune", REMOTE], network)?;
     let Some(upstream) = remote_main(paths, &repo)? else {
-        return Ok(Incoming::default());
+        return Ok(None);
     };
     let guard = with_lock(paths)?;
     sweep(&guard, paths)?;
     let main = rev_parse(paths, &repo, "refs/heads/main")?;
-    let init_only = run(&["rev-list", "--count", "main"])?.trim() == "1"
-        && run(&["log", "-1", "--format=%s", "main"])?.trim() == INIT_MESSAGE;
-    if !init_only {
-        return Ok(Incoming::default());
+    if !is_init_only(paths)? {
+        return Ok(None);
     }
     let local = changes(paths, &repo)?;
     if !local.is_empty() {
@@ -2051,7 +2159,15 @@ fn take_remote_history(paths: &Paths, network: Duration) -> Result<Incoming> {
     }
     run(&["reset", "-q", "--keep", &upstream])?;
     let files = diff_names(paths, &repo, &main, &upstream)?;
-    Ok(summarize(paths, &repo, &main, &upstream, &files))
+    Ok(Some(summarize(paths, &repo, &main, &upstream, &files)))
+}
+
+/// Whether `main` is still only the first commit [`init`] made.
+fn is_init_only(paths: &Paths) -> Result<bool> {
+    let repo = paths.repo_dir();
+    let run = |args: &[&str]| git(paths, &repo, args, LOCAL_TIMEOUT);
+    Ok(run(&["rev-list", "--count", "main"])?.trim() == "1"
+        && run(&["log", "-1", "--format=%s", "main"])?.trim() == INIT_MESSAGE)
 }
 
 /// Refuses, in a debug build, the repo name the installed Tworky's remote has, so a dev home never
@@ -2069,11 +2185,21 @@ fn refuse_release_remote(name: &str) -> Result<()> {
 /// `git@github.com:me/tworky-config.git`.
 fn remote_repo_name(url: &str) -> &str {
     let url = url.trim_end_matches(['/', '\\']);
-    let name = url.rsplit(['/', ':', '\\']).next().unwrap_or(url);
-    name.strip_suffix(".git").unwrap_or(name)
+    without_git_suffix(url.rsplit(['/', ':', '\\']).next().unwrap_or(url))
 }
 
-/// Stops syncing: aborts anything in progress in `repo-sync` and removes the remote.
+/// `name` without one trailing `.git`, in any case.
+fn without_git_suffix(name: &str) -> &str {
+    match name.len().checked_sub(4) {
+        Some(at) if name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(".git") => {
+            &name[..at]
+        }
+        _ => name,
+    }
+}
+
+/// Stops syncing: aborts anything in progress in `repo-sync`, clears it and removes the remote.
+/// Refuses while `repo-sync` holds changes the user hasn't committed or given up with [`abort`].
 pub fn remove_remote(paths: &Paths) -> Result<SyncRecord> {
     if !paths.has_repo() {
         bail!(
@@ -2085,21 +2211,28 @@ pub fn remove_remote(paths: &Paths) -> Result<SyncRecord> {
     if remote_url(paths).is_none() {
         bail!("the config repo has no remote");
     }
-    abort_in_progress(paths)?;
+    let dir = paths.repo_sync_dir();
+    if is_worktree(paths, &dir) {
+        let files = changes(paths, &dir)?;
+        if !files.is_empty() && !read_record(paths).paused {
+            bail!(
+                "the config sync's worktree {} has changes to {} that removing the remote would discard; commit them there, or run `tw config abort` to give them up, then remove the remote",
+                dir.display(),
+                files.join(", ")
+            );
+        }
+        abort_in_progress(paths)?;
+        let run = |args: &[&str]| git(paths, &dir, args, LOCAL_TIMEOUT);
+        run(&["reset", "-q", "--hard"])?;
+        run(&["clean", "-fdq"])?;
+    }
     git(
         paths,
         &paths.repo_dir(),
         &["remote", "remove", REMOTE],
         LOCAL_TIMEOUT,
     )?;
-    update_record(paths, |r| {
-        *r = SyncRecord {
-            state: SyncState::NoRemote,
-            last_sync: r.last_sync,
-            incoming: std::mem::take(&mut r.incoming),
-            ..Default::default()
-        }
-    })
+    update_record(paths, reset_to_no_remote)
 }
 
 /// What Tworky asks GitHub about remotes. [`Gh`] asks `gh`; tests answer themselves.
@@ -2140,26 +2273,34 @@ pub fn default_remote_name() -> &'static str {
 /// What the user should know about a remote before their config syncs with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RemoteCheck {
-    /// The URL git uses: an `owner/name` given as the remote becomes its GitHub URL.
+    /// The URL git uses: an `owner/name` given as the remote becomes its GitHub URL. Shown with
+    /// any credentials in it redacted.
+    #[serde(serialize_with = "serialize_redacted")]
     pub url: String,
     pub visibility: Visibility,
     pub warnings: Vec<String>,
-    /// The repo is public, so it's used only once the user confirms.
+    /// The repo is public, or Tworky can't tell who can see it, so it's used only once the user
+    /// confirms.
     pub needs_confirmation: bool,
+}
+
+fn serialize_redacted<S: serde::Serializer>(url: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&redact_url(url))
 }
 
 /// Who can see `remote` (a URL, path or GitHub `owner/name`), and whether its owner is someone else.
 pub fn check_remote(gh: &dyn GitHub, remote: &str) -> Result<RemoteCheck> {
     let url = remote_url_for(remote)?;
     refuse_release_remote(remote_repo_name(&url))?;
-    let Some((owner, name)) = github_repo(&url) else {
+    let shown = redact_url(&url);
+    let Some((owner, name)) = github_repo(&url).or_else(|| ssh_alias_repo(gh, &url)) else {
         return Ok(RemoteCheck {
             warnings: vec![format!(
-                "{url} isn't a GitHub repo, so Tworky can't check who can see it; make sure it's private"
+                "Tworky can't check who can see {shown}; make sure it's private"
             )],
             url,
             visibility: Visibility::Unknown,
-            needs_confirmation: false,
+            needs_confirmation: true,
         });
     };
     let nwo = format!("{owner}/{name}");
@@ -2196,8 +2337,23 @@ pub fn check_remote(gh: &dyn GitHub, remote: &str) -> Result<RemoteCheck> {
         url,
         visibility,
         warnings,
-        needs_confirmation: visibility == Visibility::Public,
+        needs_confirmation: matches!(visibility, Visibility::Public | Visibility::Unknown),
     })
+}
+
+/// The GitHub `owner/name` behind an SSH remote on a host alias such as
+/// `git@github-personal:me/tworky-config.git`, when gh knows that repo.
+fn ssh_alias_repo(gh: &dyn GitHub, url: &str) -> Option<(String, String)> {
+    let remote = split_remote(url)?;
+    let host = remote.host.to_ascii_lowercase();
+    if !remote.ssh || (host.contains('.') && !host.contains("github")) {
+        return None;
+    }
+    let (owner, name) = owner_and_name(remote.path)?;
+    gh.repo(&format!("{owner}/{name}"))
+        .ok()
+        .flatten()
+        .map(|_| (owner, name))
 }
 
 /// A warning when `owner` isn't the user, since whoever can push to the remote changes what runs
@@ -2228,32 +2384,64 @@ fn remote_url_for(remote: &str) -> Result<String> {
         _ => false,
     };
     Ok(if shorthand {
-        format!("https://github.com/{remote}.git")
+        format!("https://github.com/{}.git", without_git_suffix(remote))
     } else {
         remote.to_string()
     })
 }
 
-/// The owner and name of a GitHub remote URL, or `None` for anything else.
-fn github_repo(url: &str) -> Option<(String, String)> {
-    let lower = url.to_ascii_lowercase();
-    let rest = [
-        "https://github.com/",
-        "http://github.com/",
-        "ssh://git@github.com/",
-        "git@github.com:",
-        "git://github.com/",
-    ]
-    .iter()
-    .find_map(|prefix| lower.starts_with(prefix).then(|| &url[prefix.len()..]))?;
-    let rest = rest.trim_end_matches('/');
-    let rest = rest.strip_suffix(".git").unwrap_or(rest);
-    match rest.split('/').collect::<Vec<_>>().as_slice() {
+/// A remote URL's host and path. `ssh` is set for `ssh://` URLs and scp-like `user@host:path`
+/// ones, whose host may be an alias from the user's SSH config.
+struct RemoteParts<'a> {
+    host: &'a str,
+    path: &'a str,
+    ssh: bool,
+}
+
+/// Splits a `scheme://[userinfo@]host[:port]/path` URL or a scp-like `[user@]host:path`, or
+/// returns `None` for a local path.
+fn split_remote(url: &str) -> Option<RemoteParts<'_>> {
+    let (authority, path, ssh) = match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            (authority, path, scheme.eq_ignore_ascii_case("ssh"))
+        }
+        None => {
+            let (authority, path) = url.split_once(':')?;
+            // A drive letter (`C:/config.git`) or a path holding a colon isn't a host.
+            if authority.len() < 2 || authority.contains(['/', '\\']) {
+                return None;
+            }
+            (authority, path, true)
+        }
+    };
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match host.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+        _ => host,
+    };
+    (!host.is_empty()).then_some(RemoteParts { host, path, ssh })
+}
+
+/// `owner/name` from a remote's path, with any `.git` and slashes around it dropped.
+fn owner_and_name(path: &str) -> Option<(String, String)> {
+    let path = without_git_suffix(path.trim_matches('/'));
+    match path.split('/').collect::<Vec<_>>().as_slice() {
         [owner, name] if !owner.is_empty() && !name.is_empty() => {
             Some((owner.to_string(), name.to_string()))
         }
         _ => None,
     }
+}
+
+/// The owner and name of a GitHub remote URL, or `None` for anything else.
+fn github_repo(url: &str) -> Option<(String, String)> {
+    let remote = split_remote(url)?;
+    let host = remote.host.to_ascii_lowercase();
+    if host != "github.com" && host != "www.github.com" {
+        return None;
+    }
+    owner_and_name(remote.path)
 }
 
 /// A remote the config now syncs with, and what the user was warned about it.
@@ -2266,11 +2454,22 @@ pub struct Connected {
 fn needs_confirmation(check: &RemoteCheck, confirmed: bool) -> Result<()> {
     if check.needs_confirmation && !confirmed {
         bail!(
-            "{} is public; confirm to sync your config with it anyway",
-            check.url
+            "{}; confirm to sync your config with it anyway",
+            check.risk()
         );
     }
     Ok(())
+}
+
+impl RemoteCheck {
+    /// Why the remote needs confirming, for a question or an error.
+    pub fn risk(&self) -> String {
+        let url = redact_url(&self.url);
+        match self.visibility {
+            Visibility::Public => format!("{url} is public"),
+            _ => format!("Tworky can't check who can see {url}"),
+        }
+    }
 }
 
 /// Checks `remote` ([`check_remote`]), then makes it the remote and syncs with it. A public repo
@@ -2309,7 +2508,8 @@ fn create_remote_named(
     }
     if let Some(current) = remote_url(paths) {
         bail!(
-            "the config repo already syncs with {current}; remove it first with `tw config remote rm`"
+            "the config repo already syncs with {}; remove it first with `tw config remote rm`",
+            redact_url(&current)
         );
     }
     let owner = match owner.map(str::trim).filter(|o| !o.is_empty()) {
@@ -2334,7 +2534,7 @@ fn create_remote_named(
     };
     set_remote(paths, &check.url).with_context(|| {
         format!(
-            "created {nwo}, but couldn't sync with it; run `tw config remote set {nwo}` to try again"
+            "created {nwo}, but couldn't sync with it, so the config doesn't use it yet; once the problem below is fixed, connect it from Settings › Remote or with `tw config remote set {nwo}` in your own terminal"
         )
     })?;
     let sync = update_record(paths, |r| r.visibility = Some(check.visibility))?;
@@ -2416,10 +2616,18 @@ fn use_shared_config_within(
 ) -> Result<Connected> {
     let check = check_remote(gh, remote)?;
     needs_confirmation(&check, confirmed)?;
-    if !clone_into_repo(paths, &check.url, network)? {
+    let cloned = !is_unconnected_init(paths)? && clone_into_repo(paths, &check.url, network)?;
+    if !cloned {
         {
             let guard = with_lock(paths)?;
-            init(&guard, paths)?;
+            if !paths.has_repo() {
+                init(&guard, paths)?;
+            } else if !is_unconnected_init(paths)? {
+                bail!(
+                    "{} already exists; set its remote with `tw config remote set` instead",
+                    paths.repo_dir().display()
+                );
+            }
         }
         set_remote_within(paths, &check.url, network)?;
     }
@@ -2440,6 +2648,12 @@ fn use_shared_config_within(
         Err(e) => eprintln!("looking for clones: {e:#}"),
     }
     Ok(Connected { check, sync })
+}
+
+/// Whether `repo/` holds only its first commit and has no remote, as [`use_shared_config`] leaves
+/// it when connecting an empty remote fails, so trying again connects it rather than cloning.
+fn is_unconnected_init(paths: &Paths) -> Result<bool> {
+    Ok(paths.has_repo() && remote_url(paths).is_none() && is_init_only(paths)?)
 }
 
 /// Clones `url` into `repo.tmp/`, gives it the repo-local config [`init`] writes and checks out its
@@ -2480,12 +2694,14 @@ fn clone_into_repo(paths: &Paths, url: &str, network: Duration) -> Result<bool> 
         rename_retrying(&tmp, &repo, RENAME_RETRY)?;
         Ok(true)
     })();
-    if !matches!(cloned, Ok(true)) {
+    if matches!(cloned, Ok(true)) {
+        forget_sync_record(paths);
+    } else {
         let _ = std::fs::remove_dir_all(&tmp);
     }
     cloned
         .map_err(|e: anyhow::Error| anyhow::anyhow!("{}", failure_message(&e)))
-        .with_context(|| format!("cloning {url}"))
+        .with_context(|| format!("cloning {}", redact_url(url)))
 }
 
 pub fn write_machine(_guard: &RepoLock, paths: &Paths, text: &str) -> Result<()> {
@@ -4227,6 +4443,79 @@ mod tests {
         assert_eq!(head(&m.a), head(&c));
     }
 
+    #[test]
+    fn a_join_the_remote_has_not_taken_is_merged_with_its_new_commits() {
+        let m = machines();
+        commit_file(&m.a, MEMORY, "# Acme\n- from A\n");
+        sync_now(&m.a);
+        let c = own_home(&m, "c");
+        commit_file(&c, MEMORY, "# Acme\n- from C\n");
+        assert!(matches!(
+            set_remote(&c, &m.remote).unwrap().state,
+            SyncState::Conflict { .. }
+        ));
+        let resolved = "# Acme\n- from A\n- from C\n";
+        std::fs::write(c.repo_sync_dir().join(MEMORY), resolved).unwrap();
+        in_sync_dir(&c, &["add", MEMORY]);
+        commit_in_sync_dir(&c, JOIN_MESSAGE);
+
+        commit_file(&m.a, "projects/gamma/memory.md", "# Gamma\n");
+        assert_eq!(sync_now(&m.a).state, SyncState::Idle);
+        let remote = m.dir.path().join("remote.git");
+        let away = m.dir.path().join("remote.away");
+        std::fs::rename(&remote, &away).unwrap();
+        let failed = sync_now(&c);
+        assert!(
+            matches!(failed.state, SyncState::Error { .. }),
+            "{failed:?}"
+        );
+        assert_eq!(read_file(&c, MEMORY), resolved, "main took the join");
+        std::fs::rename(&away, &remote).unwrap();
+
+        let synced = sync_now(&c);
+        assert_eq!(synced.state, SyncState::Idle, "{synced:?}");
+        assert_eq!(read_file(&c, MEMORY), resolved);
+        assert_eq!(read_file(&c, "projects/gamma/memory.md"), "# Gamma\n");
+        assert_eq!(m.remote_head(), head(&c));
+        assert_eq!(sync_now(&m.a).state, SyncState::Idle);
+        assert_eq!(head(&m.a), head(&c));
+        assert_eq!(read_file(&m.a, MEMORY), resolved);
+
+        commit_file(&m.a, MEMORY, "# Acme\n- from A\n- from C\n- again\n");
+        sync_now(&m.a);
+        commit_file(&c, "projects/gamma/memory.md", "# Gamma\n- from C\n");
+        assert_eq!(sync_now(&c).state, SyncState::Idle);
+        assert_eq!(
+            read_file(&c, MEMORY),
+            "# Acme\n- from A\n- from C\n- again\n"
+        );
+    }
+
+    #[test]
+    fn a_join_whose_push_is_rejected_converges_on_the_next_try() {
+        let m = machines();
+        commit_file(&m.a, MEMORY, "# Acme\n- from A\n");
+        sync_now(&m.a);
+        let c = own_home(&m, "c");
+        commit_file(&c, MEMORY, "# Acme\n- from C\n");
+        assert!(matches!(
+            set_remote(&c, &m.remote).unwrap().state,
+            SyncState::Conflict { .. }
+        ));
+        let resolved = "# Acme\n- from A\n- from C\n";
+        std::fs::write(c.repo_sync_dir().join(MEMORY), resolved).unwrap();
+        in_sync_dir(&c, &["add", MEMORY]);
+        commit_in_sync_dir(&c, JOIN_MESSAGE);
+        commit_file(&m.a, "projects/gamma/memory.md", "# Gamma\n");
+        assert_eq!(sync_now(&m.a).state, SyncState::Idle);
+
+        let synced = sync_now(&c);
+        assert_eq!(synced.state, SyncState::Idle, "{synced:?}");
+        assert_eq!(read_file(&c, MEMORY), resolved);
+        assert_eq!(read_file(&c, "projects/gamma/memory.md"), "# Gamma\n");
+        assert_eq!(m.remote_head(), head(&c));
+    }
+
     #[derive(Default)]
     struct FakeGitHub {
         owners: Vec<String>,
@@ -4332,13 +4621,57 @@ mod tests {
             ("https://github.com/me/odd/", Visibility::Unknown),
             ("https://github.com/me/missing.git", Visibility::Unknown),
             ("https://gitlab.com/me/config.git", Visibility::Unknown),
+            ("git@gitlab.com:me/open.git", Visibility::Unknown),
             ("C:/elsewhere/config.git", Visibility::Unknown),
+            ("/srv/config.git", Visibility::Unknown),
         ] {
             let check = check_remote(&gh, remote).unwrap();
             assert_eq!(check.visibility, visibility, "{remote}");
             assert_eq!(check.warnings.len(), 1, "{remote}: {check:?}");
-            assert!(!check.needs_confirmation, "{remote}");
+            assert_eq!(
+                check.needs_confirmation,
+                visibility == Visibility::Unknown,
+                "{remote}"
+            );
+            assert!(
+                !check.warnings[0].contains("isn't a GitHub repo"),
+                "{remote}: {check:?}"
+            );
         }
+        let elsewhere = check_remote(&gh, "https://gitlab.com/me/config.git").unwrap();
+        assert!(
+            elsewhere.warnings[0].contains("can't check who can see"),
+            "{elsewhere:?}"
+        );
+
+        for remote in [
+            "https://user@github.com/me/open",
+            "https://x:TOKEN@github.com/me/open.git",
+            "https://www.github.com/me/open",
+            "HTTPS://GitHub.com/me/open.GIT",
+            "ssh://git@github.com:22/me/open.git",
+            "ssh://git@github.com/me/open",
+            "git@GitHub.com:me/open.git",
+            "me@github.com:me/open",
+            "git@github-personal:me/open.git",
+            "git@github.com-work:me/open.git",
+            "me/open.git",
+        ] {
+            let check = check_remote(&gh, remote).unwrap();
+            assert_eq!(check.visibility, Visibility::Public, "{remote}");
+            assert!(check.needs_confirmation, "{remote}");
+            assert!(check.warnings[0].contains("public"), "{remote}: {check:?}");
+        }
+        assert_eq!(
+            check_remote(&gh, "me/open.git").unwrap().url,
+            "https://github.com/me/open.git"
+        );
+        let alias = check_remote(&gh, "git@github-personal:me/private.git").unwrap();
+        assert_eq!(alias.visibility, Visibility::Private);
+        assert!(!alias.needs_confirmation);
+        let unknown_alias = check_remote(&gh, "git@github-personal:me/gone.git").unwrap();
+        assert_eq!(unknown_alias.visibility, Visibility::Unknown);
+        assert!(unknown_alias.needs_confirmation);
 
         let org = check_remote(&gh, "https://github.com/acme/config").unwrap();
         assert_eq!(org.warnings.len(), 1, "{org:?}");
@@ -4424,7 +4757,7 @@ mod tests {
         assert!(awaits_first_run(&c));
         let gh = FakeGitHub::new(&["me"]);
 
-        let set_up = use_shared_config(&c, &gh, &m.remote, false).unwrap();
+        let set_up = use_shared_config(&c, &gh, &m.remote, true).unwrap();
         assert!(!awaits_first_run(&c));
         assert!(!c.repo_tmp_dir().exists());
         assert_eq!(set_up.sync.visibility, Some(Visibility::Unknown));
@@ -4449,7 +4782,7 @@ mod tests {
         assert_eq!(sync_now(&m.a).state, SyncState::Idle);
         assert_eq!(read_file(&m.a, MEMORY), "# Acme\n- from C\n");
 
-        let e = use_shared_config(&c, &gh, &m.remote, false).unwrap_err();
+        let e = use_shared_config(&c, &gh, &m.remote, true).unwrap_err();
         assert!(format!("{e:#}").contains("already exists"), "{e:#}");
     }
 
@@ -4463,19 +4796,53 @@ mod tests {
             LOCAL_TIMEOUT,
         )
         .unwrap();
-        let empty = m.dir.path().join("empty.git");
+        let empty = forward_slashes(&m.dir.path().join("empty.git"));
         let c = paths_under(&m.dir.path().join("c"));
+        let gh = FakeGitHub::new(&["me"]);
 
-        use_shared_config(
-            &c,
-            &FakeGitHub::new(&["me"]),
-            &forward_slashes(&empty),
-            false,
+        let e = use_shared_config(&c, &gh, &empty, false).unwrap_err();
+        assert!(e.to_string().contains("confirm"), "{e:#}");
+        assert!(awaits_first_run(&c));
+
+        FAIL.set(Some("fetch"));
+        let e = use_shared_config(&c, &gh, &empty, true).unwrap_err();
+        FAIL.set(None);
+        assert!(format!("{e:#}").contains("injected"), "{e:#}");
+        assert_eq!(log_for_tests(&c), [INIT_MESSAGE]);
+        assert_eq!(remote_url(&c), None);
+
+        use_shared_config(&c, &gh, &empty, true).unwrap();
+        assert_eq!(log_for_tests(&c), [INIT_MESSAGE]);
+        assert_eq!(rev_parse(&c, Path::new(&empty), "main").unwrap(), head(&c));
+        assert!(!c.repo_tmp_dir().exists());
+    }
+
+    #[test]
+    fn a_first_run_that_failed_on_an_empty_remote_takes_the_remote_once_it_has_content() {
+        let m = machines();
+        let c = paths_under(&m.dir.path().join("c"));
+        let gh = FakeGitHub::new(&["me"]);
+        let empty = m.dir.path().join("empty.git");
+        git(
+            &m.a,
+            m.dir.path(),
+            &["init", "-q", "--bare", "-b", "main", "empty.git"],
+            LOCAL_TIMEOUT,
         )
         .unwrap();
-        assert_eq!(log_for_tests(&c), [INIT_MESSAGE]);
-        assert_eq!(rev_parse(&c, &empty, "main").unwrap(), head(&c));
-        assert!(!c.repo_tmp_dir().exists());
+        FAIL.set(Some("fetch"));
+        use_shared_config(&c, &gh, &forward_slashes(&empty), true).unwrap_err();
+        FAIL.set(None);
+
+        commit_file(&m.a, MEMORY, "# Acme\n");
+        sync_now(&m.a);
+        use_shared_config(&c, &gh, &m.remote, true).unwrap();
+        assert_eq!(head(&c), head(&m.a));
+        assert_eq!(read_file(&c, MEMORY), "# Acme\n");
+
+        commit_file(&c, "tworky/claude.local.md", "Mine\n");
+        let e = use_shared_config(&c, &gh, &m.remote, true).unwrap_err();
+        assert!(format!("{e:#}").contains("already exists"), "{e:#}");
     }
 
     #[test]
@@ -4489,7 +4856,7 @@ mod tests {
             &c,
             &gh,
             "ssh://tworky.invalid/config.git",
-            false,
+            true,
             Duration::from_secs(2),
         )
         .unwrap_err();
@@ -4499,7 +4866,7 @@ mod tests {
         assert!(!c.repo_dir().exists());
         assert!(awaits_first_run(&c));
 
-        use_shared_config(&c, &gh, &m.remote, false).unwrap();
+        use_shared_config(&c, &gh, &m.remote, true).unwrap();
         assert_eq!(head(&c), head(&m.a));
         assert!(!c.repo_tmp_dir().exists());
     }
@@ -4512,21 +4879,95 @@ mod tests {
             "https://github.com/me/tworky-config.git",
             "git@github.com:me/Tworky-Config",
             "https://github.com/me/tworky-config/",
+            "https://github.com/me/Tworky-Config.GIT",
+            "C:/remotes/TWORKY-CONFIG.Git",
         ] {
             let e = set_remote(&home.paths, url).unwrap_err();
             assert!(e.to_string().contains("debug build"), "{url}: {e:#}");
         }
         assert_eq!(remote_url(&home.paths), None);
+        let gh = FakeGitHub::new(&["me"]);
+        for remote in ["me/tworky-config.git", "me/Tworky-Config.GIT"] {
+            let e = check_remote(&gh, remote).unwrap_err();
+            assert!(e.to_string().contains("debug build"), "{remote}: {e:#}");
+        }
         assert_eq!(
             remote_repo_name("git@github.com:me/tworky-config-dev.git"),
             "tworky-config-dev"
         );
+        assert_eq!(remote_repo_name("me/Tworky-Config.GIT"), "Tworky-Config");
+        assert_eq!(remote_repo_name("me/config.git.git"), "config.git");
+        assert_eq!(
+            remote_url_for("me/tworky-config-dev.git").unwrap(),
+            "https://github.com/me/tworky-config-dev.git"
+        );
+    }
+
+    #[test]
+    fn credentials_in_a_remote_url_are_never_shown() {
+        assert_eq!(
+            redact_url("https://x:TOKEN@github.com/me/config.git"),
+            "https://***@github.com/me/config.git"
+        );
+        assert_eq!(
+            redact_url("`git clone https://TOKEN@github.com/a/b dir` failed: 'https://u:p@h:1'"),
+            "`git clone https://***@github.com/a/b dir` failed: 'https://***@h:1'"
+        );
+        for plain in [
+            "git@github.com:me/config.git",
+            "https://github.com/me/config.git",
+            "C:/config.git",
+        ] {
+            assert_eq!(redact_url(plain), plain);
+        }
+
+        let gh = FakeGitHub::new(&["me"]);
+        let check = check_remote(&gh, "https://x:TOKEN@gitlab.com/me/config.git").unwrap();
+        assert!(
+            !format!("{check:?}")
+                .replace(&check.url, "")
+                .contains("TOKEN")
+        );
+        assert!(!serde_json::to_string(&check).unwrap().contains("TOKEN"));
+        let e = needs_confirmation(&check, false).unwrap_err();
+        assert!(!format!("{e:#}").contains("TOKEN"), "{e:#}");
+
+        let dir = tempfile::tempdir().unwrap();
+        isolate_git_for_tests(dir.path());
+        let c = paths_under(dir.path());
+        SSH_COMMAND.set(Some("sleep 30 #".into()));
+        let e = clone_into_repo(
+            &c,
+            "ssh://me:TOKEN@tworky.invalid/config.git",
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        SSH_COMMAND.set(None);
+        let message = format!("{e:#}");
+        assert!(message.contains("timed out"), "{message}");
+        assert!(!message.contains("TOKEN"), "{message}");
+        let e = clone_into_repo(
+            &c,
+            "https://me:TOKEN@127.0.0.1:1/missing.git",
+            LOCAL_TIMEOUT,
+        )
+        .unwrap_err();
+        let message = format!("{e:#}");
+        assert!(!message.contains("TOKEN"), "{message}");
     }
 
     #[test]
     fn removing_the_remote_stops_syncing() {
         let m = machines();
         conflicted(&m);
+        let e = remove_remote(&m.b).unwrap_err();
+        assert!(
+            e.to_string().contains(MEMORY) && e.to_string().contains("tw config abort"),
+            "{e:#}"
+        );
+        assert!(remote_url(&m.b).is_some());
+
+        abort(&m.b).unwrap();
         let removed = remove_remote(&m.b).unwrap();
         assert_eq!(removed.state, SyncState::NoRemote);
         assert_eq!(remote_url(&m.b), None);
@@ -4536,6 +4977,103 @@ mod tests {
         );
         assert_eq!(sync_now(&m.b).state, SyncState::NoRemote);
         assert!(remove_remote(&m.b).is_err());
+    }
+
+    #[test]
+    fn an_aborted_change_in_repo_sync_does_not_block_setting_the_remote_again() {
+        let m = machines();
+        let stray = m.b.repo_sync_dir().join("projects/stray/memory.md");
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, "# Stray\n").unwrap();
+        let e = remove_remote(&m.b).unwrap_err();
+        assert!(e.to_string().contains("projects/stray/memory.md"), "{e:#}");
+
+        abort(&m.b).unwrap();
+        remove_remote(&m.b).unwrap();
+        assert!(!stray.exists());
+        let git_config = |key: &str| git(&m.b, &m.b.repo_dir(), &["config", key], LOCAL_TIMEOUT);
+        assert!(git_config("branch.main.remote").is_err());
+
+        let again = set_remote(&m.b, &m.remote).unwrap();
+        assert_eq!(again.state, SyncState::Idle, "{again:?}");
+        assert!(!again.paused);
+    }
+
+    #[test]
+    fn a_remote_that_fails_to_sync_is_not_kept() {
+        let m = machines();
+        let c = own_home(&m, "c");
+        commit_file(&c, "tworky/claude.local.md", "Mine\n");
+        let stray = sync_worktree_dir(&c).unwrap().join(MEMORY);
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, "# Half done\n").unwrap();
+
+        let e = set_remote(&c, &m.remote).unwrap_err();
+        assert!(e.to_string().contains("uncommitted"), "{e:#}");
+        assert_eq!(remote_url(&c), None);
+        let run = |args: &[&str]| git(&c, &c.repo_dir(), args, LOCAL_TIMEOUT);
+        assert!(run(&["config", "branch.main.remote"]).is_err());
+        assert!(run(&["config", "branch.main.merge"]).is_err());
+        assert_eq!(sync_status(&c).unwrap().state, SyncState::NoRemote);
+
+        std::fs::remove_file(&stray).unwrap();
+        let joined = set_remote(&c, &m.remote).unwrap();
+        assert_eq!(joined.state, SyncState::Idle, "{joined:?}");
+        assert_eq!(m.remote_head(), head(&c));
+    }
+
+    #[test]
+    fn a_remote_whose_history_was_taken_stays_when_the_sync_stops() {
+        let m = machines();
+        commit_file(&m.a, MEMORY, "# Acme\n");
+        sync_now(&m.a);
+        let c = own_home(&m, "c");
+        let stray = sync_worktree_dir(&c)
+            .unwrap()
+            .join("projects/stray/memory.md");
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, "# Half done\n").unwrap();
+
+        let connected = set_remote(&c, &m.remote).unwrap();
+        assert!(
+            matches!(connected.state, SyncState::HeldInSyncWorktree { .. }),
+            "{connected:?}"
+        );
+        assert_eq!(remote_url(&c).as_deref(), Some(m.remote.as_str()));
+        assert_eq!(head(&c), head(&m.a));
+        assert_eq!(connected.incoming.guidance, [MEMORY]);
+    }
+
+    #[test]
+    fn a_sync_record_from_an_older_repo_is_forgotten() {
+        let m = machines();
+        let stale = |paths: &Paths| {
+            update_record(paths, |r| {
+                r.state = SyncState::Conflict {
+                    files: vec![MEMORY.into()],
+                };
+                r.base = Some("1".repeat(40));
+                r.upstream = Some("2".repeat(40));
+            })
+            .unwrap();
+        };
+
+        stale(&m.b);
+        let synced = sync_now(&m.b);
+        assert_eq!(synced.state, SyncState::Idle, "{synced:?}");
+        assert_eq!(synced.base, None);
+
+        let c = paths_under(&m.dir.path().join("c"));
+        stale(&c);
+        init(&with_lock(&c).unwrap(), &c).unwrap();
+        assert_eq!(read_record(&c), SyncRecord::default());
+
+        let d = paths_under(&m.dir.path().join("d"));
+        stale(&d);
+        use_shared_config(&d, &FakeGitHub::new(&["me"]), &m.remote, true).unwrap();
+        let record = read_record(&d);
+        assert_eq!((record.base, record.upstream), (None, None));
+        assert_eq!(record.state, SyncState::Idle);
     }
 
     /// The other process in `writers_in_two_processes_take_turns_on_the_lock`; does nothing in a
