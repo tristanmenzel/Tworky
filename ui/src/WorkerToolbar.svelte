@@ -93,12 +93,16 @@
     worker.status !== 'ready' || worker.busy || (worker.session_alive && worker.activity === 'waiting'),
   )
 
+  const working = $derived(activityOf(worker) === 'working')
+
   async function switchConversation(session: string) {
     if (
       worker.session_alive &&
       !(await ask({
         title: 'Switch to this conversation?',
-        message: 'Claude stops and resumes the chosen conversation.',
+        message: working
+          ? 'Claude is working. Switching stops the current turn and any background agents, then resumes the chosen conversation.'
+          : 'Claude stops and resumes the chosen conversation.',
         confirmLabel: 'Switch',
       }))
     )
@@ -110,7 +114,9 @@
     if (
       !(await ask({
         title: 'Start a new conversation?',
-        message: 'The current one ends.',
+        message: working
+          ? 'Claude is working. Starting a new conversation stops the current turn and any background agents.'
+          : 'The current one ends.',
         confirmLabel: 'New conversation',
       }))
     )

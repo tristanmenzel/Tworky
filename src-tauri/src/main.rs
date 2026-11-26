@@ -893,9 +893,15 @@ fn run_session_job(
     let (job_app, job_id) = (app.clone(), id.clone());
     run_job(app, id, move |ws, log| {
         let result = job(ws, pid, log);
-        job_app.state::<AppState>().sessions.kill(&job_id);
+        stop_pty(&job_app, &job_id);
         result
     })
+}
+
+/// A killed session's own exit is ignored as superseded, so stopping reports the exit itself.
+fn stop_pty(app: &AppHandle, id: &str) {
+    app.state::<AppState>().sessions.kill(id);
+    let _ = app.emit("session-exited", id);
 }
 
 #[tauri::command]
@@ -1251,7 +1257,7 @@ fn resize_session(state: State<'_, AppState>, id: String, cols: u16, rows: u16) 
 #[tauri::command]
 async fn stop_session(app: AppHandle, id: String) -> CmdResult<()> {
     if project_setup::session_project(&id).is_some() {
-        app.state::<AppState>().sessions.kill(&id);
+        stop_pty(&app, &id);
         let _ = app.emit("worker-changed", &id);
         return Ok(());
     }
@@ -1281,11 +1287,11 @@ async fn list_conversations(id: String) -> CmdResult<Vec<Conversation>> {
 
 #[tauri::command]
 async fn switch_conversation(app: AppHandle, id: String, session: String) -> CmdResult<()> {
-    app.state::<AppState>().sessions.kill(&id);
     blocking(move || {
-        workspace()?
-            .switch_conversation(&id, &session)
-            .map_err(err)?;
+        let ws = workspace()?;
+        ws.check_conversation(&id, &session).map_err(err)?;
+        app.state::<AppState>().sessions.kill(&id);
+        ws.switch_conversation(&id, &session).map_err(err)?;
         let _ = app.emit("worker-changed", &id);
         Ok(())
     })

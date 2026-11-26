@@ -12,6 +12,9 @@ use crate::state::State;
 const MAX_LISTED: usize = 30;
 const READ_LIMIT: u64 = 2 * 1024 * 1024;
 const PROMPT_CHARS: usize = 100;
+/// Claude Code shortens a longer transcript folder name and adds a hash, which Tworky can't
+/// reproduce.
+const MAX_FOLDER_NAME: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Conversation {
@@ -35,8 +38,7 @@ pub fn list(transcripts_dir: &Path, current: &str) -> Vec<Conversation> {
                 return None;
             }
             let id = path.file_stem()?.to_str()?;
-            let uuid = uuid::Uuid::parse_str(id).ok()?;
-            if !uuid.hyphenated().to_string().eq_ignore_ascii_case(id) {
+            if !is_session_id(id) {
                 return None;
             }
             let meta = entry.metadata().ok().filter(|m| m.is_file())?;
@@ -73,10 +75,17 @@ pub fn list(transcripts_dir: &Path, current: &str) -> Vec<Conversation> {
     found
 }
 
-/// The transcript's first timestamp and first prompt.
+pub fn is_session_id(id: &str) -> bool {
+    uuid::Uuid::parse_str(id)
+        .is_ok_and(|uuid| uuid.hyphenated().to_string().eq_ignore_ascii_case(id))
+}
+
+/// The transcript's first timestamp and first prompt. A slash command counts only once Claude
+/// answers it or the transcript ends there, since built-in commands like `/model` run locally.
 fn read_opening(path: &Path) -> Option<(Option<String>, Option<String>)> {
     let mut reader = BufReader::new(File::open(path).ok()?.take(READ_LIMIT));
     let mut started = None;
+    let mut command = None;
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -90,22 +99,47 @@ fn read_opening(path: &Path) -> Option<(Option<String>, Option<String>)> {
         if started.is_none() {
             started = entry["timestamp"].as_str().map(String::from);
         }
-        if let Some(prompt) = prompt_of(&entry) {
-            return Some((started, Some(prompt)));
+        match classify(&entry) {
+            Entry::Prompt(prompt) => return Some((started, Some(prompt))),
+            Entry::Command(name) => command = Some(name),
+            Entry::LocalOutput => command = None,
+            Entry::Reply if command.is_some() => return Some((started, command)),
+            Entry::Reply | Entry::Other => {}
         }
     }
-    Some((started, None))
+    Some((started, command))
 }
 
-fn prompt_of(entry: &Value) -> Option<String> {
-    if entry["type"] != "user" || entry["isMeta"] == true {
-        return None;
+enum Entry {
+    Prompt(String),
+    Command(String),
+    LocalOutput,
+    Reply,
+    Other,
+}
+
+fn classify(entry: &Value) -> Entry {
+    match entry["type"].as_str() {
+        Some("assistant") => return Entry::Reply,
+        Some("system") => {
+            let local = entry["subtype"] == "local_command"
+                && entry["content"]
+                    .as_str()
+                    .is_some_and(|c| c.trim_start().starts_with("<local-command-std"));
+            return if local {
+                Entry::LocalOutput
+            } else {
+                Entry::Other
+            };
+        }
+        Some("user") if entry["isMeta"] != true => {}
+        _ => return Entry::Other,
     }
     let text = match &entry["message"]["content"] {
         Value::String(s) => s.clone(),
         Value::Array(parts) => {
             if parts.iter().any(|p| p["type"] == "tool_result") {
-                return None;
+                return Entry::Reply;
             }
             parts
                 .iter()
@@ -114,22 +148,74 @@ fn prompt_of(entry: &Value) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join(" ")
         }
-        _ => return None,
+        _ => return Entry::Other,
     };
     let text = text.trim();
     if text.starts_with("<local-command-") {
-        return None;
+        return Entry::LocalOutput;
     }
-    let text = match tag(text, "command-name") {
-        Some("/clear") => return None,
-        Some(name) => match tag(text, "command-args").map(str::trim) {
-            Some(args) if !args.is_empty() => format!("{name} {args}"),
-            _ => name.to_string(),
-        },
-        None => text.to_string(),
-    };
+    if text.starts_with("<bash-stdout>") || text.starts_with("<bash-stderr>") {
+        return Entry::Other;
+    }
+    if let Some(input) = tag(text, "bash-input") {
+        return one_line(&format!("! {input}")).map_or(Entry::Other, Entry::Prompt);
+    }
+    match tag(text, "command-name") {
+        Some("/clear") => Entry::Other,
+        Some(name) => {
+            let command = match tag(text, "command-args") {
+                Some(args) if !args.is_empty() => format!("{name} {args}"),
+                _ => name.to_string(),
+            };
+            one_line(&command).map_or(Entry::Other, Entry::Command)
+        }
+        None => one_line(&strip_tags(text)).map_or(Entry::Other, Entry::Prompt),
+    }
+}
+
+fn one_line(text: &str) -> Option<String> {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     (!line.is_empty()).then(|| shorten(&line))
+}
+
+/// Drops tags such as `<pasted_content source="x">` and `</pasted_content>`, keeping what they wrap.
+fn strip_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('<') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        match tag_len(rest) {
+            Some(len) => {
+                out.push(' ');
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('<');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn tag_len(text: &str) -> Option<usize> {
+    let name = text[1..].strip_prefix('/').unwrap_or(&text[1..]);
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return None;
+    }
+    let after = name.trim_start_matches(|c: char| {
+        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'
+    });
+    if !after.starts_with(|c: char| c == '>' || c == '/' || c.is_whitespace()) {
+        return None;
+    }
+    let close = after.find('>')?;
+    if after[..close].contains('<') {
+        return None;
+    }
+    Some(text.len() - after.len() + close + 1)
 }
 
 fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -199,11 +285,13 @@ pub fn follow(
 
 /// Compares only the final component, since Claude and Tworky may spell the same folder's path
 /// with different case or separators on Windows.
-fn same_folder_name(a: &Path, b: &Path) -> bool {
-    match (a.file_name(), b.file_name()) {
-        (Some(a), Some(b)) => a
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&b.to_string_lossy()),
+fn same_folder_name(actual: &Path, expected: &Path) -> bool {
+    match (actual.file_name(), expected.file_name()) {
+        (Some(actual), Some(expected)) => {
+            let expected = expected.to_string_lossy();
+            expected.len() > MAX_FOLDER_NAME
+                || actual.to_string_lossy().eq_ignore_ascii_case(&expected)
+        }
         _ => true,
     }
 }
@@ -377,6 +465,35 @@ mod tests {
     }
 
     #[test]
+    fn follows_unchecked_when_claude_would_shorten_the_folder_name() {
+        let s = setup();
+        let expected = s
+            .transcripts
+            .with_file_name("C".repeat(MAX_FOLDER_NAME + 1));
+        let shortened = s
+            .transcripts
+            .with_file_name(format!("{}-1a2b3c", "C".repeat(MAX_FOLDER_NAME)))
+            .join(format!("{NEW}.jsonl"));
+        let followed = follow(&s.state, "acme-1", NEW, Some(&shortened), Some(&expected)).unwrap();
+        assert_eq!(followed, Followed::Yes);
+        assert_eq!(s.worker().claude_session, NEW);
+
+        let expected = s.transcripts.with_file_name("C".repeat(MAX_FOLDER_NAME));
+        let third = "33333333-3333-4333-8333-333333333333";
+        let elsewhere = s
+            .transcripts
+            .with_file_name("C--elsewhere")
+            .join(format!("{third}.jsonl"));
+        let followed =
+            follow(&s.state, "acme-1", third, Some(&elsewhere), Some(&expected)).unwrap();
+        assert_eq!(
+            followed,
+            Followed::OtherFolder,
+            "a name at the limit is still checked"
+        );
+    }
+
+    #[test]
     fn follows_without_an_expected_folder() {
         let s = setup();
         let elsewhere = s
@@ -524,6 +641,96 @@ mod tests {
                     .into()
             )]),
             Some("/review pr 12".into())
+        );
+    }
+
+    fn command(name: &str, args: &str) -> String {
+        user(
+            format!(
+                "<command-name>{name}</command-name>
+<command-message>{}</command-message>
+<command-args>{args}</command-args>",
+                name.trim_start_matches('/')
+            )
+            .into(),
+        )
+    }
+
+    fn assistant() -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": { "role": "assistant", "content": [{ "type": "text", "text": "On it" }] },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn skips_slash_commands_that_ran_locally() {
+        let stdout = |text: &str| {
+            user(format!("<local-command-stdout>{text}</local-command-stdout>").into())
+        };
+        let system_stdout = serde_json::json!({
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<local-command-stdout>Set model to opus</local-command-stdout>",
+        })
+        .to_string();
+        assert_eq!(
+            prompt(&[
+                command("/login", ""),
+                stdout("Login successful"),
+                command("/model", "opus"),
+                system_stdout,
+                command("/config", ""),
+                stdout("Config dialog dismissed"),
+                user("Fix the build".into()),
+            ]),
+            Some("Fix the build".into())
+        );
+        assert_eq!(
+            prompt(&[
+                command("/model", ""),
+                stdout("Kept model"),
+                command("/graft:orchestrate", "45"),
+                serde_json::json!({
+                    "type": "user",
+                    "isMeta": true,
+                    "message": { "content": [{ "type": "text", "text": "skill body" }] },
+                })
+                .to_string(),
+                assistant(),
+                user("later prompt".into()),
+            ]),
+            Some("/graft:orchestrate 45".into())
+        );
+        assert_eq!(
+            prompt(&[command("/model", ""), user("Fix the build".into())]),
+            Some("Fix the build".into()),
+            "a command nobody answered before the next prompt"
+        );
+    }
+
+    #[test]
+    fn shows_bash_mode_input_as_a_bang_command() {
+        assert_eq!(
+            prompt(&[
+                user("<bash-input>git status</bash-input>".into()),
+                user("<bash-stdout>clean</bash-stdout><bash-stderr></bash-stderr>".into()),
+            ]),
+            Some("! git status".into())
+        );
+    }
+
+    #[test]
+    fn keeps_the_text_inside_wrapper_tags() {
+        assert_eq!(
+            prompt(&[user(
+                "Review this:
+<pasted_content source=\"clipboard\" lines=\"3\">fn main() {}</pasted_content>
+if a < b and <Button> stays"
+                    .into()
+            )]),
+            Some("Review this: fn main() {} if a < b and <Button> stays".into())
         );
     }
 

@@ -904,10 +904,22 @@ impl Workspace {
         Ok(conversations::list(&dir, &w.claude_session))
     }
 
-    pub fn switch_conversation(&self, id: &str, session: &str) -> Result<()> {
-        if !self.conversations(id)?.iter().any(|c| c.id == session) {
+    pub fn check_conversation(&self, id: &str, session: &str) -> Result<()> {
+        let w = self.worker(id)?;
+        let home = self
+            .claude_home
+            .as_ref()
+            .context("couldn't find Claude's config folder")?;
+        if !conversations::is_session_id(session)
+            || !claude_config::transcript_path(home, &self.session_cwd(&w)?, session).is_file()
+        {
             bail!("{session} is not one of {id}'s conversations");
         }
+        Ok(())
+    }
+
+    pub fn switch_conversation(&self, id: &str, session: &str) -> Result<()> {
+        self.check_conversation(id, session)?;
         self.state.update(id, |w| {
             w.claude_session = session.to_string();
             w.claude_started = true;
@@ -2868,12 +2880,33 @@ run = "{sleep}"
         )
         .unwrap();
         let unknown = uuid::Uuid::new_v4().to_string();
+        assert!(ws.check_conversation(&w.id, &unknown).is_err());
         assert!(ws.switch_conversation(&w.id, &unknown).is_err());
         assert!(ws.switch_conversation(&w.id, "../x").is_err());
+        let simple = uuid::Uuid::parse_str(&earlier)
+            .unwrap()
+            .simple()
+            .to_string();
+        std::fs::write(
+            transcript(&simple),
+            "{}
+",
+        )
+        .unwrap();
+        assert!(ws.switch_conversation(&w.id, &simple).is_err());
+        ws.check_conversation(&w.id, &earlier).unwrap();
+        let unlisted = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            transcript(&unlisted),
+            "{}
+",
+        )
+        .unwrap();
+        ws.check_conversation(&w.id, &unlisted).unwrap();
         assert_eq!(ws.worker(&w.id).unwrap().claude_session, w.claude_session);
 
         let listed = ws.conversations(&w.id).unwrap();
-        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.len(), 2, "no prompt, so {unlisted} isn't listed");
         assert!(listed.iter().any(|c| c.id == w.claude_session && c.current));
 
         let cleared = uuid::Uuid::new_v4().to_string();
