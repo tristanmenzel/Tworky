@@ -280,8 +280,8 @@ impl State {
         Ok(())
     }
 
-    /// Reads, changes and saves a worker in one transaction, so a writer that held an older copy
-    /// can't undo what another wrote in between. `None` when there's no such worker.
+    /// Reads, changes and saves in one transaction, so a writer holding an older copy can't undo
+    /// another's write.
     pub fn update(
         &self,
         id: &str,
@@ -450,7 +450,6 @@ pub struct ProjectSession {
 }
 
 impl ProjectSession {
-    /// The session id the running `claude` was launched with.
     pub fn process_session(&self) -> &str {
         self.running_session
             .as_deref()

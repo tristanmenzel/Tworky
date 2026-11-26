@@ -95,7 +95,6 @@ export interface Worker {
   phase: Phase | null
 }
 
-/** A Claude conversation saved in the worker's transcripts folder. */
 export interface Conversation {
   id: string
   /** ISO timestamp of the transcript's first entry. */

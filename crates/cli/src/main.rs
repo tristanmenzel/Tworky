@@ -559,7 +559,6 @@ enum SessionChange {
     Touch,
 }
 
-/// The conversation a `/clear` or `/resume` moved the session to.
 #[derive(Debug, PartialEq)]
 struct Follow {
     session: String,
@@ -606,7 +605,6 @@ fn session_change(
     SessionChange::Record(activity)
 }
 
-/// The folder `launch` resumes `id`'s conversations from, if the config can tell.
 fn session_transcripts_dir(id: &str) -> Option<std::path::PathBuf> {
     use tworky_core::{claude_config, project_setup};
     let ws = Workspace::open().ok()?;

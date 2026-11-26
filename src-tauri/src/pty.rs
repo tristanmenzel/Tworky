@@ -96,7 +96,6 @@ impl Sessions {
             .is_some_and(|s| s.shared.lock().unwrap().alive)
     }
 
-    /// Whether a later spawn of `id` has replaced the one of `generation`.
     pub fn superseded(&self, id: &str, generation: u64) -> bool {
         self.inner
             .lock()

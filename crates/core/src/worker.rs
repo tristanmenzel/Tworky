@@ -904,7 +904,6 @@ impl Workspace {
         Ok(conversations::list(&dir, &w.claude_session))
     }
 
-    /// Resumes `session`, one of the worker's own conversations, on next launch.
     pub fn switch_conversation(&self, id: &str, session: &str) -> Result<()> {
         if !self.conversations(id)?.iter().any(|c| c.id == session) {
             bail!("{session} is not one of {id}'s conversations");

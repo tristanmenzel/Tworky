@@ -23,8 +23,6 @@ pub struct Conversation {
     pub current: bool,
 }
 
-/// The conversations whose transcripts are in `transcripts_dir`, most recently active first. Only
-/// the newest are listed, plus `current` wherever it falls; one with no prompt only if it's current.
 pub fn list(transcripts_dir: &Path, current: &str) -> Vec<Conversation> {
     let Ok(entries) = std::fs::read_dir(transcripts_dir) else {
         return vec![];
@@ -154,14 +152,11 @@ fn shorten(line: &str) -> String {
 pub enum Followed {
     /// Saved, or nothing to change.
     Yes,
-    /// The new conversation's transcript is in another folder than `launch` resumes from.
     OtherFolder,
 }
 
-/// Makes `session`, the conversation Claude moved to with `/clear` or `/resume`, the one the next
-/// launch of `id` (a worker, or `setup@<project>`) resumes. A `transcript_path` outside
-/// `transcripts_dir`, the folder `launch` resumes from, is refused, because `--resume` couldn't
-/// find it; when either is unknown, the session is followed.
+/// `id` is a worker or `setup@<project>`. A transcript outside `transcripts_dir` is refused because
+/// `--resume` couldn't find it; when either is unknown, the session is followed.
 pub fn follow(
     state: &State,
     id: &str,
