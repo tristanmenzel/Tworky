@@ -135,7 +135,14 @@ pub(crate) fn session_settings(
 /// and an answer to Claude's question or a plan approval doesn't count, so they failed until the user
 /// repeated the request. Permission rules are checked before the classifier: Tworky's own writes are
 /// allowed outright, and `gh` writes get an `ask` rule, which shows the command in a prompt.
-const TW_GITHUB_WRITES: [&str; 2] = ["tw subtask add", "tw issue"];
+const TW_GITHUB_WRITES: [&str; 6] = [
+    "tw subtask add",
+    "tw subtask ls",
+    "tw subtask assign",
+    "tw subtask status",
+    "tw subtask start",
+    "tw issue",
+];
 
 const GH_WRITES: [&str; 4] = [
     "gh issue create",
@@ -1504,7 +1511,12 @@ pub fn worker_claude_md(
     push(
         &mut md,
         "\n## Writing to GitHub\n\n\
-         `tw subtask add` runs without a prompt, so agree subtasks with the user before adding them. Creating \
+         Use these commands for the issue's subtasks rather than `gh`:\n\n\
+         - `tw subtask ls`: list them with state, assignees and board Status\n\
+         - `tw subtask assign <n>`: assign one to the user\n\
+         - `tw subtask status <n> \"<status>\"`: set its Status on the project's board\n\
+         - `tw subtask start <n>`: assign it and set its Status to In Progress\n\n\
+         These and `tw subtask add` run without a prompt, so agree subtasks with the user before adding them. Creating \
          issues and posting comments or reviews show the user a permission prompt with the exact command, even in \
          auto mode, so the user approves each one there. Use these commands, which the prompt recognises, rather \
          than `gh api`:\n\n\
@@ -2637,12 +2649,23 @@ run = "{sleep}"
         for rule in ["PowerShell(gh pr review *)", "Bash(gh pr comment *)"] {
             assert!(ask.iter().any(|r| r == rule), "gh writes prompt: {ask:?}");
         }
-        for rule in ["Bash(tw subtask add *)", "PowerShell(tw issue *)"] {
-            assert!(
-                allow.iter().any(|r| r == rule),
-                "tw writes are allowed: {allow:?}"
-            );
+        for command in [
+            "tw subtask add",
+            "tw subtask ls",
+            "tw subtask assign",
+            "tw subtask status",
+            "tw subtask start",
+            "tw issue",
+        ] {
+            for shell in ["Bash", "PowerShell"] {
+                let rule = format!("{shell}({command} *)");
+                assert!(allow.contains(&rule), "tw writes are allowed: {allow:?}");
+            }
         }
+        assert!(
+            !allow.iter().any(|r| r.ends_with("(tw subtask *)")),
+            "each tw subtask command needs its own rule: {allow:?}"
+        );
         assert!(!allow.iter().any(|r| r.starts_with("mcp__")));
 
         let endpoint = McpEndpoint {

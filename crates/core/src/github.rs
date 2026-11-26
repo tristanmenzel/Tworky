@@ -52,9 +52,26 @@ subIssues(first: 50) {{ nodes {{ ...F }} }} }} }} }} {}",
 
 /// Board fields need the `read:project` scope, which `gh auth login` doesn't grant by default.
 fn with_boards_if_allowed<T>(query: impl Fn(bool) -> Result<T>) -> Result<T> {
+    with_boards_reported(query).map(|(value, _)| value)
+}
+
+fn with_boards_reported<T>(query: impl Fn(bool) -> Result<T>) -> Result<(T, bool)> {
     match query(true) {
-        Err(e) if format!("{e:#}").contains("read:project") => query(false),
-        result => result,
+        Err(e) if format!("{e:#}").contains("read:project") => Ok((query(false)?, false)),
+        result => Ok((result?, true)),
+    }
+}
+
+fn is_scope_error(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}");
+    text.contains("INSUFFICIENT_SCOPES") || text.contains("required scopes")
+}
+
+fn with_scope_hint(e: anyhow::Error) -> anyhow::Error {
+    if is_scope_error(&e) {
+        e.context("your gh token lacks the project scope; run `gh auth refresh -s project`")
+    } else {
+        e
     }
 }
 
@@ -472,14 +489,30 @@ fn assigned_issues_query(query: &str, is_subtask: IsSubtask) -> Result<IssueInde
 }
 
 pub fn issue_by_url(url: &str, is_subtask: IsSubtask) -> Result<(IssueIndex, String)> {
-    let page = with_boards_if_allowed(|boards| graphql(&resource_query(boards), &[("url", url)]))?;
+    issue_lookup(url, is_subtask).map(|found| (found.index, found.id))
+}
+
+pub struct IssueLookup {
+    pub index: IssueIndex,
+    pub id: String,
+    /// False when the token lacks `read:project`, so every issue's `boards` is empty.
+    pub boards_loaded: bool,
+}
+
+pub fn issue_lookup(url: &str, is_subtask: IsSubtask) -> Result<IssueLookup> {
+    let (page, boards_loaded) =
+        with_boards_reported(|boards| graphql(&resource_query(boards), &[("url", url)]))?;
     let mut index = IssueIndex::new(viewer(&page));
     let node = &page["data"]["resource"];
     if node.get("id").is_none() {
         bail!("{url} is not an issue");
     }
     let id = ingest_node(node, None, true, &mut index, is_subtask)?;
-    Ok((index, id))
+    Ok(IssueLookup {
+        index,
+        id,
+        boards_loaded,
+    })
 }
 
 fn viewer(page: &Value) -> String {
@@ -589,18 +622,137 @@ fn parse_board(item: &Value) -> Option<BoardStatus> {
         option_id: item["fieldValueByName"]["optionId"]
             .as_str()
             .map(String::from),
-        options: field["options"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|o| {
-                Some(BoardOption {
-                    id: o["id"].as_str()?.into(),
-                    name: o["name"].as_str()?.into(),
-                })
-            })
-            .collect(),
+        options: parse_options(field),
     })
+}
+
+fn parse_options(field: &Value) -> Vec<BoardOption> {
+    field["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| {
+            Some(BoardOption {
+                id: o["id"].as_str()?.into(),
+                name: o["name"].as_str()?.into(),
+            })
+        })
+        .collect()
+}
+
+/// Resolved before any write, so a bad board or status name fails without changing anything.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedBoard {
+    pub owner: String,
+    pub number: u64,
+    pub project_id: String,
+    pub title: String,
+    pub field_id: String,
+    pub options: Vec<BoardOption>,
+}
+
+impl ResolvedBoard {
+    pub fn option(&self, name: &str) -> Result<&BoardOption> {
+        pick_option(&self.options, name)
+            .map_err(|e| anyhow::anyhow!("board {} ({}): {e}", self.number, self.title))
+    }
+}
+
+pub fn pick_option<'a>(options: &'a [BoardOption], name: &str) -> Result<&'a BoardOption> {
+    let name = name.trim();
+    options
+        .iter()
+        .find(|o| o.name.eq_ignore_ascii_case(name))
+        .with_context(|| {
+            let names: Vec<&str> = options.iter().map(|o| o.name.as_str()).collect();
+            format!(
+                "no Status named {name:?}; the options are: {}",
+                names.join(", ")
+            )
+        })
+}
+
+pub fn resolve_board(owner: &str, number: u64) -> Result<ResolvedBoard> {
+    let page = graphql(
+        &format!(
+            "query($owner: String!) {{ repositoryOwner(login: $owner) {{ \
+... on ProjectV2Owner {{ projectV2(number: {number}) {{ id title \
+field(name: \"Status\") {{ ... on ProjectV2SingleSelectField {{ id options {{ id name }} }} }} }} }} }} }}"
+        ),
+        &[("owner", owner)],
+    )
+    .map_err(with_scope_hint)
+    .with_context(|| format!("reading board {number} on {owner}"))?;
+    parse_resolved_board(&page, owner, number)
+}
+
+fn parse_resolved_board(page: &Value, owner: &str, number: u64) -> Result<ResolvedBoard> {
+    let project = &page["data"]["repositoryOwner"]["projectV2"];
+    let project_id = project["id"]
+        .as_str()
+        .with_context(|| format!("board {number} not found on {owner}"))?;
+    let title = str_field(project, "title");
+    let field = &project["field"];
+    let field_id = field["id"].as_str().with_context(|| {
+        format!("board {number} ({title}) on {owner} has no single-select field named Status")
+    })?;
+    Ok(ResolvedBoard {
+        owner: owner.into(),
+        number,
+        project_id: project_id.into(),
+        title,
+        field_id: field_id.into(),
+        options: parse_options(field),
+    })
+}
+
+/// Project numbers are only unique per owner, so a board is matched by its id.
+fn board_position(boards: &[BoardStatus], project_id: &str) -> Option<usize> {
+    boards.iter().position(|b| b.project_id == project_id)
+}
+
+pub fn set_board_option(
+    issue: &mut Issue,
+    board: &ResolvedBoard,
+    option: &BoardOption,
+) -> Result<()> {
+    let position = board_position(&issue.boards, &board.project_id);
+    let item_id = match position {
+        Some(i) => issue.boards[i].item_id.clone(),
+        None => add_to_board(&board.project_id, &issue.id)?,
+    };
+    set_item_status(board, &item_id, option)?;
+    let status = BoardStatus {
+        item_id,
+        project_id: board.project_id.clone(),
+        number: board.number,
+        title: board.title.clone(),
+        field_id: board.field_id.clone(),
+        option_id: Some(option.id.clone()),
+        options: board.options.clone(),
+    };
+    match position {
+        Some(i) => issue.boards[i] = status,
+        None => issue.boards.push(status),
+    }
+    Ok(())
+}
+
+pub fn set_item_status(board: &ResolvedBoard, item_id: &str, option: &BoardOption) -> Result<()> {
+    graphql(
+        "mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) { \
+updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field, \
+value: {singleSelectOptionId: $option}}) { projectV2Item { id } } }",
+        &[
+            ("project", &board.project_id),
+            ("item", item_id),
+            ("field", &board.field_id),
+            ("option", &option.id),
+        ],
+    )
+    .map_err(with_scope_hint)
+    .with_context(|| format!("setting Status to {} on board {}", option.name, board.title))
+    .map(drop)
 }
 
 /// Sets the issue's Status on board `project_id` and mirrors it onto `issue`.
@@ -799,7 +951,10 @@ fn is_node_id(id: &str) -> bool {
 }
 
 pub struct CreatedSubtask {
+    pub id: String,
+    pub number: u64,
     pub url: String,
+    pub board_item_id: Option<String>,
     /// The issue exists, but adding it to the status board failed.
     pub board_error: Option<String>,
 }
@@ -834,7 +989,7 @@ repository(owner: $owner, name: $name) { id issueTypes(first: 25) { nodes { id n
         &format!(
             "mutation($repo: ID!, $title: String!, $body: String!, $type: ID!, $parent: ID!) {{ \
 createIssue(input: {{repositoryId: $repo, title: $title, body: $body, issueTypeId: $type, \
-parentIssueId: $parent{assignees}}}) {{ issue {{ id url }} }} }}"
+parentIssueId: $parent{assignees}}}) {{ issue {{ id number url }} }} }}"
         ),
         &[
             ("repo", repo_id),
@@ -848,18 +1003,25 @@ parentIssueId: $parent{assignees}}}) {{ issue {{ id url }} }} }}"
     let url = issue["url"]
         .as_str()
         .context("createIssue returned no url")?;
-    let board_error = board.and_then(|number| {
-        add_to_board(owner, number, issue["id"].as_str().unwrap_or_default())
-            .err()
-            .map(|e| format!("{e:#}"))
+    let id = str_field(issue, "id");
+    let added = board.map(|number| {
+        board_id(owner, number).and_then(|project_id| add_to_board(&project_id, &id))
     });
+    let (board_item_id, board_error) = match added {
+        None => (None, None),
+        Some(Ok(item_id)) => (Some(item_id), None),
+        Some(Err(e)) => (None, Some(format!("{e:#}"))),
+    };
     Ok(CreatedSubtask {
+        number: issue["number"].as_u64().unwrap_or_default(),
+        id,
         url: url.into(),
+        board_item_id,
         board_error,
     })
 }
 
-fn add_to_board(owner: &str, number: u64, content_id: &str) -> Result<()> {
+fn board_id(owner: &str, number: u64) -> Result<String> {
     let board = graphql(
         &format!(
             "query($owner: String!) {{ repositoryOwner(login: $owner) {{ \
@@ -867,24 +1029,34 @@ fn add_to_board(owner: &str, number: u64, content_id: &str) -> Result<()> {
         ),
         &[("owner", owner)],
     )?;
-    let project_id = board["data"]["repositoryOwner"]["projectV2"]["id"]
+    board["data"]["repositoryOwner"]["projectV2"]["id"]
         .as_str()
-        .with_context(|| format!("board {number} not found on {owner}"))?;
-    let add = || {
-        graphql(
+        .map(String::from)
+        .with_context(|| format!("board {number} not found on {owner}"))
+}
+
+/// `content_id` is an issue's node id. Adding an issue already on the board returns its existing item.
+pub fn add_to_board(project_id: &str, content_id: &str) -> Result<String> {
+    let add = || -> Result<String> {
+        let page = graphql(
             "mutation($project: ID!, $content: ID!) { \
 addProjectV2ItemById(input: {projectId: $project, contentId: $content}) { item { id } } }",
             &[("project", project_id), ("content", content_id)],
-        )
+        )?;
+        page["data"]["addProjectV2ItemById"]["item"]["id"]
+            .as_str()
+            .map(String::from)
+            .context("addProjectV2ItemById returned no item id")
     };
     // A just-created issue isn't always visible to the Projects API yet; it shows up within seconds.
     for _ in 0..3 {
-        if add().is_ok() {
-            return Ok(());
+        match add() {
+            Ok(item_id) => return Ok(item_id),
+            Err(e) if is_scope_error(&e) => return Err(with_scope_hint(e)),
+            Err(_) => std::thread::sleep(std::time::Duration::from_secs(2)),
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    add().map(drop)
+    add().map_err(with_scope_hint)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1178,6 +1350,89 @@ mod tests {
         assert_eq!(issue.boards[0].item_id, "ITEM_P1");
         assert_eq!(issue.boards[0].options[0].name, "Todo");
         assert_eq!(issue.boards[1].option_id, None, "no Status set yet");
+    }
+
+    fn options() -> Vec<BoardOption> {
+        ["Todo", "In Progress", "Done"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| BoardOption {
+                id: format!("O{i}"),
+                name: (*name).into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn picks_status_options_ignoring_case() {
+        let options = options();
+        assert_eq!(pick_option(&options, "in progress").unwrap().id, "O1");
+        assert_eq!(pick_option(&options, " DONE ").unwrap().id, "O2");
+        let err = format!("{:#}", pick_option(&options, "Doing").unwrap_err());
+        assert!(err.contains("Todo, In Progress, Done"), "{err}");
+    }
+
+    #[test]
+    fn parses_a_resolved_board() {
+        let page = json!({"data": {"repositoryOwner": {"projectV2": {
+            "id": "PVT_1", "title": "Roadmap",
+            "field": {"id": "FIELD", "options": [{"id": "a", "name": "Todo"}, {"id": "b", "name": "Done"}]}
+        }}}});
+        let board = parse_resolved_board(&page, "acme", 3).unwrap();
+        assert_eq!(board.project_id, "PVT_1");
+        assert_eq!(board.field_id, "FIELD");
+        assert_eq!(board.number, 3);
+        assert_eq!(board.option("done").unwrap().id, "b");
+        let err = board.option("Blocked").unwrap_err().to_string();
+        assert!(
+            err.contains("Todo, Done") && err.contains("Roadmap"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_board_without_a_status_field_or_not_found_fails() {
+        let no_field = json!({"data": {"repositoryOwner": {"projectV2": {
+            "id": "PVT_1", "title": "Roadmap", "field": {}
+        }}}});
+        let err = parse_resolved_board(&no_field, "acme", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no single-select field named Status"), "{err}");
+        let missing = json!({"data": {"repositoryOwner": null}});
+        let err = parse_resolved_board(&missing, "acme", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("board 3 not found on acme"), "{err}");
+    }
+
+    #[test]
+    fn finds_the_issue_board_entry_by_project_id_not_number() {
+        let entry = |project_id: &str| BoardStatus {
+            item_id: format!("ITEM_{project_id}"),
+            project_id: project_id.into(),
+            number: 1,
+            title: "Board".into(),
+            field_id: "FIELD".into(),
+            option_id: None,
+            options: options(),
+        };
+        let boards = vec![entry("PVT_OTHER_OWNER"), entry("PVT_MINE")];
+        assert_eq!(board_position(&boards, "PVT_MINE"), Some(1));
+        assert_eq!(board_position(&boards, "PVT_NEW"), None);
+    }
+
+    #[test]
+    fn scope_errors_get_a_refresh_hint() {
+        let hinted = with_scope_hint(anyhow::anyhow!(
+            "GitHub GraphQL errors: [{{\"type\":\"INSUFFICIENT_SCOPES\"}}]"
+        ));
+        assert!(
+            format!("{hinted:#}").contains("gh auth refresh -s project"),
+            "{hinted:#}"
+        );
+        let other = with_scope_hint(anyhow::anyhow!("HTTP 502"));
+        assert_eq!(format!("{other:#}"), "HTTP 502");
     }
 
     #[test]
