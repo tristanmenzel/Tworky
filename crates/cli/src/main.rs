@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use tworky_core::config::Paths;
+use tworky_core::conversations::Followed;
 use tworky_core::feedback;
 use tworky_core::github;
 use tworky_core::hierarchy::{IssueIndex, IssueNode};
@@ -494,7 +495,9 @@ fn main() -> Result<()> {
                 session_start,
             };
             let change = session_change(activity, flags, hook_input().as_ref());
-            apply_session_change(&Paths::resolve()?, &id, change)
+            apply_session_change(&Paths::resolve()?, &id, change, || {
+                session_transcripts_dir(&id)
+            })
         }
         Command::SessionPhase { from_hook, id } => {
             anyhow::ensure!(from_hook, "pass --from-hook with the hook's input on stdin");
@@ -582,9 +585,7 @@ fn session_change(
         return SessionChange::Stop(input.and_then(activity::background_from_hook));
     }
     let follow = || {
-        let subagent = ["agent_id", "agent_type"]
-            .iter()
-            .any(|f| input.is_some_and(|i| i.get(f).is_some()));
+        let subagent = field("agent_id").is_some_and(|id| !id.is_empty());
         if subagent || !matches!(field("source"), Some("clear" | "resume")) {
             return None;
         }
@@ -605,7 +606,26 @@ fn session_change(
     SessionChange::Record(activity)
 }
 
-fn apply_session_change(paths: &Paths, id: &str, change: SessionChange) -> Result<()> {
+/// The folder `launch` resumes `id`'s conversations from, if the config can tell.
+fn session_transcripts_dir(id: &str) -> Option<std::path::PathBuf> {
+    use tworky_core::{claude_config, project_setup};
+    let ws = Workspace::open().ok()?;
+    let cwd = match project_setup::session_project(id) {
+        Some(project) => project_setup::setup_dir(&ws.config, project),
+        None => ws.session_cwd(&ws.state.get(id).ok()??).ok()?,
+    };
+    Some(claude_config::transcripts_dir(
+        ws.claude_home.as_deref()?,
+        &cwd,
+    ))
+}
+
+fn apply_session_change(
+    paths: &Paths,
+    id: &str,
+    change: SessionChange,
+    transcripts_dir: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Result<()> {
     use tworky_core::activity;
     let (written, follow) = match change {
         SessionChange::Record(a) => return activity::record(paths, id, a),
@@ -619,11 +639,26 @@ fn apply_session_change(paths: &Paths, id: &str, change: SessionChange) -> Resul
         SessionChange::SessionStart(follow) => (activity::session_start(paths, id), follow),
         SessionChange::Touch => return activity::touch(paths, id),
     };
-    let followed = follow.map_or(Ok(()), |f| {
-        let state = tworky_core::state::State::open(&paths.state_db())?;
-        tworky_core::conversations::follow(&state, id, &f.session, f.transcript.as_deref())
-    });
-    written.and(followed)
+    if let Some(f) = follow {
+        let followed = tworky_core::state::State::open(&paths.state_db()).and_then(|state| {
+            tworky_core::conversations::follow(
+                &state,
+                id,
+                &f.session,
+                f.transcript.as_deref(),
+                transcripts_dir().as_deref(),
+            )
+        });
+        match followed {
+            Ok(Followed::Yes) => {}
+            Ok(Followed::OtherFolder) => eprintln!(
+                "tw: not following session {}: its transcript is in another folder",
+                f.session
+            ),
+            Err(e) => eprintln!("tw: couldn't follow session {}: {e:#}", f.session),
+        }
+    }
+    written
 }
 
 fn project(cmd: ProjectCommand) -> Result<()> {
@@ -1868,7 +1903,7 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let paths = temp_paths(home.path());
-        apply_session_change(&paths, "acme-1", stop).unwrap();
+        apply_session_change(&paths, "acme-1", stop, || None).unwrap();
         let session = activity::read(&paths, "acme-1").unwrap();
         assert_eq!(
             (session.activity, session.recorded, session.background),
@@ -1923,7 +1958,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let paths = temp_paths(home.path());
         activity::record(&paths, "acme-1", Activity::Idle).unwrap();
-        apply_session_change(&paths, "acme-1", touch).unwrap();
+        apply_session_change(&paths, "acme-1", touch, || None).unwrap();
         assert_eq!(
             activity::read(&paths, "acme-1").unwrap().activity,
             Activity::Idle
@@ -1991,18 +2026,28 @@ mod tests {
     }
 
     #[test]
+    fn a_main_session_started_with_an_agent_follows() {
+        let input = session_start("clear", r#","agent_type":"reviewer","agent_id":"""#);
+        assert!(matches!(
+            change(Activity::Idle, CLEAR, &input),
+            SessionChange::NewConversation(Activity::Idle, Some(_))
+        ));
+    }
+
+    #[test]
     fn startup_and_subagent_input_follow_nothing() {
         assert_eq!(
             change(Activity::Idle, START, &session_start("startup", "")),
             SessionChange::SessionStart(None)
         );
-        for extra in [r#","agent_id":"a1""#, r#","agent_type":"Explore""#] {
-            assert_eq!(
-                change(Activity::Idle, CLEAR, &session_start("clear", extra)),
-                SessionChange::NewConversation(Activity::Idle, None),
-                "{extra}"
-            );
-        }
+        assert_eq!(
+            change(
+                Activity::Idle,
+                CLEAR,
+                &session_start("clear", r#","agent_id":"a1""#)
+            ),
+            SessionChange::NewConversation(Activity::Idle, None),
+        );
         let no_id = r#"{"hook_event_name":"SessionStart","source":"clear"}"#;
         assert_eq!(
             change(Activity::Idle, CLEAR, no_id),
@@ -2029,7 +2074,10 @@ mod tests {
             .unwrap();
 
         let clear = change(Activity::Idle, CLEAR, &session_start("clear", ""));
-        apply_session_change(&paths, "setup@acme", clear).unwrap();
+        apply_session_change(&paths, "setup@acme", clear, || {
+            Some("/h/projects/c--W".into())
+        })
+        .unwrap();
         let session = state.project_session("acme").unwrap().unwrap();
         assert_eq!(
             (session.claude_session.as_str(), session.claude_started),

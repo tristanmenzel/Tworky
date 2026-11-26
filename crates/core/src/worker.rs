@@ -548,12 +548,13 @@ impl Workspace {
     }
 
     pub fn remove_worktree(&self, id: &str, repo_name: &str, log: Log) -> Result<()> {
-        let mut w = self.worker(id)?;
+        let w = self.worker(id)?;
         let project = self.project_of(&w)?.clone();
         let repo = Self::repo(&project, repo_name)?;
         self.drop_worktree(&w, repo, log)?;
-        w.worktrees.retain(|t| t.repo != repo.name);
-        self.state.save(&w)
+        self.state
+            .update(id, |w| w.worktrees.retain(|t| t.repo != repo.name))?;
+        Ok(())
     }
 
     fn drop_worktree(&self, w: &WorkerRecord, repo: &RepoConfig, log: Log) -> Result<()> {
@@ -2800,8 +2801,16 @@ run = "{sleep}"
         std::fs::write(transcript(&w.claude_session), "{}\n").unwrap();
 
         let cleared = uuid::Uuid::new_v4().to_string();
-        crate::conversations::follow(&ws.state, &w.id, &cleared, Some(&transcript(&cleared)))
-            .unwrap();
+        let expected = claude_config::transcripts_dir(home, &ws.session_cwd(&w).unwrap());
+        let followed = crate::conversations::follow(
+            &ws.state,
+            &w.id,
+            &cleared,
+            Some(&transcript(&cleared)),
+            Some(&expected),
+        )
+        .unwrap();
+        assert_eq!(followed, crate::conversations::Followed::Yes);
         let moved = ws.worker(&w.id).unwrap();
         assert_eq!(moved.claude_session, cleared);
         assert_eq!(moved.process_session(), w.claude_session);
