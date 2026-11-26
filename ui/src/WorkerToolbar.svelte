@@ -1,6 +1,7 @@
 <script lang="ts">
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { api, type Worker } from './api'
+  import { api, type Conversation, type Worker } from './api'
+  import { ask } from './confirm.svelte'
   import { activityLabel, activityOf, confirmCleanup, sessionLabel } from './issue'
   import ActionMenu, { type MenuItem } from './ActionMenu.svelte'
   import WorkerDot from './WorkerDot.svelte'
@@ -17,6 +18,8 @@
     onOpenBrowser: (account: string) => void
     onOpenAnonymous: () => void
     onCreateProfile: () => void
+    onSwitchConversation: (session: string) => Promise<void>
+    onNewConversation: () => Promise<void>
     onError: (message: string) => void
   }
 
@@ -30,6 +33,8 @@
     onOpenBrowser,
     onOpenAnonymous,
     onCreateProfile,
+    onSwitchConversation,
+    onNewConversation,
     onError,
   }: Props = $props()
 
@@ -51,6 +56,66 @@
     } catch (e) {
       onError(String(e))
     }
+  }
+
+  let conversations = $state<Conversation[] | null>(null)
+
+  async function loadConversations() {
+    conversations = null
+    try {
+      conversations = await api.listConversations(worker.id)
+    } catch (e) {
+      onError(String(e))
+    }
+  }
+
+  const when = (date: Date) =>
+    date.toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+
+  function conversationLabel(c: Conversation) {
+    const span = [c.started && when(new Date(c.started)), when(new Date(c.last_active))].filter(Boolean).join(' – ')
+    return `${c.current ? '● ' : ''}${span} · ${c.prompt ?? '(no prompt)'}`
+  }
+
+  const conversationItems = $derived<MenuItem[]>([
+    ...(conversations
+      ? conversations.map((c): MenuItem => ({
+          label: conversationLabel(c),
+          disabled: c.current ? 'Current conversation' : false,
+          onSelect: () => switchConversation(c.id),
+        }))
+      : [{ label: 'Loading…', disabled: "Reading the worker's transcripts", onSelect: () => {} }]),
+    { separator: true },
+    { label: 'New conversation', onSelect: newConversation },
+  ])
+
+  const conversationsBlocked = $derived(
+    worker.status !== 'ready' || worker.busy || (worker.session_alive && worker.activity === 'waiting'),
+  )
+
+  async function switchConversation(session: string) {
+    if (
+      worker.session_alive &&
+      !(await ask({
+        title: 'Switch to this conversation?',
+        message: 'Claude stops and resumes the chosen conversation.',
+        confirmLabel: 'Switch',
+      }))
+    )
+      return
+    act(() => onSwitchConversation(session))
+  }
+
+  async function newConversation() {
+    if (
+      !(await ask({
+        title: 'Start a new conversation?',
+        message: 'The current one ends.',
+        confirmLabel: 'New conversation',
+      }))
+    )
+      return
+    act(onNewConversation)
   }
 
   const cleanupItems = $derived<MenuItem[]>([
@@ -104,6 +169,13 @@
     {#if accounts.length || services}
       <ActionMenu label="Open browser" trigger="Open browser ▾" items={browserItems} />
     {/if}
+    <ActionMenu
+      label="Conversations"
+      trigger="Conversations ▾"
+      disabled={conversationsBlocked}
+      onOpen={loadConversations}
+      items={conversationItems}
+    />
     <button onclick={() => act(() => api.openDir(worker.id))}>Open folder</button>
     <ActionMenu
       label="Clean up"

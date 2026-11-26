@@ -766,6 +766,13 @@
     closeTerminal(w.id)
   }
 
+  async function restartConversation(w: Worker, change: () => Promise<void>) {
+    await change()
+    exited[w.id] = true
+    await loadWorkers()
+    mountTerminal({ ...w, session_alive: false })
+  }
+
   function workerById(id: string) {
     return workers.find((w) => w.id === id)
   }
@@ -1265,6 +1272,8 @@
                 onOpenBrowser={(account) => openBrowser(w, account)}
                 onOpenAnonymous={() => openAnonymous(w)}
                 onCreateProfile={() => (createProfileFor = { worker: w, request: null })}
+                onSwitchConversation={(session) => restartConversation(w, () => api.switchConversation(w.id, session))}
+                onNewConversation={() => restartConversation(w, () => api.newConversation(w.id))}
                 onError={showError}
               />
               {#if w.account_requests.length}
