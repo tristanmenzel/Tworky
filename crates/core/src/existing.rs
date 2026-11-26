@@ -917,6 +917,7 @@ mod tests {
                 })
                 .collect(),
             stopped: false,
+            running_session: None,
         }
     }
 

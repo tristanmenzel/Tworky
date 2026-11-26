@@ -412,6 +412,7 @@ impl Workspace {
                 .unwrap_or_default(),
             worktrees: vec![],
             stopped: false,
+            running_session: None,
         };
         record.branch = match &record.pr {
             Some(pr) => pr.head.clone(),
@@ -477,7 +478,7 @@ impl Workspace {
         base: Option<&str>,
         log: Log,
     ) -> Result<WorktreeRecord> {
-        let mut w = self.worker(id)?;
+        let w = self.worker(id)?;
         let project = self.project_of(&w)?.clone();
         let repo = Self::repo(&project, repo_name)?;
         if let Some(existing) = w.worktrees.iter().find(|t| t.repo == repo.name) {
@@ -541,8 +542,8 @@ impl Workspace {
             }
         }
 
-        w.worktrees.push(record.clone());
-        self.state.save(&w)?;
+        self.state
+            .update(id, |w| w.worktrees.push(record.clone()))?;
         Ok(record)
     }
 
@@ -593,7 +594,7 @@ impl Workspace {
     /// Starts the stack and runs setup hooks. Re-runnable: hooks for repos without a worktree are
     /// skipped and can be picked up by running setup again later.
     pub fn setup(&self, id: &str, log: Log) -> Result<()> {
-        let mut w = self.worker(id)?;
+        let w = self.worker(id)?;
         let project = self.project_of(&w)?.clone();
         let ctx = template_context(&w, &project, &IssueIndex::default());
 
@@ -628,8 +629,7 @@ impl Workspace {
             self.run_hook(&w, hook, &ctx, log)?;
         }
 
-        w.stopped = false;
-        self.state.save(&w)?;
+        self.state.update(id, |w| w.stopped = false)?;
         log("✓ setup complete");
         if crate::services::suggest_services(&project) {
             log(&format!("note: {}", crate::services::NO_SERVICES_NOTE));
@@ -763,7 +763,7 @@ impl Workspace {
     ) -> Result<HashMap<String, Vec<WorkerJob>>> {
         let scopes: Vec<(PathBuf, String)> = workers
             .iter()
-            .map(|w| (w.dir.clone(), w.claude_session.clone()))
+            .map(|w| (w.dir.clone(), w.process_session().to_string()))
             .collect();
         let found = process::jobs(&scopes)?;
         let mut out = HashMap::new();
@@ -815,10 +815,13 @@ impl Workspace {
                     let s = self.state.project_session(project).ok()??;
                     Some((
                         crate::project_setup::setup_dir(&self.config, project),
-                        s.claude_session,
+                        s.process_session().to_string(),
                     ))
                 }
-                None => self.worker(id).ok().map(|w| (w.dir, w.claude_session)),
+                None => self
+                    .worker(id)
+                    .ok()
+                    .map(|w| (w.dir.clone(), w.process_session().to_string())),
             })
             .collect();
         process::stop_sessions(&sessions, log)
@@ -826,7 +829,7 @@ impl Workspace {
 
     pub fn stop_job(&self, id: &str, pid: u32, log: Log) -> Result<()> {
         let w = self.worker(id)?;
-        process::stop_job(&w.dir, &w.claude_session, pid, log)
+        process::stop_job(&w.dir, w.process_session(), pid, log)
     }
 
     pub fn launch(&self, id: &str, mcp: Option<&McpEndpoint>) -> Result<Launch> {
@@ -876,6 +879,7 @@ impl Workspace {
     pub fn mark_claude_started(&self, id: &str) -> Result<()> {
         let mut w = self.worker(id)?;
         w.claude_started = true;
+        w.running_session = None;
         self.state.save(&w)
     }
 
@@ -884,6 +888,7 @@ impl Workspace {
         let mut w = self.worker(id)?;
         w.claude_session = uuid::Uuid::new_v4().to_string();
         w.claude_started = false;
+        w.running_session = None;
         self.state.save(&w)?;
         crate::activity::new_conversation(&self.config.paths, id)
     }
@@ -2781,6 +2786,36 @@ run = "{sleep}"
         let resumed = hooks(&ws.launch(&w.id, None).unwrap());
         assert_eq!(resumed.len(), 3);
         assert!(resumed[2].contains("run tw worker setup"));
+    }
+
+    #[test]
+    fn launch_resumes_the_conversation_a_clear_moved_to() {
+        let (_d, ws) = workspace();
+        let w = ws.plan(&index(), "T").unwrap();
+        let first = ws.launch(&w.id, None).unwrap();
+        ws.mark_claude_started(&w.id).unwrap();
+        let home = ws.claude_home.as_ref().unwrap();
+        let transcript = |session: &str| claude_config::transcript_path(home, &first.cwd, session);
+        std::fs::create_dir_all(transcript(&w.claude_session).parent().unwrap()).unwrap();
+        std::fs::write(transcript(&w.claude_session), "{}\n").unwrap();
+
+        let cleared = uuid::Uuid::new_v4().to_string();
+        crate::conversations::follow(&ws.state, &w.id, &cleared, Some(&transcript(&cleared)))
+            .unwrap();
+        let moved = ws.worker(&w.id).unwrap();
+        assert_eq!(moved.claude_session, cleared);
+        assert_eq!(moved.process_session(), w.claude_session);
+
+        std::fs::write(transcript(&cleared), "{}\n").unwrap();
+        let resumed = ws.launch(&w.id, None).unwrap();
+        assert_eq!(resumed.args[2..], ["--resume".to_string(), cleared.clone()]);
+        assert_eq!(
+            ws.worker(&w.id).unwrap().process_session(),
+            w.claude_session,
+            "until the relaunch is marked started"
+        );
+        ws.mark_claude_started(&w.id).unwrap();
+        assert_eq!(ws.worker(&w.id).unwrap().process_session(), cleared);
     }
 
     #[test]

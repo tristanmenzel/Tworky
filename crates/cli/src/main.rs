@@ -550,10 +550,17 @@ enum SessionChange {
     Record(tworky_core::activity::Activity),
     NewTurn,
     BackgroundReport,
-    NewConversation(tworky_core::activity::Activity),
+    NewConversation(tworky_core::activity::Activity, Option<Follow>),
     Stop(Option<Vec<tworky_core::activity::BackgroundTask>>),
-    SessionStart,
+    SessionStart(Option<Follow>),
     Touch,
+}
+
+/// The conversation a `/clear` or `/resume` moved the session to.
+#[derive(Debug, PartialEq)]
+struct Follow {
+    session: String,
+    transcript: Option<std::path::PathBuf>,
 }
 
 fn session_change(
@@ -574,11 +581,23 @@ fn session_change(
     if flags.stop {
         return SessionChange::Stop(input.and_then(activity::background_from_hook));
     }
+    let follow = || {
+        let subagent = ["agent_id", "agent_type"]
+            .iter()
+            .any(|f| input.is_some_and(|i| i.get(f).is_some()));
+        if subagent || !matches!(field("source"), Some("clear" | "resume")) {
+            return None;
+        }
+        Some(Follow {
+            session: field("session_id")?.to_string(),
+            transcript: field("transcript_path").map(Into::into),
+        })
+    };
     if flags.session_start {
-        return SessionChange::SessionStart;
+        return SessionChange::SessionStart(follow());
     }
     if flags.new_conversation {
-        return SessionChange::NewConversation(activity);
+        return SessionChange::NewConversation(activity, follow());
     }
     if activity == Activity::Working && field("agent_id").is_some_and(|id| !id.is_empty()) {
         return SessionChange::Touch;
@@ -588,18 +607,23 @@ fn session_change(
 
 fn apply_session_change(paths: &Paths, id: &str, change: SessionChange) -> Result<()> {
     use tworky_core::activity;
-    match change {
-        SessionChange::Record(a) => activity::record(paths, id, a),
-        SessionChange::NewTurn => activity::new_turn(paths, id),
-        SessionChange::BackgroundReport => activity::background_report(paths, id),
-        SessionChange::NewConversation(a) => {
-            activity::record(paths, id, a)?;
-            activity::new_conversation(paths, id)
-        }
-        SessionChange::Stop(background) => activity::record_stop(paths, id, background),
-        SessionChange::SessionStart => activity::session_start(paths, id),
-        SessionChange::Touch => activity::touch(paths, id),
-    }
+    let (written, follow) = match change {
+        SessionChange::Record(a) => return activity::record(paths, id, a),
+        SessionChange::NewTurn => return activity::new_turn(paths, id),
+        SessionChange::BackgroundReport => return activity::background_report(paths, id),
+        SessionChange::NewConversation(a, follow) => (
+            activity::record(paths, id, a).and_then(|()| activity::new_conversation(paths, id)),
+            follow,
+        ),
+        SessionChange::Stop(background) => return activity::record_stop(paths, id, background),
+        SessionChange::SessionStart(follow) => (activity::session_start(paths, id), follow),
+        SessionChange::Touch => return activity::touch(paths, id),
+    };
+    let followed = follow.map_or(Ok(()), |f| {
+        let state = tworky_core::state::State::open(&paths.state_db())?;
+        tworky_core::conversations::follow(&state, id, &f.session, f.transcript.as_deref())
+    });
+    written.and(followed)
 }
 
 fn project(cmd: ProjectCommand) -> Result<()> {
@@ -1920,15 +1944,100 @@ mod tests {
         };
         assert_eq!(
             change(Activity::Idle, start, ""),
-            SessionChange::SessionStart
+            SessionChange::SessionStart(None)
         );
-        let clear = SessionFlags {
-            new_conversation: true,
-            ..SessionFlags::default()
-        };
         assert_eq!(
-            change(Activity::Idle, clear, ""),
-            SessionChange::NewConversation(Activity::Idle)
+            change(Activity::Idle, CLEAR, ""),
+            SessionChange::NewConversation(Activity::Idle, None)
+        );
+    }
+
+    const CLEAR: SessionFlags = SessionFlags {
+        new_turn: false,
+        new_conversation: true,
+        stop: false,
+        session_start: false,
+    };
+
+    const START: SessionFlags = SessionFlags {
+        new_turn: false,
+        new_conversation: false,
+        stop: false,
+        session_start: true,
+    };
+
+    const NEW_ID: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn session_start(source: &str, extra: &str) -> String {
+        format!(
+            r#"{{"hook_event_name":"SessionStart","source":"{source}","session_id":"{NEW_ID}",
+            "transcript_path":"/h/projects/C--w/{NEW_ID}.jsonl"{extra}}}"#
+        )
+    }
+
+    #[test]
+    fn clear_and_resume_follow_the_new_session_id() {
+        let followed = Some(Follow {
+            session: NEW_ID.into(),
+            transcript: Some(format!("/h/projects/C--w/{NEW_ID}.jsonl").into()),
+        });
+        let clear = change(Activity::Idle, CLEAR, &session_start("clear", ""));
+        assert_eq!(
+            clear,
+            SessionChange::NewConversation(Activity::Idle, followed)
+        );
+        let resume = change(Activity::Idle, START, &session_start("resume", ""));
+        assert!(matches!(resume, SessionChange::SessionStart(Some(_))));
+    }
+
+    #[test]
+    fn startup_and_subagent_input_follow_nothing() {
+        assert_eq!(
+            change(Activity::Idle, START, &session_start("startup", "")),
+            SessionChange::SessionStart(None)
+        );
+        for extra in [r#","agent_id":"a1""#, r#","agent_type":"Explore""#] {
+            assert_eq!(
+                change(Activity::Idle, CLEAR, &session_start("clear", extra)),
+                SessionChange::NewConversation(Activity::Idle, None),
+                "{extra}"
+            );
+        }
+        let no_id = r#"{"hook_event_name":"SessionStart","source":"clear"}"#;
+        assert_eq!(
+            change(Activity::Idle, CLEAR, no_id),
+            SessionChange::NewConversation(Activity::Idle, None)
+        );
+    }
+
+    #[test]
+    fn a_clear_moves_the_setup_session_and_starts_a_new_conversation() {
+        use tworky_core::state::{ProjectSession, State};
+        let home = tempfile::tempdir().unwrap();
+        let paths = temp_paths(home.path());
+        let state = State::open(&paths.state_db()).unwrap();
+        let old = "11111111-1111-4111-8111-111111111111";
+        state
+            .save_project_session(
+                "acme",
+                &ProjectSession {
+                    claude_session: old.into(),
+                    claude_started: false,
+                    running_session: None,
+                },
+            )
+            .unwrap();
+
+        let clear = change(Activity::Idle, CLEAR, &session_start("clear", ""));
+        apply_session_change(&paths, "setup@acme", clear).unwrap();
+        let session = state.project_session("acme").unwrap().unwrap();
+        assert_eq!(
+            (session.claude_session.as_str(), session.claude_started),
+            (NEW_ID, true)
+        );
+        assert_eq!(
+            activity::read(&paths, "setup@acme").unwrap().activity,
+            Activity::Idle
         );
     }
 
