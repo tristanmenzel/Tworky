@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::accounts;
 use crate::claude_config;
 use crate::config::{AccountConfig, Config, Hook, ProjectConfig, RepoConfig};
+use crate::conversations::{self, Conversation};
 use crate::git;
 use crate::github::{self, PullRequest};
 use crate::hierarchy::{Issue, IssueIndex};
@@ -891,6 +892,28 @@ impl Workspace {
         w.claude_started = false;
         w.running_session = None;
         self.state.save(&w)?;
+        crate::activity::new_conversation(&self.config.paths, id)
+    }
+
+    pub fn conversations(&self, id: &str) -> Result<Vec<Conversation>> {
+        let w = self.worker(id)?;
+        let Some(home) = &self.claude_home else {
+            return Ok(vec![]);
+        };
+        let dir = claude_config::transcripts_dir(home, &self.session_cwd(&w)?);
+        Ok(conversations::list(&dir, &w.claude_session))
+    }
+
+    /// Resumes `session`, one of the worker's own conversations, on next launch.
+    pub fn switch_conversation(&self, id: &str, session: &str) -> Result<()> {
+        if !self.conversations(id)?.iter().any(|c| c.id == session) {
+            bail!("{session} is not one of {id}'s conversations");
+        }
+        self.state.update(id, |w| {
+            w.claude_session = session.to_string();
+            w.claude_started = true;
+            w.running_session = None;
+        })?;
         crate::activity::new_conversation(&self.config.paths, id)
     }
 
@@ -2825,6 +2848,48 @@ run = "{sleep}"
         );
         ws.mark_claude_started(&w.id).unwrap();
         assert_eq!(ws.worker(&w.id).unwrap().process_session(), cleared);
+    }
+
+    #[test]
+    fn switch_conversation_resumes_one_of_the_workers_transcripts() {
+        let (_d, ws) = workspace();
+        let w = ws.plan(&index(), "T").unwrap();
+        let cwd = ws.session_cwd(&w).unwrap();
+        let home = ws.claude_home.as_ref().unwrap();
+        let transcript = |session: &str| claude_config::transcript_path(home, &cwd, session);
+        assert!(ws.conversations(&w.id).unwrap().is_empty());
+
+        ws.mark_claude_started(&w.id).unwrap();
+        std::fs::create_dir_all(transcript(&w.claude_session).parent().unwrap()).unwrap();
+        std::fs::write(transcript(&w.claude_session), "{}\n").unwrap();
+        let earlier = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            transcript(&earlier),
+            r#"{"type":"user","message":{"content":"first"}}"#,
+        )
+        .unwrap();
+        let unknown = uuid::Uuid::new_v4().to_string();
+        assert!(ws.switch_conversation(&w.id, &unknown).is_err());
+        assert!(ws.switch_conversation(&w.id, "../x").is_err());
+        assert_eq!(ws.worker(&w.id).unwrap().claude_session, w.claude_session);
+
+        let listed = ws.conversations(&w.id).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|c| c.id == w.claude_session && c.current));
+
+        let cleared = uuid::Uuid::new_v4().to_string();
+        crate::conversations::follow(&ws.state, &w.id, &cleared, None, None).unwrap();
+        assert!(ws.worker(&w.id).unwrap().running_session.is_some());
+
+        ws.switch_conversation(&w.id, &earlier).unwrap();
+        let switched = ws.worker(&w.id).unwrap();
+        assert_eq!(
+            (switched.claude_session.as_str(), switched.claude_started),
+            (earlier.as_str(), true)
+        );
+        assert_eq!(switched.running_session, None);
+        let launch = ws.launch(&w.id, None).unwrap();
+        assert_eq!(launch.args[2..], ["--resume".to_string(), earlier]);
     }
 
     #[test]

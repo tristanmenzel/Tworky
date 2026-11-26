@@ -95,6 +95,17 @@ export interface Worker {
   phase: Phase | null
 }
 
+/** A Claude conversation saved in the worker's transcripts folder. */
+export interface Conversation {
+  id: string
+  /** ISO timestamp of the transcript's first entry. */
+  started: string | null
+  /** Unix milliseconds of the transcript's last write. */
+  last_active: number
+  prompt: string | null
+  current: boolean
+}
+
 /** A dev server, watcher or test run still running in a worker. */
 export interface Job {
   pid: number
@@ -548,6 +559,8 @@ export const api = {
   windowsBuild: () => invoke<number | null>('windows_build'),
   stop: (id: string) => invoke<void>('stop_session', { id }),
   newConversation: (id: string) => invoke<void>('new_conversation', { id }),
+  listConversations: (id: string) => invoke<Conversation[]>('list_conversations', { id }),
+  switchConversation: (id: string, session: string) => invoke<void>('switch_conversation', { id, session }),
   openDir: (id: string, repo?: string) => invoke<void>('open_worker_dir', { id, repo }),
   openInVscode: (id: string, repo: string) => invoke<void>('open_in_vscode', { id, repo }),
   dismissHandover: (id: string) => invoke<void>('dismiss_handover', { id }),

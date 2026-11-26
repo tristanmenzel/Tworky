@@ -96,13 +96,22 @@ impl Sessions {
             .is_some_and(|s| s.shared.lock().unwrap().alive)
     }
 
+    /// Whether a later spawn of `id` has replaced the one of `generation`.
+    pub fn superseded(&self, id: &str, generation: u64) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|s| s.generation > generation)
+    }
+
     pub fn spawn(
         &self,
         id: &str,
         launch: &Launch,
         cols: u16,
         rows: u16,
-        on_exit: impl FnOnce() + Send + 'static,
+        on_exit: impl FnOnce(u64) + Send + 'static,
     ) -> Result<()> {
         let pty = native_pty_system().openpty(PtySize {
             rows,
@@ -181,7 +190,7 @@ impl Sessions {
             }
             thread_shared.lock().unwrap().alive = false;
             liveness.end(&thread_id, generation);
-            on_exit();
+            on_exit(generation);
         });
         Ok(())
     }

@@ -15,6 +15,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tworky_core::activity::{self, AccountRequest, Activity, Handover, Phase, Session};
 use tworky_core::config::Paths;
+use tworky_core::conversations::Conversation;
 use tworky_core::existing::WorkSubject;
 use tworky_core::github;
 use tworky_core::hierarchy::IssueIndex;
@@ -965,7 +966,11 @@ async fn open_session(
             let exit_id = id.clone();
             state
                 .sessions
-                .spawn(&id, &launch, cols.max(20), rows.max(5), move || {
+                .spawn(&id, &launch, cols.max(20), rows.max(5), move |generation| {
+                    let sessions = &exit_app.state::<AppState>().sessions;
+                    if sessions.superseded(&exit_id, generation) {
+                        return;
+                    }
                     let _ = exit_app.emit("session-exited", &exit_id);
                     let _ = exit_app.emit("worker-changed", &exit_id);
                 })
@@ -1270,6 +1275,24 @@ async fn new_conversation(app: AppHandle, id: String) -> CmdResult<()> {
 }
 
 #[tauri::command]
+async fn list_conversations(id: String) -> CmdResult<Vec<Conversation>> {
+    blocking(move || workspace()?.conversations(&id).map_err(err)).await
+}
+
+#[tauri::command]
+async fn switch_conversation(app: AppHandle, id: String, session: String) -> CmdResult<()> {
+    app.state::<AppState>().sessions.kill(&id);
+    blocking(move || {
+        workspace()?
+            .switch_conversation(&id, &session)
+            .map_err(err)?;
+        let _ = app.emit("worker-changed", &id);
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
 async fn open_worker_dir(id: String, repo: Option<String>) -> CmdResult<()> {
     blocking(move || {
         let w = workspace()?
@@ -1488,6 +1511,8 @@ fn main() {
             windows_build,
             stop_session,
             new_conversation,
+            list_conversations,
+            switch_conversation,
             open_worker_dir,
             open_in_vscode,
             open_project_config,
