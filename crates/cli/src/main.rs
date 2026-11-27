@@ -55,6 +55,9 @@ enum Command {
     /// Report a bug or friction point with Tworky itself as a GitHub issue
     #[command(subcommand)]
     Issue(IssueCommand),
+    /// Review threads on a pull request: list them, reply in one, resolve one
+    #[command(subcommand)]
+    Pr(PrCommand),
     /// The work list: issues, pull requests and custom work
     #[command(subcommand)]
     Item(ItemCommand),
@@ -336,7 +339,7 @@ struct SubtaskArg {
 
 #[derive(Args)]
 struct BodyArgs {
-    /// Issue body text
+    /// Body text
     #[arg(long, conflicts_with = "body_file")]
     body: Option<String>,
     /// Read the body from a file, or from stdin with `-`
@@ -372,6 +375,46 @@ enum IssueCommand {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum PrCommand {
+    /// List the review threads with their comment ids: unresolved ones, or every one with --all
+    Threads {
+        /// The pull request: its URL or owner/repo#number
+        #[arg(value_parser = pr_reference)]
+        pr: github::PrReference,
+        /// Include resolved threads
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reply in the review thread holding a comment
+    Reply {
+        /// The pull request: its URL or owner/repo#number
+        #[arg(value_parser = pr_reference)]
+        pr: github::PrReference,
+        /// Any review comment in the thread: its id, the number in `#discussion_r<id>`
+        comment: u64,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+    /// Resolve the review thread holding a comment, replying in it first when given a body
+    Resolve {
+        /// The pull request: its URL or owner/repo#number
+        #[arg(value_parser = pr_reference)]
+        pr: github::PrReference,
+        /// Any review comment in the thread: its id, the number in `#discussion_r<id>`
+        comment: u64,
+        #[command(flatten)]
+        body: BodyArgs,
+    },
+}
+
+fn pr_reference(arg: &str) -> Result<github::PrReference, String> {
+    github::parse_pr_reference(arg.trim())
+        .ok_or_else(|| format!("expected a pull request URL or owner/repo#number, got '{arg}'"))
 }
 
 #[derive(Args)]
@@ -519,6 +562,7 @@ fn main() -> Result<()> {
         Command::Accounts(cmd) => accounts(cmd),
         Command::Subtask(cmd) => subtask(cmd),
         Command::Issue(cmd) => issue(cmd),
+        Command::Pr(cmd) => pr(cmd),
         Command::Item(cmd) => item(cmd),
         Command::Project(cmd) => project(cmd),
     }
@@ -1079,6 +1123,79 @@ fn issue(cmd: IssueCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `None` when no body was given, which only `tw pr resolve` accepts.
+fn reply_body(args: &BodyArgs, required: bool) -> Result<Option<String>> {
+    if args.body.is_none() && args.body_file.is_none() {
+        anyhow::ensure!(!required, "give the reply with --body or --body-file");
+        return Ok(None);
+    }
+    let body = read_body(args)?;
+    anyhow::ensure!(!body.trim().is_empty(), "the reply body is empty");
+    Ok(Some(body))
+}
+
+fn pr(cmd: PrCommand) -> Result<()> {
+    use tworky_core::review_threads;
+    match cmd {
+        PrCommand::Threads { pr, all, json } => {
+            let threads = review_threads::threads(&pr)?;
+            if json {
+                let shown: Vec<_> = threads.iter().filter(|t| all || !t.is_resolved).collect();
+                println!("{}", serde_json::to_string_pretty(&shown)?);
+            } else {
+                println!("{}", review_threads::format_threads(&threads, all));
+            }
+            Ok(())
+        }
+        PrCommand::Reply { pr, comment, body } => {
+            let body = reply_body(&body, true)?.expect("a reply body is required");
+            let threads = review_threads::threads(&pr)?;
+            let thread = review_threads::find_thread(&threads, comment, &pr)?;
+            review_threads::check_can(thread, true, false)?;
+            let reply = review_threads::reply(&thread.id, &body)?;
+            anyhow::ensure!(!reply.pending, "{}", pending_reply(&reply.url));
+            println!("{}", reply.url);
+            Ok(())
+        }
+        PrCommand::Resolve { pr, comment, body } => {
+            let body = reply_body(&body, false)?;
+            let threads = review_threads::threads(&pr)?;
+            let thread = review_threads::find_thread(&threads, comment, &pr)?;
+            review_threads::check_can(thread, body.is_some(), !thread.is_resolved)?;
+            let mut posted = None;
+            if let Some(body) = body {
+                let reply = review_threads::reply(&thread.id, &body)?;
+                anyhow::ensure!(
+                    !reply.pending,
+                    "{}, so the thread was not resolved",
+                    pending_reply(&reply.url)
+                );
+                println!("{}", reply.url);
+                posted = Some(reply.url);
+            }
+            if thread.is_resolved {
+                println!("{} was already resolved", thread.location());
+                return Ok(());
+            }
+            review_threads::resolve(&thread.id).with_context(|| match &posted {
+                Some(url) => format!(
+                    "the reply was posted ({url}) but the thread at {} is still open; run tw pr resolve again without a body",
+                    thread.location()
+                ),
+                None => format!("resolving the thread at {}", thread.location()),
+            })?;
+            println!("resolved {}", thread.location());
+            Ok(())
+        }
+    }
+}
+
+fn pending_reply(url: &str) -> String {
+    format!(
+        "the reply is held in your pending review on this pull request, which only you see until you submit it on GitHub: {url}"
+    )
 }
 
 fn new_issue(repo: &str, kind: feedback::Kind, args: NewIssueArgs) -> Result<()> {
@@ -2162,6 +2279,57 @@ mod tests {
                 panic!("`{command}` doesn't parse:\n{e}");
             }
         }
+    }
+
+    #[test]
+    fn a_pull_request_is_a_url_or_owner_repo_number() {
+        let Command::Pr(PrCommand::Reply { pr, comment, body }) =
+            Cli::try_parse_from(["tw", "pr", "reply", "o/r#1", "123", "--body", "x"])
+                .unwrap()
+                .command
+        else {
+            panic!("not a reply");
+        };
+        assert_eq!(
+            pr,
+            github::PrReference::InRepo {
+                owner: "o".into(),
+                name: "r".into(),
+                number: 1
+            }
+        );
+        assert_eq!((comment, body.body.as_deref()), (123, Some("x")));
+        assert!(
+            Cli::try_parse_from(["tw", "pr", "threads", "https://github.com/o/r/pull/1"]).is_ok()
+        );
+
+        let err = Cli::try_parse_from(["tw", "pr", "threads", "42"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("expected a pull request URL or owner/repo#number, got '42'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_reply_needs_a_body_and_a_resolve_takes_one_optionally() {
+        let args = |body: Option<&str>| BodyArgs {
+            body: body.map(String::from),
+            body_file: None,
+        };
+        let err = reply_body(&args(None), true).unwrap_err().to_string();
+        assert!(err.contains("--body or --body-file"), "{err}");
+        for blank in ["", " \n"] {
+            assert!(reply_body(&args(Some(blank)), true).is_err());
+            assert!(reply_body(&args(Some(blank)), false).is_err());
+        }
+        assert_eq!(reply_body(&args(None), false).unwrap(), None);
+        assert_eq!(
+            reply_body(&args(Some("Fixed")), true).unwrap().as_deref(),
+            Some("Fixed")
+        );
     }
 
     #[test]

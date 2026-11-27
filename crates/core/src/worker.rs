@@ -124,32 +124,36 @@ pub(crate) fn session_settings(
             "StopFailure": report("idle --stop"),
         }
     });
-    let mut allow = shell_rules(&TW_GITHUB_WRITES);
+    let mut allow = shell_rules(&UNPROMPTED_GITHUB_COMMANDS);
     if browser {
         allow.push(format!("mcp__{MCP_SERVER}"));
     }
-    settings["permissions"] = serde_json::json!({ "ask": shell_rules(&GH_WRITES), "allow": allow });
+    settings["permissions"] =
+        serde_json::json!({ "ask": shell_rules(&PROMPTED_WRITES), "allow": allow });
     settings.to_string()
 }
 
 /// Auto mode's classifier blocks GitHub writes unless the user's own message names the exact action,
 /// and an answer to Claude's question or a plan approval doesn't count, so they failed until the user
-/// repeated the request. Permission rules are checked before the classifier: Tworky's own writes are
-/// allowed outright, and `gh` writes get an `ask` rule, which shows the command in a prompt.
-const TW_GITHUB_WRITES: [&str; 6] = [
+/// repeated the request. Permission rules are checked before the classifier: these `tw` commands are
+/// allowed outright, and posts on issues and PRs get an `ask` rule, which shows the command in a prompt.
+const UNPROMPTED_GITHUB_COMMANDS: [&str; 7] = [
     "tw subtask add",
     "tw subtask ls",
     "tw subtask assign",
     "tw subtask status",
     "tw subtask start",
     "tw issue",
+    "tw pr threads",
 ];
 
-const GH_WRITES: [&str; 4] = [
+const PROMPTED_WRITES: [&str; 6] = [
     "gh issue create",
     "gh issue comment",
     "gh pr comment",
     "gh pr review",
+    "tw pr reply",
+    "tw pr resolve",
 ];
 
 fn shell_rules(commands: &[&str]) -> Vec<String> {
@@ -1563,6 +1567,12 @@ pub fn worker_claude_md(
          - Issue comments: `gh issue comment`\n\
          - PR comments: `gh pr comment`\n\
          - PR reviews: `gh pr review` (`--comment`, `--approve` or `--request-changes`, with `--body-file`)\n\n\
+         To answer review comments, reply in their threads rather than with a top-level `gh pr comment`. `<pr>` is \
+         the PR's URL or `owner/repo#n`:\n\n\
+         - `tw pr threads <pr>`: list unresolved review threads with their comment ids (runs without a prompt)\n\
+         - `tw pr reply <pr> <comment id> --body-file -`: reply in the thread holding that comment\n\
+         - `tw pr resolve <pr> <comment id> [--body-file -]`: resolve that thread, replying in it first when \
+         given a body\n\n\
          Run each as its own command, not chained with `&&` or `;`, so each prompt shows one action. If a write is \
          denied anyway, say which command and why, and let the user decide; don't retry it unchanged.\n",
     );
@@ -2122,6 +2132,15 @@ start_url = "http://localhost:5173/home"
         assert!(md.contains("tw worktree add <repo> --branch <name>"));
         assert!(md.contains("feat/header-layout-327"));
         assert!(!md.contains("## Sub-issues"));
+        for text in [
+            "`tw pr threads <pr>`",
+            "`tw pr reply <pr> <comment id> --body-file -`",
+            "`tw pr resolve <pr> <comment id> [--body-file -]`",
+            "rather than with a top-level `gh pr comment`",
+            "`owner/repo#n`",
+        ] {
+            assert!(md.contains(text), "{text}");
+        }
 
         let story = ws.plan(&idx, "S").unwrap();
         let md = worker_claude_md(&story, &project(), &idx, &memory);
@@ -2695,6 +2714,18 @@ run = "{sleep}"
         for rule in ["PowerShell(gh pr review *)", "Bash(gh pr comment *)"] {
             assert!(ask.iter().any(|r| r == rule), "gh writes prompt: {ask:?}");
         }
+        for command in ["tw pr reply", "tw pr resolve"] {
+            for shell in ["Bash", "PowerShell"] {
+                let rule = format!("{shell}({command} *)");
+                assert!(ask.contains(&rule), "review thread writes prompt: {ask:?}");
+            }
+        }
+        assert!(
+            !allow
+                .iter()
+                .any(|r| r.contains("(tw pr ") && !r.contains("threads")),
+            "only tw pr threads runs without a prompt: {allow:?}"
+        );
         for command in [
             "tw subtask add",
             "tw subtask ls",
@@ -2702,10 +2733,11 @@ run = "{sleep}"
             "tw subtask status",
             "tw subtask start",
             "tw issue",
+            "tw pr threads",
         ] {
             for shell in ["Bash", "PowerShell"] {
                 let rule = format!("{shell}({command} *)");
-                assert!(allow.contains(&rule), "tw writes are allowed: {allow:?}");
+                assert!(allow.contains(&rule), "tw commands are allowed: {allow:?}");
             }
         }
         assert!(
