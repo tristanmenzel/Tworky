@@ -1585,6 +1585,12 @@ run = "npm ci"
         )
     }
 
+    fn workspace_without_stack() -> (tempfile::TempDir, Workspace) {
+        let (dir, mut ws) = workspace();
+        ws.config.projects[0].stack = None;
+        (dir, ws)
+    }
+
     fn index() -> IssueIndex {
         let mut idx = IssueIndex::new("me".into());
         let mut story = issue("S", 318, Some("Story"), Some("E"), &[]);
@@ -1902,7 +1908,7 @@ start_url = "http://localhost:5173/home"
 
     #[test]
     fn cleanup_removes_a_scratch_item() {
-        let (_d, ws) = workspace();
+        let (_d, ws) = workspace_without_stack();
         insert_item(&ws, "quiet-lynx", ItemSource::Custom, true);
         insert_item(&ws, "tidy-seal", ItemSource::Custom, false);
         for name in ["quiet-lynx", "tidy-seal"] {
@@ -1927,7 +1933,7 @@ start_url = "http://localhost:5173/home"
 
     #[test]
     fn cleanup_and_remove_item_removes_a_custom_item() {
-        let (_d, ws) = workspace();
+        let (_d, ws) = workspace_without_stack();
         insert_item(&ws, "tidy-seal", ItemSource::Custom, false);
         let w = ws.plan_item("tidy-seal", &IssueIndex::default()).unwrap();
         let mut lines = Vec::new();
@@ -1944,7 +1950,7 @@ start_url = "http://localhost:5173/home"
 
     #[test]
     fn cleanup_and_remove_item_removes_an_issue_item() {
-        let (_d, ws) = workspace();
+        let (_d, ws) = workspace_without_stack();
         insert_item(&ws, "keen-lynx", ItemSource::Issue(issue_ref_t()), false);
         let w = ws.plan_item("keen-lynx", &index()).unwrap();
         ws.cleanup_and_remove_item(&w.id, None, &mut |_| {})
@@ -1955,7 +1961,7 @@ start_url = "http://localhost:5173/home"
 
     #[test]
     fn cleanup_and_remove_item_tolerates_a_scratch_item() {
-        let (_d, ws) = workspace();
+        let (_d, ws) = workspace_without_stack();
         insert_item(&ws, "quiet-lynx", ItemSource::Custom, true);
         let w = ws.plan_item("quiet-lynx", &IssueIndex::default()).unwrap();
         ws.cleanup_and_remove_item(&w.id, None, &mut |_| {})
@@ -1987,7 +1993,7 @@ start_url = "http://localhost:5173/home"
 
     #[test]
     fn cleanup_and_remove_item_cleans_up_a_worker_with_no_item() {
-        let (_d, ws) = workspace();
+        let (_d, ws) = workspace_without_stack();
         let w = ws.plan(&index(), "T").unwrap();
         let mut lines = Vec::new();
         ws.cleanup_and_remove_item(&w.id, None, &mut |l| lines.push(l.to_string()))
