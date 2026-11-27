@@ -212,6 +212,19 @@ pub struct Launch {
     pub replaced_missing: bool,
 }
 
+impl Launch {
+    /// The folders Claude Code asks to trust before the session starts: the working directory, and
+    /// each `--add-dir`, recorded at the root of the git repo that holds it.
+    pub fn trusted_dirs(&self) -> Vec<PathBuf> {
+        let added = self
+            .args
+            .windows(2)
+            .filter(|pair| pair[0] == "--add-dir")
+            .map(|pair| claude_config::trust_root(Path::new(&pair[1])));
+        std::iter::once(self.cwd.clone()).chain(added).collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoPrs {
     pub repo: String,
