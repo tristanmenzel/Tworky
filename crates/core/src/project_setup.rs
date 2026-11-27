@@ -457,6 +457,13 @@ mod tests {
         let settings = &first.args[first.args.iter().position(|a| a == "--settings").unwrap() + 1];
         assert!(settings.contains("--worker 'setup@portal'"), "{settings}");
         assert!(settings.contains("Bash(tw:*)"));
+        let trusted = first.trusted_dirs();
+        assert_eq!(trusted[0], first.cwd);
+        assert!(
+            trusted.contains(&ws.config.paths.projects_dir()),
+            "{trusted:?}"
+        );
+        assert!(trusted.contains(&dir.path().join("portal")), "{trusted:?}");
         assert!(
             settings.contains("PowerShell(tw issue *)"),
             "filing is allowed: {settings}"

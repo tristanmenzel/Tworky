@@ -263,6 +263,14 @@ pub fn project_key(dir: &Path) -> String {
     }
 }
 
+/// Where Claude Code records trust for `dir`: the top of the git repo holding it, else `dir`.
+pub fn trust_root(dir: &Path) -> PathBuf {
+    dir.ancestors()
+        .find(|d| d.join(".git").exists())
+        .unwrap_or(dir)
+        .to_path_buf()
+}
+
 /// Marks `dir` as trusted so the session opens without the "trust this folder" prompt.
 /// Leaves every other field untouched, and writes only when something changes.
 pub fn trust_directory(config: &Path, dir: &Path) -> Result<bool> {
@@ -427,6 +435,18 @@ mod tests {
             text.find("zeta").unwrap() < text.find("alpha").unwrap(),
             "key order kept"
         );
+    }
+
+    #[test]
+    fn trust_root_is_the_enclosing_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let nested = repo.join("templates").join("acme");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        assert_eq!(trust_root(&nested), repo);
+        let plain = dir.path().join("plain");
+        assert_eq!(trust_root(&plain), plain);
     }
 
     #[test]

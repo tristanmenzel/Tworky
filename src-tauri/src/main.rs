@@ -949,14 +949,16 @@ async fn open_session(
                     "The previous Claude conversation was never saved, so a new one is starting.",
                 );
             }
-            if let Some(config) = tworky_core::claude_config::global_config_path()
-                && let Err(e) = tworky_core::claude_config::trust_directory(&config, &launch.cwd)
-            {
-                push_log(
-                    &app,
-                    &id,
-                    &format!("could not pre-trust the session folder: {e:#}"),
-                );
+            if let Some(config) = tworky_core::claude_config::global_config_path() {
+                for dir in launch.trusted_dirs() {
+                    if let Err(e) = tworky_core::claude_config::trust_directory(&config, &dir) {
+                        push_log(
+                            &app,
+                            &id,
+                            &format!("could not pre-trust {}: {e:#}", dir.display()),
+                        );
+                    }
+                }
             }
             if let Ok(paths) = Paths::resolve() {
                 let _ = activity::launching(&paths, &id);
