@@ -18,6 +18,7 @@ pub mod power;
 pub mod process;
 pub mod project_setup;
 pub mod pulls;
+pub mod review_threads;
 pub mod services;
 pub mod settings;
 pub mod stack;
