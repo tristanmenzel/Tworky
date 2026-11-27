@@ -45,7 +45,7 @@ const THREADS: &str = "fragment T on PullRequestReviewThreadConnection { \
 pageInfo { hasNextPage endCursor } nodes { id path line originalLine isResolved isOutdated \
 viewerCanReply viewerCanResolve comments(first: 100) { nodes { fullDatabaseId author { login } body url } } } }";
 
-/// Files-tab links (`.../pull/N/files#r1`, `.../pull/N/changes?w=1`) resolve to `null`.
+/// GitHub's `resource(url:)` returns `null` for Files-tab links (`.../pull/N/files#r1`, `.../pull/N/changes?w=1`).
 fn normalise_pr_url(url: &str) -> &str {
     let url = url.split(['#', '?']).next().unwrap_or_default();
     let url = url.trim_end_matches('/');

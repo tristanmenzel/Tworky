@@ -1125,7 +1125,6 @@ fn issue(cmd: IssueCommand) -> Result<()> {
     }
 }
 
-/// `None` when no body was given, which only `tw pr resolve` accepts.
 fn reply_body(args: &BodyArgs, required: bool) -> Result<Option<String>> {
     if args.body.is_none() && args.body_file.is_none() {
         anyhow::ensure!(!required, "give the reply with --body or --body-file");
