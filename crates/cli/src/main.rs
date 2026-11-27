@@ -1201,7 +1201,7 @@ fn pending_resolve_note(already_resolved: bool) -> &'static str {
     if already_resolved {
         "; the thread was already resolved"
     } else {
-        ", so the thread was not resolved"
+        ", so the thread was not resolved (once the review is dealt with, resolve it with tw pr resolve and no body)"
     }
 }
 
@@ -2013,7 +2013,7 @@ mod tests {
         let url = "https://github.com/o/r/pull/1#discussion_r2";
         let open = pending_reply(url, pending_resolve_note(false));
         let resolved = pending_reply(url, pending_resolve_note(true));
-        assert!(open.contains(&format!("({url}), so the thread was not resolved;")));
+        assert!(open.contains(&format!("({url}), so the thread was not resolved (")));
         assert!(resolved.contains(&format!("({url}); the thread was already resolved;")));
         assert!(!resolved.contains("not resolved"));
     }
