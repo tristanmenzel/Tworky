@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
+  import { openUrl } from '@tauri-apps/plugin-opener'
   import { Terminal } from '@xterm/xterm'
   import { FitAddon } from '@xterm/addon-fit'
   import { api, type Job, type Worker } from './api'
@@ -35,6 +36,7 @@
   onMount(() => {
     const output = job.output
     if (!output || !host) return
+    const el = host
     const term = new Terminal({
       fontFamily: css('--mono') || 'Consolas, monospace',
       fontSize: 13,
@@ -42,6 +44,11 @@
       convertEol: true,
       scrollback: 10000,
       theme: { background: css('--term-bg') || '#0d0f12' },
+      linkHandler: {
+        activate: (_e, uri) => openUrl(uri),
+        hover: (_e, uri) => (el.title = uri),
+        leave: () => el.removeAttribute('title'),
+      },
     })
     const fit = new FitAddon()
     term.loadAddon(fit)

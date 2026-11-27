@@ -138,6 +138,11 @@
       allowProposedApi: true,
       scrollback: 10000,
       theme: { background: css('--term-bg') || '#0d0f12' },
+      linkHandler: {
+        activate: (_e, uri) => openUrl(uri),
+        hover: (_e, uri) => (host.title = uri),
+        leave: () => host.removeAttribute('title'),
+      },
     })
     fit = new FitAddon()
     term.loadAddon(fit)
