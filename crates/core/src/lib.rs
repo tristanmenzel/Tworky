@@ -4,6 +4,7 @@ pub mod build_info;
 pub mod cards;
 pub mod claude_config;
 pub mod config;
+pub mod conversations;
 pub mod existing;
 pub mod feedback;
 pub mod git;

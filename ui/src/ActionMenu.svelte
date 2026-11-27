@@ -16,7 +16,15 @@
     trigger = '⋯',
     danger = false,
     disabled = false,
-  }: { items: MenuItem[]; label?: string; trigger?: string; danger?: boolean; disabled?: boolean } = $props()
+    onOpen,
+  }: {
+    items: MenuItem[]
+    label?: string
+    trigger?: string
+    danger?: boolean
+    disabled?: boolean
+    onOpen?: () => void
+  } = $props()
 
   let open = $state(false)
   let root: HTMLDivElement
@@ -44,7 +52,10 @@
     aria-label={label}
     aria-haspopup="menu"
     aria-expanded={open}
-    onclick={() => (open = !open)}>{trigger}</button
+    onclick={() => {
+      open = !open
+      if (open) onOpen?.()
+    }}>{trigger}</button
   >
   {#if open}
     <div class="popup" role="menu">
@@ -90,6 +101,7 @@
     background: none;
     border: 0;
     text-align: left;
+    overflow-wrap: anywhere;
     padding: 6px 8px;
     border-radius: 5px;
   }

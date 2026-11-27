@@ -57,6 +57,7 @@ impl Workspace {
             .unwrap_or_else(|| ProjectSession {
                 claude_session: uuid::Uuid::new_v4().to_string(),
                 claude_started: false,
+                running_session: None,
             }))
     }
 
@@ -74,10 +75,8 @@ impl Workspace {
             && let Some(home) = &self.claude_home
             && !claude_config::transcript_path(home, &dir, &session.claude_session).exists()
         {
-            session = ProjectSession {
-                claude_session: uuid::Uuid::new_v4().to_string(),
-                claude_started: false,
-            };
+            session.claude_session = uuid::Uuid::new_v4().to_string();
+            session.claude_started = false;
             replaced_missing = true;
         }
         self.state.save_project_session(name, &session)?;
@@ -136,6 +135,7 @@ impl Workspace {
     pub fn mark_project_session_started(&self, name: &str) -> Result<()> {
         let mut session = self.project_session(name)?;
         session.claude_started = true;
+        session.running_session = None;
         self.state.save_project_session(name, &session)
     }
 
@@ -146,6 +146,7 @@ impl Workspace {
             &ProjectSession {
                 claude_session: uuid::Uuid::new_v4().to_string(),
                 claude_started: false,
+                running_session: None,
             },
         )
     }
@@ -356,6 +357,7 @@ fn sample_worker(config: &Config, project: &ProjectConfig) -> WorkerRecord {
         created_at: 0,
         worktrees: vec![],
         stopped: false,
+        running_session: None,
     }
 }
 

@@ -15,6 +15,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tworky_core::activity::{self, AccountRequest, Activity, Handover, Phase, Session};
 use tworky_core::config::Paths;
+use tworky_core::conversations::Conversation;
 use tworky_core::existing::WorkSubject;
 use tworky_core::github;
 use tworky_core::hierarchy::IssueIndex;
@@ -892,9 +893,15 @@ fn run_session_job(
     let (job_app, job_id) = (app.clone(), id.clone());
     run_job(app, id, move |ws, log| {
         let result = job(ws, pid, log);
-        job_app.state::<AppState>().sessions.kill(&job_id);
+        stop_pty(&job_app, &job_id);
         result
     })
+}
+
+/// A killed session's own exit is ignored as superseded, so stopping reports the exit itself.
+fn stop_pty(app: &AppHandle, id: &str) {
+    app.state::<AppState>().sessions.kill(id);
+    let _ = app.emit("session-exited", id);
 }
 
 #[tauri::command]
@@ -965,7 +972,11 @@ async fn open_session(
             let exit_id = id.clone();
             state
                 .sessions
-                .spawn(&id, &launch, cols.max(20), rows.max(5), move || {
+                .spawn(&id, &launch, cols.max(20), rows.max(5), move |generation| {
+                    let sessions = &exit_app.state::<AppState>().sessions;
+                    if sessions.superseded(&exit_id, generation) {
+                        return;
+                    }
                     let _ = exit_app.emit("session-exited", &exit_id);
                     let _ = exit_app.emit("worker-changed", &exit_id);
                 })
@@ -1246,7 +1257,7 @@ fn resize_session(state: State<'_, AppState>, id: String, cols: u16, rows: u16) 
 #[tauri::command]
 async fn stop_session(app: AppHandle, id: String) -> CmdResult<()> {
     if project_setup::session_project(&id).is_some() {
-        app.state::<AppState>().sessions.kill(&id);
+        stop_pty(&app, &id);
         let _ = app.emit("worker-changed", &id);
         return Ok(());
     }
@@ -1265,6 +1276,24 @@ async fn new_conversation(app: AppHandle, id: String) -> CmdResult<()> {
             None => ws.reset_claude_session(&id),
         }
         .map_err(err)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_conversations(id: String) -> CmdResult<Vec<Conversation>> {
+    blocking(move || workspace()?.conversations(&id).map_err(err)).await
+}
+
+#[tauri::command]
+async fn switch_conversation(app: AppHandle, id: String, session: String) -> CmdResult<()> {
+    blocking(move || {
+        let ws = workspace()?;
+        ws.check_conversation(&id, &session).map_err(err)?;
+        app.state::<AppState>().sessions.kill(&id);
+        ws.switch_conversation(&id, &session).map_err(err)?;
+        let _ = app.emit("worker-changed", &id);
+        Ok(())
     })
     .await
 }
@@ -1488,6 +1517,8 @@ fn main() {
             windows_build,
             stop_session,
             new_conversation,
+            list_conversations,
+            switch_conversation,
             open_worker_dir,
             open_in_vscode,
             open_project_config,

@@ -85,6 +85,9 @@ pub struct Sessions {
     inner: Mutex<HashMap<String, Session>>,
     liveness: Liveness,
     generations: AtomicU64,
+    /// The last generation `kill` ended per id, so its exit, which may come before the next spawn,
+    /// isn't taken for that spawn's.
+    killed: Mutex<HashMap<String, u64>>,
 }
 
 impl Sessions {
@@ -96,13 +99,20 @@ impl Sessions {
             .is_some_and(|s| s.shared.lock().unwrap().alive)
     }
 
+    /// Whether an exit of `generation` belongs to a session that was killed or replaced.
+    pub fn superseded(&self, id: &str, generation: u64) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let killed = self.killed.lock().unwrap().get(id).copied();
+        superseded(inner.get(id).map(|s| s.generation), killed, generation)
+    }
+
     pub fn spawn(
         &self,
         id: &str,
         launch: &Launch,
         cols: u16,
         rows: u16,
-        on_exit: impl FnOnce() + Send + 'static,
+        on_exit: impl FnOnce(u64) + Send + 'static,
     ) -> Result<()> {
         let pty = native_pty_system().openpty(PtySize {
             rows,
@@ -181,7 +191,7 @@ impl Sessions {
             }
             thread_shared.lock().unwrap().alive = false;
             liveness.end(&thread_id, generation);
-            on_exit();
+            on_exit(generation);
         });
         Ok(())
     }
@@ -237,6 +247,10 @@ impl Sessions {
         let mut inner = self.inner.lock().unwrap();
         if let Some(mut s) = inner.remove(id) {
             self.liveness.end(id, s.generation);
+            self.killed
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), s.generation);
             let _ = s.child.kill();
         }
     }
@@ -262,6 +276,10 @@ impl Sessions {
             let _ = s.child.kill();
         }
     }
+}
+
+fn superseded(current: Option<u64>, killed: Option<u64>, generation: u64) -> bool {
+    current.is_some_and(|c| c > generation) || killed.is_some_and(|k| k >= generation)
 }
 
 /// The app may itself be launched from a Claude Code session (or a shell with NO_COLOR set);
@@ -443,6 +461,25 @@ mod tests {
         );
         live.end("acme-1", 1);
         assert!(live.snapshot().is_empty());
+    }
+
+    #[test]
+    fn an_exit_is_superseded_once_its_generation_is_killed_or_replaced() {
+        assert!(!superseded(None, None, 0), "exited by itself");
+        assert!(
+            !superseded(Some(3), Some(2), 3),
+            "exited by itself after a kill"
+        );
+        assert!(superseded(Some(4), None, 3), "replaced by a spawn");
+        assert!(
+            superseded(None, Some(3), 3),
+            "killed, before the next spawn"
+        );
+        assert!(
+            superseded(Some(4), Some(3), 3),
+            "killed, after the next spawn"
+        );
+        assert!(superseded(None, Some(5), 3), "an older spawn's late exit");
     }
 
     #[test]

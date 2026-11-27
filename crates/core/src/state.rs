@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::ports::PortMap;
@@ -112,6 +112,10 @@ pub struct WorkerRecord {
     /// Set by terminate, cleared by setup: the stack and the session's dev servers are down.
     #[serde(default)]
     pub stopped: bool,
+    /// The id on the running `claude`'s command line, once `/clear` or `/resume` has moved
+    /// `claude_session` away from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,6 +166,13 @@ impl WorkerRecord {
 
     pub fn issue_id(&self) -> Option<&str> {
         self.issue.as_ref().map(|i| i.id.as_str())
+    }
+
+    /// The session id the running `claude` was launched with.
+    pub fn process_session(&self) -> &str {
+        self.running_session
+            .as_deref()
+            .unwrap_or(&self.claude_session)
     }
 }
 
@@ -269,6 +280,31 @@ impl State {
         Ok(())
     }
 
+    /// Reads, changes and saves in one transaction, so a writer holding an older copy can't undo
+    /// another's write.
+    pub fn update(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut WorkerRecord),
+    ) -> Result<Option<WorkerRecord>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let data: Option<String> = tx
+            .query_row("SELECT data FROM workers WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?;
+        let Some(data) = data else {
+            return Ok(None);
+        };
+        let mut w: WorkerRecord = serde_json::from_str(&data)?;
+        f(&mut w);
+        tx.execute(
+            "UPDATE workers SET slot = ?2, data = ?3 WHERE id = ?1",
+            params![id, w.slot, serde_json::to_string(&w)?],
+        )?;
+        tx.commit()?;
+        Ok(Some(w))
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<WorkerRecord>> {
         let data: Option<String> = self
             .conn()?
@@ -373,6 +409,34 @@ impl State {
         )?;
         Ok(())
     }
+
+    /// [`Self::update`] for a project's setup session. It never creates the row.
+    pub fn update_project_session(
+        &self,
+        project: &str,
+        f: impl FnOnce(&mut ProjectSession),
+    ) -> Result<Option<ProjectSession>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let data: Option<String> = tx
+            .query_row(
+                "SELECT data FROM project_sessions WHERE project = ?1",
+                [project],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(data) = data else {
+            return Ok(None);
+        };
+        let mut s: ProjectSession = serde_json::from_str(&data)?;
+        f(&mut s);
+        tx.execute(
+            "UPDATE project_sessions SET data = ?2 WHERE project = ?1",
+            params![project, serde_json::to_string(&s)?],
+        )?;
+        tx.commit()?;
+        Ok(Some(s))
+    }
 }
 
 /// The Claude conversation that sets up or adjusts a project's config.
@@ -380,6 +444,17 @@ impl State {
 pub struct ProjectSession {
     pub claude_session: String,
     pub claude_started: bool,
+    /// As [`WorkerRecord::running_session`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_session: Option<String>,
+}
+
+impl ProjectSession {
+    pub fn process_session(&self) -> &str {
+        self.running_session
+            .as_deref()
+            .unwrap_or(&self.claude_session)
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +486,7 @@ mod tests {
             created_at: 0,
             worktrees: vec![],
             stopped: false,
+            running_session: None,
         }
     }
 
@@ -428,6 +504,54 @@ mod tests {
         assert_eq!(state.used_slots().unwrap(), vec![1, 2]);
         state.delete("a").unwrap();
         assert!(state.get("a").unwrap().is_none());
+    }
+
+    #[test]
+    fn update_changes_only_what_it_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(&dir.path().join("s.db")).unwrap();
+        state.insert(&record("a", 1)).unwrap();
+        let stale = state.get("a").unwrap().unwrap();
+        state
+            .update("a", |w| w.claude_session = "moved".into())
+            .unwrap();
+        let saved = state
+            .update("a", |w| w.stopped = stale.stopped)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.claude_session, "moved");
+        assert_eq!(state.get("a").unwrap().unwrap().claude_session, "moved");
+        assert!(state.update("b", |w| w.stopped = true).unwrap().is_none());
+        assert!(state.get("b").unwrap().is_none());
+    }
+
+    #[test]
+    fn update_project_session_never_creates_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(&dir.path().join("s.db")).unwrap();
+        assert!(
+            state
+                .update_project_session("acme", |s| s.claude_started = true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.project_session("acme").unwrap().is_none());
+    }
+
+    #[test]
+    fn reads_records_written_before_running_sessions() {
+        let mut old = serde_json::to_value(record("a", 1)).unwrap();
+        assert!(
+            old.get("running_session").is_none(),
+            "not written while unset"
+        );
+        old.as_object_mut().unwrap().remove("running_session");
+        let w: WorkerRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(w.running_session, None);
+        assert_eq!(w.process_session(), "s");
+        let s: ProjectSession =
+            serde_json::from_str(r#"{"claude_session":"p","claude_started":true}"#).unwrap();
+        assert_eq!(s.process_session(), "p");
     }
 
     #[test]
