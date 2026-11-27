@@ -1155,7 +1155,7 @@ fn pr(cmd: PrCommand) -> Result<()> {
             let thread = review_threads::find_thread(&threads, comment, &pr)?;
             review_threads::check_can(thread, true, false)?;
             let reply = review_threads::reply(&thread.id, &body)?;
-            anyhow::ensure!(!reply.pending, "{}", pending_reply(&reply.url));
+            anyhow::ensure!(!reply.pending, "{}", pending_reply(&reply.url, ""));
             println!("{}", reply.url);
             Ok(())
         }
@@ -1169,8 +1169,8 @@ fn pr(cmd: PrCommand) -> Result<()> {
                 let reply = review_threads::reply(&thread.id, &body)?;
                 anyhow::ensure!(
                     !reply.pending,
-                    "{}, so the thread was not resolved",
-                    pending_reply(&reply.url)
+                    "{}",
+                    pending_reply(&reply.url, pending_resolve_note(thread.is_resolved))
                 );
                 println!("{}", reply.url);
                 posted = Some(reply.url);
@@ -1192,10 +1192,18 @@ fn pr(cmd: PrCommand) -> Result<()> {
     }
 }
 
-fn pending_reply(url: &str) -> String {
+fn pending_reply(url: &str, thread_note: &str) -> String {
     format!(
-        "the reply is held in your pending review on this pull request, which only you see until you submit it on GitHub: {url}"
+        "the reply was posted into your pending review on this pull request ({url}){thread_note}; don't run this again, which would add a duplicate pending reply, but submit or discard the pending review on GitHub"
     )
+}
+
+fn pending_resolve_note(already_resolved: bool) -> &'static str {
+    if already_resolved {
+        "; the thread was already resolved"
+    } else {
+        ", so the thread was not resolved"
+    }
 }
 
 fn new_issue(repo: &str, kind: feedback::Kind, args: NewIssueArgs) -> Result<()> {
@@ -1999,6 +2007,16 @@ mod tests {
             config_dir: home.join("config"),
             data_dir: home.join("data"),
         }
+    }
+
+    #[test]
+    fn a_pending_reply_on_resolve_says_whether_the_thread_was_resolved() {
+        let url = "https://github.com/o/r/pull/1#discussion_r2";
+        let open = pending_reply(url, pending_resolve_note(false));
+        let resolved = pending_reply(url, pending_resolve_note(true));
+        assert!(open.contains(&format!("({url}), so the thread was not resolved;")));
+        assert!(resolved.contains(&format!("({url}); the thread was already resolved;")));
+        assert!(!resolved.contains("not resolved"));
     }
 
     #[test]
